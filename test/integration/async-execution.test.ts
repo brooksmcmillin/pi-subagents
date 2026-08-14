@@ -2437,13 +2437,13 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			path.join(outputDir, "dynamic-1", "0-reviewer", "context.md"),
 			path.join(outputDir, "dynamic-1", "1-reviewer", "context.md"),
 		];
-		assert.equal(fs.readFileSync(dynamicOutputPaths[0]!, "utf-8"), "review-a");
-		assert.equal(fs.readFileSync(dynamicOutputPaths[1]!, "utf-8"), "review-b");
+		assert.equal(fs.readFileSync(dynamicOutputPaths[0]!, "utf-8"), '{\n  "ok": "a"\n}\n');
+		assert.equal(fs.readFileSync(dynamicOutputPaths[1]!, "utf-8"), '{\n  "ok": "b"\n}\n');
 		const reviewerArtifacts = payload.results.slice(1, 3).map((result) => result.artifactPaths?.outputPath);
 		assert.ok(reviewerArtifacts[0] && reviewerArtifacts[1]);
 		assert.notEqual(reviewerArtifacts[0], reviewerArtifacts[1]);
-		assert.equal(fs.readFileSync(reviewerArtifacts[0], "utf-8"), "review-a");
-		assert.equal(fs.readFileSync(reviewerArtifacts[1], "utf-8"), "review-b");
+		assert.equal(fs.readFileSync(reviewerArtifacts[0], "utf-8"), '{\n  "ok": "a"\n}');
+		assert.equal(fs.readFileSync(reviewerArtifacts[1], "utf-8"), '{\n  "ok": "b"\n}');
 		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", new RegExp(dynamicOutputPaths[0]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		assert.match(readMockPiArgs(mockPi, 2).at(-1) ?? "", new RegExp(dynamicOutputPaths[1]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		assert.equal(status.steps?.length, 4);
@@ -3467,6 +3467,106 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(payload.results[0]?.output ?? "", /Output saved to:/);
 		assert.doesNotMatch(payload.results[0]?.output ?? "", /async full output/);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async full output\nwith details");
+	});
+
+	it("background structured output overwrites receipt prose and exposes the saved path", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			output: "1 finding | artifact: review.md",
+			structuredOutput: { status: "findings", count: 1 },
+		});
+		const id = `async-structured-output-${Date.now().toString(36)}`;
+		const outputPath = path.join(tempDir, "async-structured-output.json");
+		const run = executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Return the structured report",
+			agentConfig: makeAgent("reviewer", { tools: ["read", "grep"] }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: outputPath,
+			outputMode: "file-only",
+			structuredOutputSchema: {
+				type: "object",
+				required: ["status", "count"],
+				properties: {
+					status: { type: "string" },
+					count: { type: "number" },
+				},
+			},
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(run.details.asyncId, id);
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const child = payload.results[0] as { savedOutputPath?: string } | undefined;
+		assert.equal(payload.success, true);
+		assert.equal(
+			fs.readFileSync(outputPath, "utf-8"),
+			'{\n  "status": "findings",\n  "count": 1\n}\n',
+		);
+		assert.doesNotMatch(fs.readFileSync(outputPath, "utf-8"), /artifact: review\.md/);
+		assert.equal(
+			child?.savedOutputPath,
+			outputPath,
+			JSON.stringify(payload.results[0], null, 2),
+		);
+	});
+
+	it("background structured output fails closed when the artifact cannot be saved", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			output: "clean | artifact: review.md",
+			structuredOutput: { status: "clean", count: 0 },
+		});
+		const id = `async-structured-output-save-error-${Date.now().toString(36)}`;
+		const blockedParent = path.join(tempDir, "blocked-output-parent");
+		fs.writeFileSync(blockedParent, "not a directory");
+		const outputPath = path.join(blockedParent, "report.json");
+		executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Return the structured report",
+			agentConfig: makeAgent("reviewer", { tools: ["read", "grep"] }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: outputPath,
+			outputMode: "file-only",
+			structuredOutputSchema: {
+				type: "object",
+				required: ["status", "count"],
+				properties: {
+					status: { type: "string" },
+					count: { type: "number" },
+				},
+			},
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const child = payload.results[0] as { savedOutputPath?: string; outputSaveError?: string } | undefined;
+		assert.equal(payload.success, false);
+		assert.equal(child?.success, false);
+		assert.match(child?.error ?? "", /Failed to persist schema-validated output artifact/);
+		assert.match(child?.outputSaveError ?? "", /EEXIST|ENOTDIR|not a directory/i);
+		assert.equal(child?.savedOutputPath, undefined);
+		assert.equal(fs.existsSync(outputPath), false);
 	});
 
 	it("background single runs route relative outputs to outputBaseDir", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

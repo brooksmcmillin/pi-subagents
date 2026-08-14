@@ -1432,6 +1432,8 @@ export interface AsyncStatus {
 		steering?: SteeringStatus;
 		error?: string;
 		structuredOutput?: unknown;
+		savedOutputPath?: string;
+		outputSaveError?: string;
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;

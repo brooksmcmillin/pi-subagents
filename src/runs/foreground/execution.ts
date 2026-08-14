@@ -65,7 +65,7 @@ import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolved
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
-import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../shared/structured-output.ts";
+import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput, serializeStructuredOutput } from "../shared/structured-output.ts";
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -1488,10 +1488,24 @@ async function runSingleAttempt(
 		}));
 	}
 		if (options.outputPath && result.exitCode === 0) {
-			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
+			const outputForPersistence = validatedStructuredOutput
+				? serializeStructuredOutput(result.structuredOutput)
+				: fullOutput;
+			const resolvedOutput = resolveSingleOutput(
+				options.outputPath,
+				outputForPersistence,
+				shared.outputSnapshot,
+				{ authoritative: validatedStructuredOutput },
+			);
 			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 			result.savedOutputPath = resolvedOutput.savedPath;
 			result.outputSaveError = resolvedOutput.saveError;
+			if (validatedStructuredOutput && (!resolvedOutput.savedPath || resolvedOutput.saveError)) {
+				result.exitCode = 1;
+				result.error = `Failed to persist schema-validated output artifact: ${resolvedOutput.saveError ?? "output path was not saved"}`;
+				progress.status = "failed";
+				progress.error = result.error;
+			}
 			if (resolvedOutput.savedPath) {
 				result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
 				if (result.outputState === "absent") result.outputState = "unknown";
@@ -1902,6 +1916,21 @@ async function runSyncCompletion(
 	const childWrittenOutput = options.outputPath
 		? extractChildWrittenOutput(result.messages, options.outputPath, options.cwd ?? runtimeCwd)
 		: undefined;
+	const acceptanceFileOutput = options.outputPath
+		? result.structuredOutput !== undefined
+			? {
+				content: serializeStructuredOutput(result.structuredOutput),
+				path: options.outputPath,
+				authoritative: true,
+			}
+			: childWrittenOutput !== undefined
+				? {
+					content: childWrittenOutput,
+					path: options.outputPath,
+					authoritative: options.outputMode === "file-only",
+				}
+				: undefined
+		: undefined;
 	try {
 		if (result.interrupted && detachedReason === "user request") {
 			// Only an accepted user-detach receipt needs a non-rejecting terminal
@@ -1918,9 +1947,7 @@ async function runSyncCompletion(
 			result.acceptance = await evaluateAcceptance({
 				acceptance: effectiveAcceptance,
 				output: acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "",
-				fileOutput: childWrittenOutput !== undefined && options.outputPath
-					? { content: childWrittenOutput, path: options.outputPath, authoritative: options.outputMode === "file-only" }
-					: undefined,
+				fileOutput: acceptanceFileOutput,
 				cwd: options.cwd ?? runtimeCwd,
 				reportOptional: isAgentContractV1(options.agentContract),
 				artifactsDir: options.artifactsDir,
