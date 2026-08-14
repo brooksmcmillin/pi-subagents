@@ -737,6 +737,44 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("retries a truncated JSON result file until its write completes", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
+		try {
+			const resultPath = path.join(resultsDir, "partial.json");
+			fs.writeFileSync(resultPath, '{"id":"partial"', "utf-8");
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher({
+				events: {
+					on: () => () => {},
+					emit(_event: string, data: unknown) { emitted.push(data); },
+				},
+			}, state, resultsDir, 60_000);
+			const originalError = console.error;
+			const logged: unknown[][] = [];
+			console.error = (...args: unknown[]) => { logged.push(args); };
+			try {
+				watcher.primeExistingResults();
+				setTimeout(() => fs.writeFileSync(resultPath, JSON.stringify({
+					id: "partial",
+					sessionId: "session-1",
+					success: true,
+					summary: "done",
+				}), "utf-8"), 75);
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			} finally {
+				console.error = originalError;
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(emitted.length, 1);
+			assert.equal(logged.length, 0);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("logs malformed result files instead of swallowing them silently", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
@@ -760,7 +798,7 @@ describe("result watcher", () => {
 			};
 			try {
 				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				assert.equal(await waitForPredicate(() => logged.length > 0, 1_000), true);
 			} finally {
 				console.error = originalError;
 				watcher.stopResultWatcher();

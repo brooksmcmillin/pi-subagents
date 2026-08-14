@@ -9,6 +9,7 @@ import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
 import { steerWorkflowForegroundTarget, workflowForegroundSteeringDir } from "../../src/runs/foreground/workflow-foreground-steering.ts";
+import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
 import { ASYNC_DIR, RESULTS_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 function createState(): SubagentState {
@@ -31,8 +32,7 @@ function createState(): SubagentState {
 }
 
 function writeJson(filePath: string, value: object): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
+	writeAtomicJson(filePath, value);
 }
 
 function createRunningAsync(state: SubagentState, runId: string, options: { track?: boolean; sessionId?: string; state?: "queued" | "running"; pid?: number; mode?: "single" | "workflow" } = {}): string {
@@ -443,7 +443,7 @@ describe("async interrupt action", () => {
 		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
 		status.state = "complete";
 		status.endedAt = Date.now();
-		fs.writeFileSync(statusPath, JSON.stringify(status), "utf-8");
+		writeJson(statusPath, status);
 		state.workflowControllers?.delete(workflowRunId);
 		try {
 			const result = await executorWithKill(state, () => true)
@@ -594,7 +594,7 @@ describe("async interrupt action", () => {
 			const statusPath = path.join(asyncDir, "status.json");
 			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
 			status.steps[0].runner = runner;
-			fs.writeFileSync(statusPath, JSON.stringify(status), "utf-8");
+			writeJson(statusPath, status);
 			try {
 				const result = await executorWithKill(state, () => {
 					throw new Error("external interrupt should not signal the runner");
