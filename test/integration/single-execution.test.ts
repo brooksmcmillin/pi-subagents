@@ -3200,7 +3200,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	});
 
 	it("direct single tool calls support outputSchema", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const reportPath = path.join(tempDir, "schema-report.json");
 		mockPi.onCall({
+			output: "1 finding | artifact: review.md",
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true, note: "captured" } } },
 				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
@@ -3212,7 +3214,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		const result = await executor.execute(
 			"single-schema",
-			{ agent: "echo", task: "Return structured data", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } }, acceptance: false },
+			{ agent: "echo", task: "Return structured data", output: reportPath, outputMode: "file-only", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } }, acceptance: false },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),
@@ -3221,8 +3223,45 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, undefined);
 		const child = result.details?.results?.[0];
 		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
-		assert.match(child?.finalOutput ?? "", /"ok": true/);
+		assert.equal(fs.readFileSync(reportPath, "utf-8"), '{\n  "ok": true,\n  "note": "captured"\n}\n');
+		assert.doesNotMatch(fs.readFileSync(reportPath, "utf-8"), /artifact: review\.md/);
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
+	});
+
+	it("fails when schema-validated output cannot be persisted", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const blockedParent = path.join(tempDir, "not-a-directory");
+		fs.writeFileSync(blockedParent, "file", "utf-8");
+		mockPi.onCall({
+			output: "receipt only",
+			stdoutRaw: [
+				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "tool_execution_end", toolName: "structured_output" },
+			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+			structuredOutputCapture: { ok: true },
+		});
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"single-schema-save-failure",
+			{
+				agent: "echo",
+				task: "Return structured data",
+				output: path.join(blockedParent, "report.json"),
+				outputMode: "file-only",
+				outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+				acceptance: false,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(
+			result.details?.results?.[0]?.error ?? "",
+			/Failed to persist schema-validated output artifact/,
+		);
 	});
 
 	it("accepts recovered tool errors before valid structured output but rejects later errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

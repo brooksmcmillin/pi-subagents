@@ -10,6 +10,10 @@ export const STRUCTURED_OUTPUT_SCHEMA_ENV = "PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEM
 export const STRUCTURED_OUTPUT_CAPTURE_ENV = "PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
 
+export function serializeStructuredOutput(value: unknown): string {
+	return typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`;
+}
+
 export interface StructuredOutputRuntime {
 	schema: JsonSchemaObject;
 	schemaPath: string;

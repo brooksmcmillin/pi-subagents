@@ -102,6 +102,8 @@ Use `outputMode: "file-only"` when a saved output may be large and the parent on
 
 In workflowScript, give each child an explicit output path when later script steps need a durable file reference. A child with only read-only tools does not need direct filesystem access for `output`: it returns the complete artifact in its final response and the runtime persists it. Children with mutation-capable tools retain the direct-write instruction.
 
+When a child also has `outputSchema`, the schema-validated `structured_output` value is authoritative for the declared output path. String roots are saved verbatim; other values are saved as deterministic pretty JSON. The runtime overwrites receipt prose or child-written content at that path and fails the run if the validated artifact cannot be persisted. Consumers should use `structuredOutput` as the typed report and the returned output path as its durable representation.
+
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
 
 ### Retained children

@@ -77,7 +77,7 @@ import {
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, type SubagentTaskDelivery } from "../shared/pi-args.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
-import { createStructuredOutputRuntime, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../shared/structured-output.ts";
+import { createStructuredOutputRuntime, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput, serializeStructuredOutput } from "../shared/structured-output.ts";
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
@@ -1772,10 +1772,20 @@ async function runSingleStepInner(
 	}
 
 	const rawOutput = finalResult?.finalOutput ?? "";
-	const outputForPersistence = stripAcceptanceReport(rawOutput);
+	const structuredResult = finalResult as (RunPiStreamingResult & { structuredOutput?: unknown }) | undefined;
+	const validatedStructuredOutput = structuredResult?.structuredOutput !== undefined;
+	const outputForPersistence = validatedStructuredOutput
+		? serializeStructuredOutput(structuredResult?.structuredOutput)
+		: stripAcceptanceReport(rawOutput);
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
-		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot)
+		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, {
+			authoritative: validatedStructuredOutput,
+		})
 		: { fullOutput: outputForPersistence };
+	if (validatedStructuredOutput && step.outputPath && (!resolvedOutput.savedPath || resolvedOutput.saveError) && finalResult) {
+		finalResult.exitCode = 1;
+		finalResult.error = `Failed to persist schema-validated output artifact: ${resolvedOutput.saveError ?? "output path was not saved"}`;
+	}
 	const output = stripAcceptanceReport(resolvedOutput.fullOutput);
 	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
 	let outputForSummary = output;
@@ -1796,6 +1806,21 @@ async function runSingleStepInner(
 	const outputForAcceptance = rawOutput;
 	const childWrittenOutput = step.outputPath
 		? extractChildWrittenOutput(finalResult?.messages, step.outputPath, step.cwd ?? ctx.cwd)
+		: undefined;
+	const acceptanceFileOutput = step.outputPath
+		? validatedStructuredOutput
+			? {
+				content: resolvedOutput.fullOutput,
+				path: step.outputPath,
+				authoritative: true,
+			}
+			: childWrittenOutput !== undefined
+				? {
+					content: childWrittenOutput,
+					path: step.outputPath,
+					authoritative: step.outputMode === "file-only",
+				}
+				: undefined
 		: undefined;
 	const outputState: SubagentOutputState = finalResult?.outputState === "present"
 		|| (finalResult as (RunPiStreamingResult & { structuredOutput?: unknown }) | undefined)?.structuredOutput !== undefined
@@ -1818,9 +1843,7 @@ async function runSingleStepInner(
 		? await evaluateAcceptance(omitUndefinedProperties({
 			acceptance: step.effectiveAcceptance,
 			output: outputForAcceptance,
-			fileOutput: childWrittenOutput !== undefined && step.outputPath
-				? { content: childWrittenOutput, path: step.outputPath, authoritative: step.outputMode === "file-only" }
-				: undefined,
+			fileOutput: acceptanceFileOutput,
 			cwd: step.cwd ?? ctx.cwd,
 			signal: combinedAbortSignal([ctx.timeoutSignal, ctx.stopSignal]),
 			abortMessage: ctx.stopSignal?.aborted ? ctx.stopMessage ?? "Subagent stopped by user." : ctx.timeoutMessage ?? "Subagent timed out.",
@@ -1904,7 +1927,8 @@ async function runSingleStepInner(
 		modelAttempts,
 		totalCost: costSummaryFromAttempts(modelAttempts),
 		artifactPaths,
-		outputSaveError: artifactErrors.outputSaveError,
+		savedOutputPath: resolvedOutput.savedPath,
+		outputSaveError: resolvedOutput.saveError ?? artifactErrors.outputSaveError,
 		metadataSaveError: artifactErrors.metadataSaveError,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),
@@ -3856,6 +3880,8 @@ async function runSubagent(
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "execution", singleResult.execution);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "review", singleResult.review);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutput", singleResult.structuredOutput);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "savedOutputPath", singleResult.savedOutputPath);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "outputSaveError", singleResult.outputSaveError);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutputPath", singleResult.structuredOutputPath);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutputSchemaPath", singleResult.structuredOutputSchemaPath);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "acceptance", singleResult.acceptance);
@@ -3907,6 +3933,8 @@ async function runSubagent(
 					modelAttempts: pr.modelAttempts,
 					totalCost: pr.totalCost,
 					artifactPaths: pr.artifactPaths,
+					savedOutputPath: pr.savedOutputPath,
+					outputSaveError: pr.outputSaveError,
 					transcriptPath: pr.transcriptPath,
 					transcriptError: pr.transcriptError,
 					effects: pr.effects,
@@ -4246,6 +4274,8 @@ async function runSubagent(
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "execution", singleResult.execution);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "review", singleResult.review);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutput", singleResult.structuredOutput);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "savedOutputPath", singleResult.savedOutputPath);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "outputSaveError", singleResult.outputSaveError);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutputPath", singleResult.structuredOutputPath);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "structuredOutputSchemaPath", singleResult.structuredOutputSchemaPath);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "acceptance", singleResult.acceptance);
@@ -4332,6 +4362,8 @@ async function runSubagent(
 						modelAttempts: pr.modelAttempts,
 						totalCost: pr.totalCost,
 						artifactPaths: pr.artifactPaths,
+						savedOutputPath: pr.savedOutputPath,
+						outputSaveError: pr.outputSaveError,
 						transcriptPath: pr.transcriptPath,
 						transcriptError: pr.transcriptError,
 						effects: pr.effects,
@@ -4549,6 +4581,8 @@ async function runSubagent(
 				modelAttempts: singleResult.modelAttempts,
 				totalCost: singleResult.totalCost,
 				artifactPaths: singleResult.artifactPaths,
+				savedOutputPath: singleResult.savedOutputPath,
+				outputSaveError: singleResult.outputSaveError,
 				transcriptPath: singleResult.transcriptPath,
 				transcriptError: singleResult.transcriptError,
 				effects: singleResult.effects,
@@ -4636,6 +4670,8 @@ async function runSubagent(
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "execution", singleResult.execution);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "review", singleResult.review);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "structuredOutput", singleResult.structuredOutput);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "savedOutputPath", singleResult.savedOutputPath);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "outputSaveError", singleResult.outputSaveError);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "structuredOutputPath", singleResult.structuredOutputPath);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "structuredOutputSchemaPath", singleResult.structuredOutputSchemaPath);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "acceptance", singleResult.acceptance);
@@ -4900,6 +4936,7 @@ async function runSubagent(
 				modelAttempts: r.modelAttempts,
 				totalCost: r.totalCost,
 				artifactPaths: r.artifactPaths,
+				savedOutputPath: r.savedOutputPath,
 				outputSaveError: r.outputSaveError,
 				metadataSaveError: r.metadataSaveError,
 				truncated: r.truncated,
