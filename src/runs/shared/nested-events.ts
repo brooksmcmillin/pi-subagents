@@ -135,9 +135,9 @@ export function createNestedRoute(rootRunId: string): NestedRoute {
 	fs.mkdirSync(eventSink, { recursive: true, mode: 0o700 });
 	fs.mkdirSync(controlInbox, { recursive: true, mode: 0o700 });
 	const createdAt = Date.now();
-	fs.writeFileSync(path.join(routeRoot, ROUTE_FILE), `${JSON.stringify({ rootRunId, capabilityToken, createdAt })}\n`, { mode: 0o600 });
 	fs.mkdirSync(routeIndexDir(rootRunId), { recursive: true, mode: 0o700 });
 	writeAtomicJson(routeIndexPath(rootRunId, capabilityToken), { rootRunId, capabilityToken, routeRoot: path.basename(routeRoot), createdAt });
+	writeAtomicJson(path.join(routeRoot, ROUTE_FILE), { rootRunId, capabilityToken, createdAt });
 	return { rootRunId, eventSink, controlInbox, capabilityToken };
 }
 
@@ -546,8 +546,7 @@ function routeFromIndexEntry(rootRunId: string, filePath: string): NestedRoute |
 		};
 		validateRouteShape(route);
 		return route;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") fs.rmSync(filePath, { force: true });
+	} catch {
 		return undefined;
 	}
 }

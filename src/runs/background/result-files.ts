@@ -100,12 +100,12 @@ export function writeResultIndexForData(resultPath: string, data: Record<string,
 }
 
 export function writeAsyncResultFile(resultPath: string, data: Record<string, unknown>): void {
-	writeAtomicJson(resultPath, data);
 	try {
 		writeResultIndexForData(resultPath, data);
 	} catch (error) {
 		console.error(`Failed to write async result index for '${resultPath}':`, error);
 	}
+	writeAtomicJson(resultPath, data);
 }
 
 export function removeResultIndex(resultsDir: string, sessionId: string | undefined, runId: string | undefined, toolCallId?: string): void {
@@ -164,9 +164,12 @@ function resultFilesFromIndexDir(resultsDir: string, dir: string): string[] {
 	for (const entryPath of listIndexFiles(dir)) {
 		try {
 			const entry = parseResultIndexEntry(JSON.parse(fs.readFileSync(entryPath, "utf-8")));
-			const resultFile = entry ? indexedResultFile(resultsDir, entry) : undefined;
+			if (!entry) {
+				fs.rmSync(entryPath, { force: true });
+				continue;
+			}
+			const resultFile = indexedResultFile(resultsDir, entry);
 			if (resultFile) candidates.add(resultFile);
-			else fs.rmSync(entryPath, { force: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Ignoring invalid async result index '${entryPath}':`, error);
 		}

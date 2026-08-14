@@ -183,10 +183,7 @@ export function findAsyncRunPrefixMatches(prefix: string, asyncDirRoot: string, 
 	if (!requestedId) return [];
 	const asyncRoot = path.resolve(asyncDirRoot);
 	const resultRoot = path.resolve(resultsDir);
-	const matchingIds = [...new Set([
-		...prefixedRunIds(asyncRoot, requestedId),
-		...prefixedRunIds(resultRoot, requestedId, ".json"),
-	])].sort();
+	const matchingIds = prefixedRunIds(asyncRoot, requestedId).sort();
 	return matchingIds.map((id) => {
 		const asyncDir = path.join(asyncRoot, id);
 		assertInsideRoot(asyncRoot, asyncDir, "Async run directory");

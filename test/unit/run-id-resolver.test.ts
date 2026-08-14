@@ -141,6 +141,23 @@ describe("subagent run id resolver", () => {
 		}
 	});
 
+	it("does not resolve unindexed result files by prefix", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-id-result-prefix-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "legacy-run.json"), JSON.stringify({ id: "legacy-run", sessionId: "session-a", success: true }), "utf-8");
+
+			const exact = resolveSubagentRunId("legacy-run", { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal(exact?.kind, "async");
+			assert.equal(exact?.id, "legacy-run");
+			assert.equal(resolveSubagentRunId("legacy", { asyncDirRoot: asyncRoot, resultsDir }), undefined);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("resolves workflow tool-call ids through active and result indexes", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-resolver-tool-call-index-"));
 		try {
