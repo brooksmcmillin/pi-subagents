@@ -38,4 +38,17 @@ describe("result file indexes", () => {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
+
+	it("does not commit a result payload when its index cannot be written", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-index-failure-"));
+		try {
+			fs.writeFileSync(path.join(resultsDir, "result-index"), "not a directory", "utf-8");
+			const resultPath = path.join(resultsDir, "blocked.json");
+
+			assert.throws(() => writeAsyncResultFile(resultPath, { id: "blocked", runId: "blocked", sessionId: "session-a", success: true }));
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
 });

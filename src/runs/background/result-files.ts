@@ -100,11 +100,7 @@ export function writeResultIndexForData(resultPath: string, data: Record<string,
 }
 
 export function writeAsyncResultFile(resultPath: string, data: Record<string, unknown>): void {
-	try {
-		writeResultIndexForData(resultPath, data);
-	} catch (error) {
-		console.error(`Failed to write async result index for '${resultPath}':`, error);
-	}
+	writeResultIndexForData(resultPath, data);
 	writeAtomicJson(resultPath, data);
 }
 

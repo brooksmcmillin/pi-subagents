@@ -541,7 +541,7 @@ describe("result watcher", () => {
 				otherWatcher.primeExistingResults();
 				await new Promise((resolve) => setTimeout(resolve, 10));
 				ownerWatcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				assert.equal(await waitForPredicate(() => owner.emitted.some((entry) => entry.event === "subagent:async-complete")), true);
 			} finally {
 				ownerWatcher.stopResultWatcher();
 				otherWatcher.stopResultWatcher();
