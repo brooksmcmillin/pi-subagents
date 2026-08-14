@@ -16,16 +16,19 @@ Use this skill when the parent orchestrator needs one specialized child or compo
 
 ## How to use this router
 
-Read the matching reference file before acting. Paths are relative to this `SKILL.md`; resolve them against `skills/pi-subagents/` and load them with the read tool.
+**Do not read the references below to decide whether to delegate.** That decision is made by the parent session from its own rules and the user's request, not by reading this skill. The agent catalog and orchestration recipes are only useful after the parent has decided to delegate work, and loading them earlier just to "check" wastes context for sessions that end up doing the work themselves.
 
-| Task | Read |
+Once the parent has decided to delegate, read the matching reference file before acting. Paths are relative to this `SKILL.md`; resolve them against `skills/pi-subagents/` and load them with the read tool.
+
+| Task (after deciding to delegate) | Read |
 | --- | --- |
-| Decide whether to delegate, choose agents, compare tool versus slash commands, apply prompt techniques, or understand builtin roles | `references/prompting-and-roles.md` |
-| Run one-child, scripted, async, scheduled, mission-backed, forked, watchdog, oracle, or intercom-coordinated workflows | `references/execution-controls.md` |
-| List/create/update/delete/eject/disable agents, inspect legacy chain records, edit agent files, use prompt-template integration, or expose extension RPC | `references/management-authoring-rpc.md` |
-| Check safety constraints, best practices, standard workflows, or error handling | `references/constraints-and-recipes.md` |
+| Choose an agent, write a subagent prompt, override its model, or compare tool vs slash commands | `references/agent-catalog.md` |
+| Pick an execution shape: one-child, scripted, async, scheduled, mission-backed, forked, watchdog, oracle, or intercom-coordinated | `references/execution-controls.md` |
+| List/create/update/delete/eject/disable agents or chains, edit agent files, use prompt-template integration, or expose extension RPC | `references/management-authoring-rpc.md` |
+| Apply an orchestration recipe (parallel review, review loop, parallel research, gather-then-clarify, parallel cleanup, staged fix orchestration, Fable mode, etc.) | `references/orchestration-recipes.md` |
+| Check safety constraints, best practices, or error handling | `references/constraints-and-recipes.md` |
 
-For broad or uncertain requests, read more than one reference. For complex work, start with `references/prompting-and-roles.md` and `references/execution-controls.md`, then consult `references/constraints-and-recipes.md` before launching or reviewing child work.
+For broad or uncertain requests, read more than one reference. For complex work, start with `references/agent-catalog.md` and `references/execution-controls.md`, then consult `references/orchestration-recipes.md` and `references/constraints-and-recipes.md` before launching or reviewing child work.
 
 ## Always-on constraints
 

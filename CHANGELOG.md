@@ -38,6 +38,7 @@
 - Preserve workflow child task output when neither the workflow nor child configures an output file (#1136).
 
 ### Changed
+- Split bundled `pi-subagents` skill into a lean router plus on-demand references. The agent catalog now lives in `references/agent-catalog.md` and orchestration recipes in `references/orchestration-recipes.md`; the router explicitly gates both reads to "after deciding to delegate," so sessions that do not delegate do not pay the catalog/recipe cost. Removed `references/prompting-and-roles.md` (folded into `agent-catalog.md` and `orchestration-recipes.md`) and moved the always-on constraints, best practices, and error handling into a slimmer `references/constraints-and-recipes.md`.
 - Register the default `subagent` tool prompt as split metadata: a short description plus `promptSnippet` and `promptGuidelines`, while keeping explicit `full`, `compact`, and `custom` description modes.
 - Keep `worktree: true` workflow children on the single-child path while preserving managed patch handoffs, and remove unused foreground chain/parallel execution and durable chain management surfaces.
 - Document scripted chaining as the supported workflow API, with migration examples for removed top-level chain/task inputs.
