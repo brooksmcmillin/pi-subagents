@@ -318,6 +318,58 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("does not redeliver user notification after reload while observer retry is pending", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-observer-reload-"));
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const resultPath = path.join(resultsDir, "observer-reload.json");
+			writeIndexedResult(resultPath, { id: "observer-reload", runId: "observer-reload", sessionId: "session-current", success: true, summary: "done" });
+			let observerCalls = 0;
+			let deliveries = 0;
+			let emitted = 0;
+			const pi = { events: { on: () => () => {}, emit: () => { emitted += 1; } } };
+			const firstState = createState();
+			firstState.currentSessionId = "session-current";
+			const firstWatcher = createResultWatcher(pi, firstState, resultsDir, 60_000, {
+				observeCompletion: () => {
+					observerCalls += 1;
+					throw new Error("observer unavailable");
+				},
+				notifier: { deliver: async () => { deliveries += 1; return true; } },
+			});
+			try {
+				firstWatcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => {
+					if (deliveries !== 1 || !fs.existsSync(resultPath)) return false;
+					return typeof (JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { notificationDeliveredAt?: unknown }).notificationDeliveredAt === "number";
+				}), true);
+			} finally {
+				firstWatcher.stopResultWatcher();
+			}
+
+			const secondState = createState();
+			secondState.currentSessionId = "session-current";
+			const secondWatcher = createResultWatcher(pi, secondState, resultsDir, 60_000, {
+				observeCompletion: () => { observerCalls += 1; },
+				notifier: { deliver: async () => { deliveries += 1; return true; } },
+			});
+			try {
+				secondWatcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			} finally {
+				secondWatcher.stopResultWatcher();
+			}
+
+			assert.equal(observerCalls, 2);
+			assert.equal(deliveries, 1);
+			assert.equal(emitted, 1);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("observes retained-project completions without changing active-session delivery", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scheduled-"));
 		const resultsDir = path.join(root, "results");

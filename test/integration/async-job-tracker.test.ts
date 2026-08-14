@@ -344,8 +344,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const routeRoot = path.dirname(nestedRoute.eventSink);
 		try {
 			const runDir = path.join(asyncRoot, "run-restored-nested");
+			const statusPath = path.join(runDir, "status.json");
 			fs.mkdirSync(runDir, { recursive: true });
-			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+			const statusPayload = {
 				runId: "run-restored-nested",
 				mode: "single",
 				state: "running",
@@ -353,7 +354,8 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				startedAt: 1000,
 				lastUpdate: 2000,
 				steps: [{ agent: "worker", status: "running" }],
-			}), "utf-8");
+			};
+			fs.writeFileSync(statusPath, JSON.stringify(statusPayload), "utf-8");
 			updateActiveRunIndex(runDir, "running");
 			const state = createState();
 			state.currentSessionId = "session-restored-nested";
@@ -379,8 +381,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 					agent: "nested-worker",
 				},
 			}), "utf-8");
+			fs.writeFileSync(statusPath, JSON.stringify({ ...statusPayload, lastUpdate: 3001 }), "utf-8");
 
-			await waitForCondition(() => state.asyncJobs.get("run-restored-nested")?.nestedChildren?.[0]?.id === "nested-child", "restored evented nested child refresh", 1000);
+			await waitForCondition(() => state.asyncJobs.get("run-restored-nested")?.nestedChildren?.[0]?.id === "nested-child", "restored evented nested child refresh", 3000);
 			assert.equal(state.asyncJobs.get("run-restored-nested")?.steps?.[0]?.children?.[0]?.id, "nested-child");
 			tracker.resetJobs();
 		} finally {

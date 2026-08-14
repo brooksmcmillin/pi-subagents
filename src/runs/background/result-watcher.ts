@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
+import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import {
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
 	type IntercomEventBus,
@@ -83,6 +84,7 @@ type ResultFileData = CompletionNotification & {
 	asyncDir?: string;
 	intercomTarget?: string;
 	parallelHandoff?: ParallelHandoffReference;
+	notificationDeliveredAt?: unknown;
 };
 
 type ResultFileIdentity = {
@@ -142,6 +144,16 @@ function isNotFound(error: unknown): boolean {
 function shouldPoll(error: unknown): boolean {
 	const code = errorCode(error);
 	return code === "EMFILE" || code === "ENOSPC";
+}
+
+function hasDeliveredNotification(data: ResultFileData): boolean {
+	return typeof data.notificationDeliveredAt === "number" && Number.isFinite(data.notificationDeliveredAt);
+}
+
+function markDeliveredNotification(resultPath: string, data: ResultFileData, runId: string, now: number): ResultFileData {
+	const marked = { ...data, runId, notificationDeliveredAt: now };
+	writeAtomicJson(resultPath, marked);
+	return marked;
 }
 
 /**
@@ -243,8 +255,9 @@ export function createResultWatcher(
 		if (!shouldProcessResult(file)) return;
 		processing.add(file);
 		try {
-			const data = parseResult(fsApi.readFileSync(resultPath, "utf-8"));
+			let data = parseResult(fsApi.readFileSync(resultPath, "utf-8"));
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
+			const sessionId = data.sessionId;
 			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
 			const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : undefined;
 			let observerSucceeded = true;
@@ -262,12 +275,12 @@ export function createResultWatcher(
 			}
 			if (observerSucceeded) removeMissionObserverIndex(resultsDir, runId);
 			const epoch = deliveryEpoch;
-			if (!ownsSession(data.sessionId, epoch)) return;
+			if (!ownsSession(sessionId, epoch)) return;
 			// Recorded before dedupe and before the unlink below so subagent_wait can
 			// use the in-memory record or its bounded durable replay after cleanup.
 			recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
 				resultsDir,
-				sessionId: data.sessionId,
+				sessionId,
 			});
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(data.nestedChildren, resultPath, "nestedChildren"));
@@ -282,6 +295,7 @@ export function createResultWatcher(
 			}
 
 			const completionKey = buildCompletionKey(data, `result:${file}`);
+			const alreadyDelivered = hasDeliveredNotification(data);
 			const lastSeenAt = state.completionSeen.get(completionKey);
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
@@ -290,11 +304,11 @@ export function createResultWatcher(
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
+				if (!ownsSession(sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
 				try {
 					fsApi.unlinkSync(resultPath);
 					identityCache.delete(file);
-					removeResultIndex(resultsDir, data.sessionId, runId, toolCallId);
+					removeResultIndex(resultsDir, sessionId, runId, toolCallId);
 				} catch (error) {
 					if (!isNotFound(error)) {
 						console.error(`Failed to remove delivered subagent result '${resultPath}'; will retry:`, error);
@@ -348,6 +362,26 @@ export function createResultWatcher(
 				};
 			}), nestedChildren);
 
+			if (alreadyDelivered) {
+				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
+				if (!observerSucceeded) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
+				if (!ownsSession(sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
+				try {
+					fsApi.unlinkSync(resultPath);
+					identityCache.delete(file);
+					removeResultIndex(resultsDir, sessionId, runId, toolCallId);
+				} catch (error) {
+					if (!isNotFound(error)) {
+						console.error(`Failed to remove delivered subagent result '${resultPath}'; will retry:`, error);
+						scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					}
+				}
+				return;
+			}
+
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
 			if (deliverIntercomResults && intercomTarget && triggerTurn) {
@@ -364,7 +398,7 @@ export function createResultWatcher(
 					asyncDir: data.asyncDir,
 					...(data.parallelHandoff ? { parallelHandoff: data.parallelHandoff } : {}),
 				}));
-				if (!ownsSession(data.sessionId, epoch)) return;
+				if (!ownsSession(sessionId, epoch)) return;
 				if (!intercomDelivered) console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
 			}
 
@@ -388,8 +422,16 @@ export function createResultWatcher(
 					})) : [],
 				} : {}),
 			});
-			if (!ownsSession(data.sessionId, epoch)) return;
+			if (!ownsSession(sessionId, epoch)) return;
 			if (!accepted) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
+			}
+			try {
+				data = markDeliveredNotification(resultPath, data, runId, Date.now());
+				identityCache.delete(file);
+			} catch (error) {
+				console.error(`Failed to mark subagent result notification delivered for '${resultPath}'; will retry:`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
@@ -421,11 +463,11 @@ export function createResultWatcher(
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
-			if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
+			if (!ownsSession(sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
 			try {
 				fsApi.unlinkSync(resultPath);
 				identityCache.delete(file);
-				removeResultIndex(resultsDir, data.sessionId, runId, toolCallId);
+				removeResultIndex(resultsDir, sessionId, runId, toolCallId);
 			} catch (error) {
 				if (!isNotFound(error)) {
 					console.error(`Failed to remove delivered subagent result '${resultPath}'; will retry:`, error);
