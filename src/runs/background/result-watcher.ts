@@ -28,6 +28,7 @@ const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
 const HEALTHY_SCAN_INTERVAL_MS = 60_000;
 const RETRY_DELAY_MS = 100;
+const MAX_INCOMPLETE_RESULT_RETRIES = 3;
 
 type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "realpathSync" | "statSync" | "watch">;
 
@@ -134,6 +135,10 @@ function shouldPoll(error: unknown): boolean {
 	return code === "EMFILE" || code === "ENOSPC";
 }
 
+function isIncompleteJson(error: unknown): boolean {
+	return error instanceof SyntaxError;
+}
+
 /**
  * Watches persisted async results for the session currently owned by this
  * runtime. `stopResultWatcher()` revokes ownership before closing resources,
@@ -156,6 +161,7 @@ export function createResultWatcher(
 	const parseResult = deps.parseResult ?? ((raw: string) => JSON.parse(raw) as ResultFileData);
 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
 	const pendingTriggerTurn = new Map<string, boolean>();
+	const incompleteResultRetries = new Map<string, number>();
 	const processing = new Set<string>();
 	const identityCache = new Map<string, { signature: string; identity: ResultFileIdentity }>();
 	let deliveryActive = true;
@@ -217,11 +223,28 @@ export function createResultWatcher(
 
 	const handleResult = async (file: string, triggerTurn: boolean) => {
 		const resultPath = path.join(resultsDir, file);
-		if (processing.has(file) || !fsApi.existsSync(resultPath)) return;
+		if (processing.has(file)) return;
+		if (!fsApi.existsSync(resultPath)) {
+			incompleteResultRetries.delete(file);
+			return;
+		}
 		if (!shouldProcessResult(file)) return;
 		processing.add(file);
 		try {
-			const data = parseResult(fsApi.readFileSync(resultPath, "utf-8"));
+			let data: ResultFileData;
+			try {
+				data = parseResult(fsApi.readFileSync(resultPath, "utf-8"));
+				incompleteResultRetries.delete(file);
+			} catch (error) {
+				const retries = incompleteResultRetries.get(file) ?? 0;
+				if (isIncompleteJson(error) && retries < MAX_INCOMPLETE_RESULT_RETRIES) {
+					incompleteResultRetries.set(file, retries + 1);
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
+				incompleteResultRetries.delete(file);
+				throw error;
+			}
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
 			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
 			try {
@@ -511,6 +534,7 @@ export function createResultWatcher(
 		pendingTriggerTurn.clear();
 		processing.clear();
 		identityCache.clear();
+		incompleteResultRetries.clear();
 	};
 
 	return { startResultWatcher, primeExistingResults, stopResultWatcher };
