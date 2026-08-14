@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAsyncResultFile } from "./result-files.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
 import { isActiveAsyncState, updateActiveRunIndex } from "./active-run-index.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
@@ -2268,7 +2269,7 @@ async function runSubagent(
 
 	fs.mkdirSync(asyncDir, { recursive: true });
 	writeAtomicJson(statusPath, statusPayload);
-	updateActiveRunIndex(asyncDir, statusPayload.state);
+	updateActiveRunIndex(asyncDir, statusPayload.state, statusPayload.toolCallId);
 	let pendingParallelUsageCost: CostSummary = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
 	const currentUsageTotals = (): CostSummary => {
 		const cost = results.reduce<CostSummary>((sum, result) => ({
@@ -2346,8 +2347,8 @@ async function runSubagent(
 		refreshWorkflowGraph();
 		writeAtomicJson(statusPath, statusPayload);
 		const activeState = isActiveAsyncState(statusPayload.state);
-		if (activeState && activeState !== lastIndexedActiveState) {
-			updateActiveRunIndex(asyncDir, statusPayload.state);
+		if (activeState !== lastIndexedActiveState) {
+			updateActiveRunIndex(asyncDir, statusPayload.state, statusPayload.toolCallId);
 		}
 		lastIndexedActiveState = activeState;
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
@@ -4690,7 +4691,7 @@ async function runSubagent(
 	}
 	writeStatusPayload();
 	try {
-		writeAtomicJson(resultPath, {
+		writeAsyncResultFile(resultPath, {
 			lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 			id,
 			agent: agentName,

@@ -975,33 +975,31 @@ describe("subagent_wait tool", () => {
 				},
 			};
 
-			// A real timer-based sleep with a LONG poll interval; if wait waited for
-			// the poll it would take ~10s. The event should wake it in ~10ms.
 			let sleepCalls = 0;
-			const realSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+			let sleepArmed!: () => void;
+			const armed = new Promise<void>((resolve) => { sleepArmed = resolve; });
+			const sleep = (_ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
 				sleepCalls += 1;
-				const t = setTimeout(resolve, ms);
-				signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+				signal?.addEventListener("abort", resolve, { once: true });
+				sleepArmed();
 			});
 
-			const startedAt = Date.now();
 			const p = waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
 				events,
 				pollIntervalMs: 10_000,
-				sleep: realSleep,
+				sleep,
 			}));
 
-			// After a short delay, flip the run terminal and emit a completion event.
-			setTimeout(() => {
-				writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
-				events.emit("subagent:async-complete", { id: "run-a" });
-			}, 15);
+			await armed;
+			writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+			events.emit("subagent:async-complete", { id: "run-a" });
 
-			const result = await p;
-			const elapsed = Date.now() - startedAt;
+			const result = await Promise.race([
+				p,
+				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("event wake did not resolve subagent_wait")), 1_000)),
+			]);
 			assert.equal(result.isError, undefined);
 			assert.match(textOf(result), /done/i);
-			assert.ok(elapsed < 5_000, `should wake via event, not the 10s poll; took ${elapsed}ms`);
 			assert.ok(sleepCalls >= 1, "poll-interval sleep still armed as fallback");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

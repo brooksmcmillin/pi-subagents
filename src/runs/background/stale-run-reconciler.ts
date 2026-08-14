@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { resultFilePath, writeAsyncResultFile } from "./result-files.ts";
 import { releaseActiveRunIndex, updateActiveRunIndex } from "./active-run-index.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { DIRS, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode } from "../../shared/types.ts";
@@ -197,7 +198,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	};
 }
 
-function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, reason?: string): { status: AsyncStatus; result: object; message: string } {
+function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, reason?: string): { status: AsyncStatus; result: Record<string, unknown>; message: string } {
 	const runId = status.runId || path.basename(asyncDir);
 	const pid = typeof status.pid === "number" ? status.pid : "unknown";
 	const baseMessage = reason ?? `Async runner process ${pid} exited or disappeared before writing a result. Marked run failed by stale-run reconciliation.`;
@@ -259,7 +260,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 
 function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string): ReconcileAsyncRunResult {
 	const repair = buildFailedRepair(status, asyncDir, now, reason);
-	writeAtomicJson(resultPath, repair.result);
+	writeAsyncResultFile(resultPath, repair.result);
 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
 	if (repair.status.processTerminal?.state === "observed") releaseActiveRunIndex(asyncDir);
 	appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), {
@@ -344,7 +345,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		if (stepRecord.thinking !== undefined && typeof stepRecord.thinking !== "string") throw new Error(`Invalid async status file '${statusPath}': steps[${index}].thinking must be a string.`);
 	}
 	const runId = effectiveStatus.runId || path.basename(asyncDir);
-	const resultPath = path.join(options.resultsDir ?? DIRS.results, `${runId}.json`);
+	const resultPath = resultFilePath(options.resultsDir ?? DIRS.results, runId);
 	if (fs.existsSync(resultPath)) {
 		const terminalStatus = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
 			? terminalStatusFromResult(effectiveStatus, resultPath, now)

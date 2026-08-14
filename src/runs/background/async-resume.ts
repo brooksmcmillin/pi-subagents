@@ -8,6 +8,7 @@ import { intersectSubagentCapabilityCeilings, parseSubagentCapabilityCeiling, ty
 import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
+import { resultFilePath } from "./result-files.ts";
 
 export interface AsyncResumeParams {
 	id?: string;
@@ -172,7 +173,7 @@ function prefixedRunIds(dir: string, prefix: string, suffix = ""): string[] {
 }
 
 function exactResultPath(resultsDir: string, runId: string): string | null {
-	const resultPath = path.join(resultsDir, `${runId}.json`);
+	const resultPath = resultFilePath(resultsDir, runId);
 	assertInsideRoot(resultsDir, resultPath, "Async result file");
 	return fs.existsSync(resultPath) ? resultPath : null;
 }
