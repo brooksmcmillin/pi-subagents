@@ -32,6 +32,22 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 }
 
 describe("registered subagent tool description", () => {
+	it("lists agents only for discovery when no named role is already selected", () => {
+		for (const description of [
+			SUBAGENT_SAFETY_GUIDANCE,
+			FULL_SUBAGENT_TOOL_DESCRIPTION,
+			COMPACT_SUBAGENT_TOOL_DESCRIPTION,
+		]) {
+			assert.match(description, /action:\s*"list".*discovery/i);
+			assert.match(description, /Launch known named agents directly/i);
+			assert.match(description, /runtime validation fails closed/i);
+			assert.doesNotMatch(
+				description,
+				/Use \{ action: "list" \} before execution|Call \{ action:"list" \} first/i,
+			);
+		}
+	});
+
 	it("uses split metadata by default", () => {
 		const description = buildSubagentToolDescription();
 		const metadata = buildSubagentToolPromptMetadata();
@@ -40,9 +56,10 @@ describe("registered subagent tool description", () => {
 		assert.equal(metadata.promptSnippet, SUBAGENT_TOOL_PROMPT_SNIPPET);
 		assert.equal(Buffer.byteLength(metadata.promptSnippet!), 62);
 		assert.deepEqual(metadata.promptGuidelines, SUBAGENT_TOOL_PROMPT_GUIDELINES);
-		assert.equal(Buffer.byteLength(metadata.promptGuidelines!.join("\n")), 741);
+		assert.equal(Buffer.byteLength(metadata.promptGuidelines!.join("\n")), 851);
 		assert.match(metadata.promptGuidelines!.join("\n"), /Use subagent only when delegation is needed/i);
-		assert.match(metadata.promptGuidelines!.join("\n"), /action: \"list\".*executable, non-disabled/i);
+		assert.match(metadata.promptGuidelines!.join("\n"), /action: "list".*discovery/i);
+		assert.match(metadata.promptGuidelines!.join("\n"), /Launch known named agents directly/i);
 		assert.match(metadata.promptGuidelines!.join("\n"), /workflowScript for multi-step or parallel work/i);
 		assert.match(metadata.promptGuidelines!.join("\n"), /workflowScript means exactly one top-level subagent tool call with async:true/i);
 		assert.match(metadata.promptGuidelines!.join("\n"), /Inside it, use runs\.run\/runs\.all to launch children/i);
@@ -73,7 +90,7 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /continue independent work only until its next dependency barrier; consume the result before work that depends on it/i);
 		assert.match(description, /children\.list.*resumable\/not-resumable reasons/i);
 		assert.match(description, /Resume only rows reported resumable/i);
-		assert.match(description, /implementation challenge.*\{action:\"resume\", id:\"run-id\", message:\"\.\.\.\"\}/i);
+		assert.match(description, /implementation challenge.*\{action:"resume", id:"run-id", message:"\.\.\."\}/i);
 		assert.match(description, /Resume keeps the stored agent\/model\/tool contract/i);
 		assert.match(description, /Oracle\/advisor consultations should use supervisor dialogue for material unknowns when available/i);
 		assert.match(description, /same-role fallback challenge and label it as fallback/i);
@@ -93,7 +110,7 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /subagent_wait/i);
 		assert.match(description, /continue independent work only until its next dependency barrier; consume the result before work that depends on it/i);
 		assert.match(description, /children\.list.*resume only rows reported resumable/i);
-		assert.match(description, /\{action:\"resume\",id:\"run-id\",message:\"\.\.\.\"\} for a simple follow-up or challenge/i);
+		assert.match(description, /\{action:"resume",id:"run-id",message:"\.\.\."\} for a simple follow-up or challenge/i);
 		assert.match(description, /resume keeps the stored agent\/model\/tool contract/i);
 		assert.match(description, /Oracle\/advisor consultations use available supervisor dialogue/i);
 		assert.match(description, /same-role fallback challenge and label it as fallback/i);

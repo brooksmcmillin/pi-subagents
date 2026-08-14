@@ -5,7 +5,9 @@ description: |
   scripted-chaining, async, forked-context, and coordinated workflows. Use
   for advisory review, implementation handoffs, and multi-step tasks where a
   single agent should stay in control while other agents contribute context,
-  planning, or execution.
+  planning, or execution. Do not use for one ordinary read-only quick-scout or
+  quick-review launch when the registered subagent tool description already
+  provides that named-role contract; launch it directly from that contract.
 ---
 
 # Pi Subagents
@@ -13,6 +15,12 @@ description: |
 This skill is for the main parent orchestrator only. Do not inject or follow it inside spawned child subagents. The parent session owns delegation, orchestration, review fanout, and final fix-worker launches. Ordinary children should not run their own subagent workflows; the explicit exception is a delegated fanout child whose resolved builtin `tools` includes `subagent`, and that child may use `subagent` only for the fanout work the parent assigned.
 
 Use this skill when the parent orchestrator needs one specialized child or composed orchestration. Use `workflowScript` for all execution, including one isolated child. Chaining is still supported, but it is code-driven: use `await runs.run(...)` for sequential steps, `runs.all([...])` for parallel fanout, and ordinary JavaScript for branching, retries, gate monitors, and aggregation. Keep workflow helpers portable: use plain helper functions or explicit Promise chains, not nested `async function` helpers, async arrows, or async methods. Do not use legacy top-level `chain` / `tasks` inputs or durable `.chain.md` execution. Scripted workflows normally start asynchronously unless config sets `asyncByDefault:false`; set `async:true` explicitly when async behavior matters. Pass `async:false` only when the parent must block until completion. Async mode still shows progress. Do not use `async:false` for final reviews, backlog gates, run-to-completion convenience, or because no other work is available.
+
+Exception: for one ordinary read-only `quick-scout` or `quick-review` launch,
+follow the registered subagent tool description directly and do not load this
+skill or its references. Load this skill when the role is unfamiliar, the
+launch is customized, or the work requires fanout, retries, lifecycle control,
+mutation, or broader orchestration.
 
 ## How to use this router
 
@@ -22,7 +30,7 @@ Once the parent has decided to delegate, read the matching reference file before
 
 | Task (after deciding to delegate) | Read |
 | --- | --- |
-| Choose an agent, write a subagent prompt, override its model, or compare tool vs slash commands | `references/agent-catalog.md` |
+| Choose an agent, write a custom prompt, override its model, or compare tool vs slash commands | `references/agent-catalog.md` |
 | Pick an execution shape: one-child, scripted, async, scheduled, mission-backed, forked, watchdog, oracle, or intercom-coordinated | `references/execution-controls.md` |
 | List/create/update/delete/eject/disable agents or chains, edit agent files, use prompt-template integration, or expose extension RPC | `references/management-authoring-rpc.md` |
 | Apply an orchestration recipe (parallel review, review loop, parallel research, gather-then-clarify, parallel cleanup, staged fix orchestration, Fable mode, etc.) | `references/orchestration-recipes.md` |
