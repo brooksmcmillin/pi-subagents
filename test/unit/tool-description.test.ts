@@ -28,6 +28,22 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 }
 
 describe("registered subagent tool description", () => {
+	it("lists agents only for discovery when no named role is already selected", () => {
+		for (const description of [
+			SUBAGENT_SAFETY_GUIDANCE,
+			FULL_SUBAGENT_TOOL_DESCRIPTION,
+			COMPACT_SUBAGENT_TOOL_DESCRIPTION,
+		]) {
+			assert.match(description, /action:\s*"list".*discovery/i);
+			assert.match(description, /Launch known named agents directly/i);
+			assert.match(description, /runtime validation fails closed/i);
+			assert.doesNotMatch(
+				description,
+				/Use \{ action: "list" \} before execution|Call \{ action:"list" \} first/i,
+			);
+		}
+	});
+
 	it("describes structured single-child execution and workflow orchestration", () => {
 		const description = buildSubagentToolDescription();
 		assert.match(description, /^Run one child with \{ agent, task\? \}; use \{ workflowScript \} for orchestration/i);
