@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Split bundled `pi-subagents` skill into a lean router plus on-demand references. The agent catalog now lives in `references/agent-catalog.md` and orchestration recipes in `references/orchestration-recipes.md`; the router explicitly gates both reads to "after deciding to delegate," so sessions that do not delegate do not pay the catalog/recipe cost. Removed `references/prompting-and-roles.md` (folded into `agent-catalog.md` and `orchestration-recipes.md`) and moved the always-on constraints, best practices, and error handling into a slimmer `references/constraints-and-recipes.md`.
+
 ## [0.49.0] - 2026-08-13
 
 ### Added
