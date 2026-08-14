@@ -285,6 +285,39 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("keeps result files until failed completion observers retry successfully", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-observer-retry-"));
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const resultPath = path.join(resultsDir, "observer-retry.json");
+			writeIndexedResult(resultPath, { id: "observer-retry", runId: "observer-retry", sessionId: "session-current", success: true, summary: "done" });
+			const state = createState();
+			state.currentSessionId = "session-current";
+			let observerCalls = 0;
+			let deliveries = 0;
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observeCompletion: () => {
+					observerCalls += 1;
+					if (observerCalls === 1) throw new Error("observer unavailable");
+				},
+				notifier: { deliver: async () => { deliveries += 1; return true; } },
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && observerCalls >= 2), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(observerCalls, 2);
+			assert.equal(deliveries, 1);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("observes retained-project completions without changing active-session delivery", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scheduled-"));
 		const resultsDir = path.join(root, "results");

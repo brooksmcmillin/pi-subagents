@@ -376,6 +376,7 @@ describe("async status helpers", () => {
 		try {
 			const asyncDir = createAsyncDir(root, "run-stale", {
 				runId: "run-stale",
+				sessionId: "session-stale",
 				mode: "single",
 				state: "running",
 				pid: 12345,

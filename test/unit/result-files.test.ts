@@ -39,7 +39,7 @@ describe("result file indexes", () => {
 		}
 	});
 
-	it("does not commit a result payload when its index cannot be written", () => {
+	it("does not commit a result payload when its session index cannot be written", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-index-failure-"));
 		try {
 			fs.writeFileSync(path.join(resultsDir, "result-index"), "not a directory", "utf-8");
@@ -48,6 +48,37 @@ describe("result file indexes", () => {
 			assert.throws(() => writeAsyncResultFile(resultPath, { id: "blocked", runId: "blocked", sessionId: "session-a", success: true }));
 			assert.equal(fs.existsSync(resultPath), false);
 		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not commit a result payload without a session id", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-no-session-"));
+		try {
+			const resultPath = path.join(resultsDir, "blocked.json");
+
+			assert.throws(() => writeAsyncResultFile(resultPath, { id: "blocked", runId: "blocked", success: true }), /sessionId/);
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("commits a result payload when only an optional index fails", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-optional-index-"));
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			fs.mkdirSync(path.join(resultsDir, "result-index"), { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "result-index", "tool-calls"), "not a directory", "utf-8");
+			const resultPath = path.join(resultsDir, "kept.json");
+
+			writeAsyncResultFile(resultPath, { id: "kept", runId: "kept", sessionId: "session-a", toolCallId: "call-a", success: true });
+
+			assert.equal(fs.existsSync(resultPath), true);
+			assert.deepEqual(resultFilesForSession(resultsDir, "session-a"), ["kept.json"]);
+		} finally {
+			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});

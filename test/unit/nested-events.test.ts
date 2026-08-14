@@ -39,9 +39,23 @@ const savedEnv = {
 	[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]: process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV],
 };
 
-afterEach(() => {
+async function removeDirWithRetry(dir: string): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			lastError = error;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	}
+	throw lastError;
+}
+
+afterEach(async () => {
 	for (const route of routes.splice(0)) {
-		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		await removeDirWithRetry(path.dirname(route.eventSink));
 	}
 	for (const [key, value] of Object.entries(savedEnv)) {
 		if (value === undefined) delete process.env[key];

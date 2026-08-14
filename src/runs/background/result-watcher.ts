@@ -286,6 +286,10 @@ export function createResultWatcher(
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
+				if (!observerSucceeded) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
 				if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
 				try {
 					fsApi.unlinkSync(resultPath);
@@ -412,6 +416,10 @@ export function createResultWatcher(
 				});
 			} catch (error) {
 				console.error(`Completion observer failed for '${resultPath}':`, error);
+			}
+			if (!observerSucceeded) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
 			}
 			if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
 			try {

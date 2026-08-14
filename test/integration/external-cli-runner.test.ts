@@ -28,6 +28,7 @@ describe("external CLI async lifecycle", () => {
 		const configPath = path.join(dir, "config.json");
 		fs.writeFileSync(configPath, JSON.stringify({
 			id: "external-lifecycle",
+			sessionId: "session-external",
 			steps: [{
 				agent: "external",
 				task: "Task text",

@@ -260,7 +260,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 
 function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string): ReconcileAsyncRunResult {
 	const repair = buildFailedRepair(status, asyncDir, now, reason);
-	writeAsyncResultFile(resultPath, repair.result);
+	if (repair.result.sessionId) writeAsyncResultFile(resultPath, repair.result);
 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
 	if (repair.status.processTerminal?.state === "observed") releaseActiveRunIndex(asyncDir);
 	appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), {
@@ -268,10 +268,10 @@ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: st
 		ts: now,
 		runId: repair.status.runId,
 		pid: status.pid,
-		resultPath,
+		...(repair.result.sessionId ? { resultPath } : {}),
 		message: repair.message,
 	});
-	return { status: repair.status, repaired: true, resultPath, message: repair.message };
+	return { status: repair.status, repaired: true, ...(repair.result.sessionId ? { resultPath } : {}), message: repair.message };
 }
 
 function terminal(state: AsyncStatus["state"]): boolean {

@@ -93,13 +93,22 @@ export function writeResultIndexForData(resultPath: string, data: Record<string,
 	const resultsDir = path.dirname(resultPath);
 	writeAtomicJson(resultIndexPath(resultsDir, sessionId, runId), entry);
 	const toolCallId = nonEmptyString(data.toolCallId);
-	if (toolCallId) writeAtomicJson(toolCallIndexPath(resultsDir, toolCallId, runId), entry);
-	if (entry.asyncDir && fs.existsSync(path.join(entry.asyncDir, MISSION_BINDING_FILE))) {
-		writeAtomicJson(observerIndexPath(resultsDir, MISSION_OBSERVER, runId), entry);
+	try {
+		if (toolCallId) writeAtomicJson(toolCallIndexPath(resultsDir, toolCallId, runId), entry);
+	} catch (error) {
+		console.error(`Failed to write async result tool-call index for '${resultPath}':`, error);
+	}
+	try {
+		if (entry.asyncDir && fs.existsSync(path.join(entry.asyncDir, MISSION_BINDING_FILE))) {
+			writeAtomicJson(observerIndexPath(resultsDir, MISSION_OBSERVER, runId), entry);
+		}
+	} catch (error) {
+		console.error(`Failed to write async result observer index for '${resultPath}':`, error);
 	}
 }
 
 export function writeAsyncResultFile(resultPath: string, data: Record<string, unknown>): void {
+	if (!nonEmptyString(data.sessionId)) throw new Error(`Cannot write async result '${resultPath}' without a sessionId.`);
 	writeResultIndexForData(resultPath, data);
 	writeAtomicJson(resultPath, data);
 }

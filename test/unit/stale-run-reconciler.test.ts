@@ -71,6 +71,37 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("repairs sessionless stale status without writing an unindexed result", () => {
+		const root = tempRoot("pi-stale-run-sessionless-");
+		try {
+			const asyncDir = path.join(root, "run-sessionless");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-sessionless",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				currentStep: 0,
+				steps: [{ agent: "scout", status: "running", startedAt: 1000 }],
+			});
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, true);
+			assert.equal(result.resultPath, undefined);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "failed");
+			assert.equal(fs.existsSync(path.join(resultsDir, "run-sessionless.json")), false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("includes runner stderr diagnostics when repairing a stale startup crash", () => {
 		const root = tempRoot("pi-stale-run-stderr-");
 		try {
@@ -78,6 +109,7 @@ describe("async stale-run reconciliation", () => {
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
 				runId: "run-dead-stderr",
+				sessionId: "session-current",
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -113,6 +145,7 @@ describe("async stale-run reconciliation", () => {
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
 				runId: "run-dead-events-dir",
+				sessionId: "session-current",
 				mode: "single",
 				state: "running",
 				pid: 12345,

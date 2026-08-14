@@ -853,6 +853,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				runId: "run-stale",
 				mode: "single",
 				state: "running",
+				sessionId: "session-stale",
 				pid: 12345,
 				startedAt: Date.now() - 1000,
 				lastUpdate: Date.now() - 1000,
@@ -870,7 +871,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				now: () => Date.now(),
 			});
 			tracker.resetJobs(ui.ctx as never);
-			tracker.handleStarted({ id: "run-stale", asyncDir: runDir, agent: "worker" });
+			tracker.handleStarted({ id: "run-stale", asyncDir: runDir, agent: "worker", sessionId: "session-stale" });
 
 			await waitForCondition(() => state.asyncJobs.size === 0, "stale async job cleanup");
 
