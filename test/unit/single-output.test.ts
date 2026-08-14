@@ -16,6 +16,7 @@ import {
 	resolveSingleOutputPath,
 	validateFileOnlyOutputMode,
 } from "../../src/runs/shared/single-output.ts";
+import { serializeStructuredOutput } from "../../src/runs/shared/structured-output.ts";
 
 const tempDirs: string[] = [];
 
@@ -160,6 +161,27 @@ describe("resolveSingleOutput", () => {
 		assert.equal(result.fullOutput, "fallback output");
 		assert.equal(result.savedPath, undefined);
 		assert.match(result.saveError ?? "", /Failed to read changed output file/);
+	});
+
+	it("overwrites child prose when schema-validated output is authoritative", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-output-test-"));
+		tempDirs.push(dir);
+		const outputPath = path.join(dir, "review.md");
+		const before = captureSingleOutputSnapshot(outputPath);
+		fs.writeFileSync(outputPath, "1 finding | artifact: review.md", "utf-8");
+		const report = serializeStructuredOutput({ status: "findings", findings: [{ evidence: "src/a.ts:1" }] });
+
+		const result = resolveSingleOutput(outputPath, report, before, { authoritative: true });
+
+		assert.equal(result.fullOutput, report);
+		assert.equal(result.savedPath, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), report);
+		assert.doesNotMatch(fs.readFileSync(outputPath, "utf-8"), /artifact: review\.md/);
+	});
+
+	it("serializes string report roots verbatim and object roots deterministically", () => {
+		assert.equal(serializeStructuredOutput("# Review\nclean"), "# Review\nclean");
+		assert.equal(serializeStructuredOutput({ status: "clean" }), '{\n  "status": "clean"\n}\n');
 	});
 });
 

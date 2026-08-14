@@ -173,8 +173,15 @@ export function resolveSingleOutput(
 	outputPath: string | undefined,
 	fallbackOutput: string,
 	beforeRun: SingleOutputSnapshot | undefined,
+	options: { authoritative?: boolean } = {},
 ): { fullOutput: string; savedPath?: string; saveError?: string } {
 	if (!outputPath) return { fullOutput: fallbackOutput };
+	if (options.authoritative) {
+		const save = persistSingleOutput(outputPath, fallbackOutput);
+		return save.savedPath
+			? { fullOutput: fallbackOutput, savedPath: save.savedPath }
+			: { fullOutput: fallbackOutput, saveError: save.error };
+	}
 
 	let changedSinceStart = false;
 	try {
