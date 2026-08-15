@@ -3486,7 +3486,7 @@ function workflowChildResult(key: string, result: AgentToolResult<Details>): Wor
 		...(detached ? { detached: true } : {}),
 		...(structured.length === 1 ? { structuredOutput: structured[0] } : structured.length > 1 ? { structuredOutput: structured } : {}),
 		artifactPaths: [...artifactPaths],
-		results: result.details.results,
+		results: result.details.results.map(compactSuccessfulFileOnlyWorkflowResult),
 	};
 }
 
@@ -3571,6 +3571,57 @@ export async function steerWorkflowChildByKey(input: {
 		}
 		await new Promise<void>((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
 	}
+}
+
+/**
+ * Workflow scripts need a durable receipt for successful file-only children, not
+ * a second copy of the child's transcript, progress, tool history, and model
+ * accounting. Failures deliberately retain the complete result so diagnostics
+ * are never traded away for payload size.
+ */
+export function compactSuccessfulFileOnlyWorkflowResult(result: SingleResult): SingleResult {
+	if (result.outputMode !== "file-only" || !result.savedOutputPath || result.exitCode !== 0 || result.error) return result;
+	type Receipt = Pick<SingleResult, "index" | "agent" | "task" | "exitCode"> & Partial<SingleResult>;
+	return compactOptional<Receipt>({
+		index: result.index,
+		agent: result.agent,
+		task: "[prompt redacted]",
+		context: result.context,
+		exitCode: result.exitCode,
+		detached: result.detached,
+		detachedReason: result.detachedReason,
+		interrupted: result.interrupted,
+		timedOut: result.timedOut,
+		stopped: result.stopped,
+		sessionFile: result.sessionFile,
+		artifactPaths: result.artifactPaths,
+		outputState: result.outputState,
+		outputMode: result.outputMode,
+		savedOutputPath: result.savedOutputPath,
+		outputReference: result.outputReference,
+		structuredOutputPath: result.structuredOutputPath,
+		acceptance: result.acceptance,
+		transcriptPath: result.transcriptPath,
+	}) as unknown as SingleResult;
+}
+
+/** Reattach per-result structured output once in the final receipt. */
+export function workflowChildResults(
+	children: WorkflowScriptChildResult[],
+	originalResultsByKey: ReadonlyMap<string, SingleResult[]>,
+): SingleResult[] {
+	return children.flatMap((child) => {
+		const results = (child.results ?? []) as SingleResult[];
+		const originalsByIndex = new Map(
+			(originalResultsByKey.get(child.key) ?? []).map((result) => [result.index, result]),
+		);
+		return results.map((result) => {
+			const original = originalsByIndex.get(result.index);
+			return original?.structuredOutput !== undefined
+				? { ...result, structuredOutput: original.structuredOutput }
+				: result;
+		});
+	});
 }
 
 export function prepareWorkflowLaunchParams(
@@ -4180,6 +4231,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const claimedOutputPaths = new Map<string, string>();
 			const producedChildOutputPaths = new Set<string>();
 			const workflowResults: SingleResult[] = [];
+			const workflowResultsByKey = new Map<string, SingleResult[]>();
 			const workflowChildRunIds = new Map<string, string>();
 			let liveWorkflow: NonNullable<Details["workflow"]> = { trace: [], emits: [], console: [] };
 			const workflowDeadlineAt = timeout === undefined ? undefined : Date.now() + timeout;
@@ -4242,6 +4294,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							}, ctx, preserveActiveSession);
 						});
 						workflowResults.push(...result.details.results);
+						workflowResultsByKey.set(key, result.details.results);
 						for (const childResult of result.details.results) {
 							if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
 						}
@@ -4273,7 +4326,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const displayText = appendWorkflowOutputWarning(workflowText, outputWarning);
 				return attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: displayText }],
-					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: workflow.children.flatMap((child) => (child.results ?? []) as SingleResult[]), totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console }, chatProgress }),
+					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: workflowChildResults(workflow.children, workflowResultsByKey), totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console }, chatProgress }),
 				}, workflowFanoutBudget));
 			} catch (error) {
 				const partial = error instanceof WorkflowScriptError ? error.partial : { trace: [], emits: [], console: [], children: [] };
@@ -4289,7 +4342,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: displayText }],
 					isError: true,
-					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: partial.children.flatMap((child) => (child.results ?? []) as SingleResult[]), totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console }, chatProgress }),
+					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: workflowChildResults(partial.children, workflowResultsByKey), totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console }, chatProgress }),
 				}, workflowFanoutBudget));
 			}
 		}
