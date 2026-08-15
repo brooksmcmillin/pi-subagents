@@ -1,8 +1,86 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { prepareWorkflowLaunchParams } from "../../src/runs/foreground/subagent-executor.ts";
+import { compactSuccessfulFileOnlyWorkflowResult, prepareWorkflowLaunchParams, workflowChildResults } from "../../src/runs/foreground/subagent-executor.ts";
+import type { SingleResult } from "../../src/shared/types.ts";
 
 describe("workflow launch params", () => {
+	it("reduces successful file-only workflow results to a bounded artifact receipt", () => {
+		const result = {
+			index: 2,
+			agent: "reviewer",
+			task: "A large private prompt",
+			exitCode: 0,
+			usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
+			outputMode: "file-only",
+			savedOutputPath: "/tmp/review.md",
+			outputReference: { path: "/tmp/review.md", authoritative: true },
+			structuredOutput: { verdict: "pass" },
+			messages: [{ role: "assistant", content: "large" }],
+			toolCalls: [{ name: "read", args: {}, text: "read", expandedText: "large" }],
+			progress: { recentOutput: ["large"] },
+			finalOutput: "Saved output: /tmp/review.md",
+		} as unknown as SingleResult;
+
+		const compact = compactSuccessfulFileOnlyWorkflowResult(result);
+		assert.equal(compact.task, "[prompt redacted]");
+		assert.equal(compact.savedOutputPath, "/tmp/review.md");
+		assert.equal(compact.structuredOutput, undefined);
+		assert.equal(compact.usage, undefined);
+		assert.equal(compact.messages, undefined);
+		assert.equal(compact.toolCalls, undefined);
+		assert.equal(compact.progress, undefined);
+		assert.equal(compact.finalOutput, undefined);
+	});
+
+	it("publishes each structured workflow output once in the final receipt", () => {
+		const compact = (agent: string) => ({
+			index: 0,
+			agent,
+			task: "[prompt redacted]",
+			exitCode: 0,
+			outputMode: "file-only",
+			savedOutputPath: "/tmp/review.md",
+		} as unknown as SingleResult);
+		const results = workflowChildResults([{
+			key: "first",
+			ok: true,
+			output: "Saved output: /tmp/review.md",
+			structuredOutput: { verdict: "pass" },
+			artifactPaths: ["/tmp/review.md"],
+			results: [compact("first-agent")],
+		}, {
+			key: "second",
+			ok: true,
+			output: "Saved output: /tmp/review.md",
+			structuredOutput: { verdict: "warn" },
+			artifactPaths: ["/tmp/review.md"],
+			results: [compact("second-agent")],
+		}], new Map([
+			["second", [{ ...compact("second-agent"), structuredOutput: { verdict: "warn" } }]],
+			["first", [{ ...compact("first-agent"), structuredOutput: { verdict: "pass" } }]],
+		]));
+
+		assert.deepEqual(results[0]?.structuredOutput, { verdict: "pass" });
+		assert.deepEqual(results[1]?.structuredOutput, { verdict: "warn" });
+		assert.equal(results.filter((result) => result.structuredOutput !== undefined).length, 2);
+	});
+
+	it("retains complete failed file-only workflow results for diagnosis", () => {
+		const failed = {
+			index: 0,
+			agent: "reviewer",
+			task: "Review",
+			exitCode: 1,
+			error: "review failed",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			outputMode: "file-only",
+			savedOutputPath: "/tmp/partial.md",
+			messages: [{ role: "assistant", content: "diagnostic" }],
+		} as unknown as SingleResult;
+
+		assert.equal(compactSuccessfulFileOnlyWorkflowResult(failed), failed);
+	});
+
 	it("keeps omitted workflow child async foreground", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
