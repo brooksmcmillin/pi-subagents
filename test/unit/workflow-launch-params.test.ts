@@ -32,26 +32,37 @@ describe("workflow launch params", () => {
 		assert.equal(compact.finalOutput, undefined);
 	});
 
-	it("publishes structured workflow output once in the final receipt", () => {
-		const compact = {
-			index: 2,
-			agent: "reviewer",
+	it("publishes each structured workflow output once in the final receipt", () => {
+		const compact = (agent: string) => ({
+			index: 0,
+			agent,
 			task: "[prompt redacted]",
 			exitCode: 0,
 			outputMode: "file-only",
 			savedOutputPath: "/tmp/review.md",
-		} as unknown as SingleResult;
+		} as unknown as SingleResult);
 		const results = workflowChildResults([{
-			key: "review",
+			key: "first",
 			ok: true,
 			output: "Saved output: /tmp/review.md",
 			structuredOutput: { verdict: "pass" },
 			artifactPaths: ["/tmp/review.md"],
-			results: [compact],
-		}]);
+			results: [compact("first-agent")],
+		}, {
+			key: "second",
+			ok: true,
+			output: "Saved output: /tmp/review.md",
+			structuredOutput: { verdict: "warn" },
+			artifactPaths: ["/tmp/review.md"],
+			results: [compact("second-agent")],
+		}], new Map([
+			["second", [{ ...compact("second-agent"), structuredOutput: { verdict: "warn" } }]],
+			["first", [{ ...compact("first-agent"), structuredOutput: { verdict: "pass" } }]],
+		]));
 
 		assert.deepEqual(results[0]?.structuredOutput, { verdict: "pass" });
-		assert.equal(results.filter((result) => result.structuredOutput !== undefined).length, 1);
+		assert.deepEqual(results[1]?.structuredOutput, { verdict: "warn" });
+		assert.equal(results.filter((result) => result.structuredOutput !== undefined).length, 2);
 	});
 
 	it("retains complete failed file-only workflow results for diagnosis", () => {
