@@ -664,7 +664,6 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				};
 			},
 		});
-		onRuntimeEvent("session_start", () => activateStructuredOutputTool(pi));
 	}
 
 	onRuntimeEvent("context", (event: unknown, ctx?: ExtensionContext) => {
@@ -688,6 +687,13 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		const inheritSkills = readBooleanEnv(SUBAGENT_INHERIT_SKILLS_ENV);
 		const fanoutChild = readBooleanEnv(SUBAGENT_FANOUT_CHILD_ENV);
 		const structuredOutput = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] && process.env[STRUCTURED_OUTPUT_SCHEMA_ENV]);
+		if (structuredOutput) {
+			// Activate here, not at session_start: session_start fires once at session
+			// construction, before this turn's tool state is finalized. before_agent_start
+			// fires immediately before the agent loop starts this turn, so activating here
+			// is guaranteed to land in the tool set the model actually sees.
+			activateStructuredOutputTool(pi);
+		}
 		let rewritten = event.systemPrompt;
 		if (inheritProjectContext !== undefined || inheritSkills !== undefined || fanoutChild !== undefined || structuredOutput) {
 			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
