@@ -672,7 +672,7 @@ describe("subagent prompt runtime", () => {
 		}
 	});
 
-	it("activates structured_output for an explicit child tool allowlist with outputSchema", () => {
+	it("activates structured_output for an explicit child tool allowlist with outputSchema", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-allowlist-"));
 		try {
 			const schemaPath = path.join(dir, "schema.json");
@@ -696,10 +696,10 @@ describe("subagent prompt runtime", () => {
 			process.env[REQUIRED_CHILD_TOOLS_ENV] = env[REQUIRED_CHILD_TOOLS_ENV];
 			const registered = ["read"];
 			let active = ["read"];
-			const handlers = new Map<string, Array<() => unknown>>();
+			const handlers = new Map<string, Array<(event?: unknown) => unknown>>();
 
 			registerSubagentPromptRuntime({
-				on(event: string, handler: () => unknown) {
+				on(event: string, handler: (event?: unknown) => unknown) {
 				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 				},
 				registerTool(tool: { name: string }) {
@@ -710,39 +710,39 @@ describe("subagent prompt runtime", () => {
 				setActiveTools: (names: string[]) => {
 					active = names.filter((name) => registered.includes(name));
 				},
-			} as { on(event: string, handler: () => unknown): void; registerTool(tool: { name: string }): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
+			} as { on(event: string, handler: (event?: unknown) => unknown): void; registerTool(tool: { name: string }): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
 
-			const sessionStart = handlers.get("session_start")?.at(-1);
-			assert.ok(sessionStart, "structured output runtime should verify activation at session start");
-			sessionStart();
+			const beforeAgentStart = handlers.get("before_agent_start")?.at(-1);
+			assert.ok(beforeAgentStart, "structured output runtime should verify activation at the final pre-model boundary");
+			await beforeAgentStart({ systemPrompt: "system prompt" });
 			assert.deepEqual(active, ["read", "structured_output"]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
-	it("fails clearly when structured_output cannot be activated", () => {
+	it("fails clearly when structured_output cannot be activated", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-inactive-"));
 		try {
 			const schemaPath = path.join(dir, "schema.json");
 			fs.writeFileSync(schemaPath, JSON.stringify({ type: "object" }), "utf-8");
 			process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = schemaPath;
 			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = path.join(dir, "output.json");
-			const handlers = new Map<string, Array<() => unknown>>();
+			const handlers = new Map<string, Array<(event?: unknown) => unknown>>();
 
 			registerSubagentPromptRuntime({
-				on(event: string, handler: () => unknown) {
+				on(event: string, handler: (event?: unknown) => unknown) {
 					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 				},
 				registerTool() {},
 				getAllTools: () => [{ name: "structured_output" }],
 				getActiveTools: () => ["read"],
 				setActiveTools() {},
-			} as { on(event: string, handler: () => unknown): void; registerTool(): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
+			} as { on(event: string, handler: (event?: unknown) => unknown): void; registerTool(): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
 
-			const sessionStart = handlers.get("session_start")?.at(-1);
-			assert.ok(sessionStart);
-			assert.throws(sessionStart, /structured_output.*could not be activated/i);
+			const beforeAgentStart = handlers.get("before_agent_start")?.at(-1);
+			assert.ok(beforeAgentStart);
+			await assert.rejects(() => Promise.resolve(beforeAgentStart({ systemPrompt: "system prompt" })), /structured_output.*could not be activated/i);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -1243,7 +1243,9 @@ describe("subagent prompt runtime", () => {
 			},
 			getAllTools: () => [{ name: "structured_output" }],
 			registerTool() {},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }>; registerTool(): void });
+			getActiveTools: () => ["structured_output"],
+			setActiveTools() {},
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }>; registerTool(): void; getActiveTools(): string[]; setActiveTools(names: string[]): void });
 
 		try {
 			const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
