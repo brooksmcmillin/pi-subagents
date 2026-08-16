@@ -15,7 +15,7 @@ import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts"
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { buildChainInstructions, isCheckpointStep, isDynamicParallelStep, isParallelStep, resolveChainPath, resolveExistingReadPaths, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
+import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveChainPath, resolveExistingReadPaths, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
@@ -59,6 +59,7 @@ import {
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import { nestedResultsPath, nestedSummaryFromAsyncStatus, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
+import { resultFilePath } from "./result-files.ts";
 import { appendTurnBudgetSystemPrompt, initialTurnBudgetState } from "../shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
@@ -143,7 +144,7 @@ interface AsyncChainParams {
 	/** Raw caller-facing goal used only by the started event. */
 	goal?: string;
 	attachRoot?: ImportedAsyncRoot & { agent: string; outputName?: string; label?: string };
-	resultMode?: Exclude<SubagentRunMode, "single">;
+	resultMode?: SubagentRunMode;
 	agents: AgentConfig[];
 	ctx: AsyncExecutionContext;
 	availableModels?: AvailableModelInfo[];
@@ -224,6 +225,7 @@ interface AsyncSingleParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	worktree?: boolean;
 	controlConfig?: ResolvedControlConfig;
 	intercomBridge?: IntercomBridgeConfig;
 	controlIntercomTarget?: string;
@@ -668,13 +670,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		: chain;
 	const firstStep = chain[0];
 	const originalTask = params.task ?? (firstStep
-		? (isCheckpointStep(firstStep)
-			? undefined
-			: isParallelStep(firstStep)
-				? firstStep.parallel[0]?.task
-				: isDynamicParallelStep(firstStep)
-					? firstStep.parallel.task
-					: (firstStep as SequentialStep).task)
+		? (isParallelStep(firstStep)
+			? firstStep.parallel[0]?.task
+			: isDynamicParallelStep(firstStep)
+				? firstStep.parallel.task
+				: (firstStep as SequentialStep).task)
 		: undefined);
 	try {
 		if (params.validateOutputBindings !== false) {
@@ -687,13 +687,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: graphChain });
 
 	for (const s of chain) {
-		const stepAgents = isCheckpointStep(s)
-			? []
-			: isParallelStep(s)
-				? s.parallel.map((t) => t.agent)
-				: isDynamicParallelStep(s)
-					? [s.parallel.agent]
-					: [(s as SequentialStep).agent];
+		const stepAgents = isParallelStep(s)
+			? s.parallel.map((t) => t.agent)
+			: isDynamicParallelStep(s)
+				? [s.parallel.agent]
+				: [(s as SequentialStep).agent];
 		for (const agentName of stepAgents) {
 			if (!agents.find((x) => x.name === agentName)) {
 				return { error: `Unknown agent: ${agentName}` };
@@ -871,6 +869,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
 			...(s.outputSchema ? { structuredOutput: createStructuredOutputRuntime(s.outputSchema, path.join(asyncDir, "structured-output")) } : {}),
 			...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
+			...(s.worktree ? { worktree: true } : {}),
 		};
 	};
 
@@ -889,9 +888,6 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 
 	try {
 		const builtSteps = chain.map((s, stepIndex) => {
-			if (isCheckpointStep(s)) {
-				return { checkpoint: s.checkpoint, ...(s.message ? { message: s.message } : {}), phase: s.phase, label: s.label };
-			}
 			if (isParallelStep(s)) {
 				const parallelBehaviors = s.parallel.map((task) => {
 					const agent = agents.find((candidate) => candidate.name === task.agent)!;
@@ -957,8 +953,17 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					...(s.gateOn ? { gateOn: s.gateOn } : {}),
 				};
 			}
+			const sequential = s as SequentialStep;
+			let behaviorCwd: string | undefined;
+			if (sequential.worktree) {
+				try {
+					behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, 0, worktreeBaseDir);
+				} catch {
+					behaviorCwd = undefined;
+				}
+			}
 			const staticStep = nextFlatStep();
-			return buildSeqStep(s as SequentialStep, staticStep.sessionFile, undefined, false, undefined, staticStep.index, undefined, `chain[${stepIndex}]`);
+			return buildSeqStep(sequential, staticStep.sessionFile, behaviorCwd, false, undefined, staticStep.index, undefined, `chain[${stepIndex}]`);
 		});
 		const steps = params.attachRoot
 			? [{
@@ -1027,7 +1032,6 @@ export function executeAsyncChain(
 	const resultMode = params.resultMode ?? "chain";
 	const acceptanceErrors = validateExecutionAcceptance({
 		chain: chain.map((step) => {
-			if (isCheckpointStep(step)) return {};
 			if (isParallelStep(step)) return { parallel: step.parallel };
 			if (isDynamicParallelStep(step)) return { acceptance: step.acceptance, parallel: step.parallel };
 			return { acceptance: step.acceptance };
@@ -1116,7 +1120,7 @@ export function executeAsyncChain(
 			{
 				id,
 				steps,
-				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(DIRS.results, `${id}.json`),
+				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -1343,6 +1347,10 @@ export function executeAsyncSingle(
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 	}
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const instructionCwd = params.worktree === true
+		? resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s0`, 0, worktreeBaseDir)
+		: runnerCwd;
+	const readExistenceCwd = params.worktree === true ? runnerCwd : instructionCwd;
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
 	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
@@ -1384,7 +1392,7 @@ export function executeAsyncSingle(
 	}
 
 	const effectiveOutput = normalizeSingleOutputOverride(params.output, agentConfig.output);
-	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, runnerCwd, params.outputBaseDir ?? (artifactsDir ? path.join(artifactsDir, "outputs", id) : undefined));
+	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, instructionCwd, params.outputBaseDir ?? (artifactsDir ? path.join(artifactsDir, "outputs", id) : undefined));
 	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, agentConfig);
 	const outputMode = params.outputMode ?? "inline";
 	const validationError = validateFileOnlyOutputMode(outputMode, outputPath, `Async single run (${agent})`);
@@ -1393,7 +1401,7 @@ export function executeAsyncSingle(
 	// Reads: caller override > agent defaultReads > none. `~`/`~/` expand to home;
 	// absolute paths pass through; relative paths resolve against the child cwd.
 	const reads = params.reads !== undefined ? params.reads : agentConfig.defaultReads ?? false;
-	const readPaths = Array.isArray(reads) ? resolveExistingReadPaths(reads, runnerCwd) : [];
+	const readPaths = Array.isArray(reads) ? resolveExistingReadPaths(reads, readExistenceCwd) : [];
 	const readsInstruction = readPaths.length > 0
 		? `[Read from: ${readPaths.join(", ")}]\n\n`
 		: "";
@@ -1428,11 +1436,13 @@ export function executeAsyncSingle(
 	const structuredOutput = params.structuredOutputSchema
 		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"))
 		: undefined;
-	const modelCandidates = buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope })
-		.flatMap((candidate) => {
-			const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
-			return resolved ? [resolved] : [];
-		});
+	const modelCandidates = externalRunner
+		? []
+		: buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope })
+			.flatMap((candidate) => {
+				const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
+				return resolved ? [resolved] : [];
+			});
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
@@ -1567,11 +1577,12 @@ export function executeAsyncSingle(
 						...(structuredOutput ? { structuredOutput } : {}),
 						...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
+						...(params.worktree === true ? { worktree: true } : {}),
 					},
 				],
 				resultPath: params.parentWorkflowRunId !== undefined && params.revivalLease !== undefined
 					? workflowAwaitedAsyncResultPath(asyncDir)
-					: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(DIRS.results, `${id}.json`),
+					: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : resultFilePath(DIRS.results, id),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,

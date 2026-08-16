@@ -4,6 +4,8 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 
 ## Execution examples
 
+Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for sequential steps and `runs.all(...)` for parallel fanout. Legacy top-level `chain`, `tasks`, and `parallel` inputs are not supported. Helper functions must be plain functions or explicit Promise chains. Nested `async function` helpers, async arrows, and async methods are rejected so child-launch tracking stays portable across Node and Bun.
+
 ```js
 // One child; return the child promise explicitly
 { workflowScript: `return runs.run("main", { agent: "scout", task: "Analyze the auth flow" })` }
@@ -31,9 +33,8 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 | `agent` | string | - | Agent target for management actions. Workflow child agents are set inside `runs.run` or `runs.all`. |
 | `action` | string | - | Agent management (including `guide`, `children.list`, and `refine`/`refine.show`/`refine.rollback`), mission (`mission.create/list/show/update/resolve-decision/attach-run/close`), Herdr inspector (`inspector.open/status/close`), status/control, schedule, watchdog, or doctor action. |
 | `topic` | `overview \| workflows \| agents \| missions \| observability \| tool-reference \| configuration \| models \| watchdog \| extension-api` | `overview` | Packaged guide topic for `action: "guide"`. |
-| `chainName` | string | - | Chain name for management actions. |
-| `config` | object/string | - | Agent or existing durable chain config for management create/update. |
-| `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; `fork` creates real branched sessions from the parent leaf. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
+| `config` | object/string | - | Agent config for management create/update. |
+| `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; an implicit `fork` creates a real branched session when the parent session file and current leaf exist, otherwise it falls back to `fresh` without a failed first attempt. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
 | `missionId` | string | - | Attach a workflow to an existing project mission instead of creating its default enclosing mission. |
 | `mission` | object/false | auto-create | Override the default enclosing mission with `{ title \| summary, objective?, goal?, budget?, labels? }`. Set exactly one non-empty `title` or `summary`; `objective` and `labels` are optional. `goal` may only be `true`, requires `budget.tokens`, and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
 | `handoffPath` | string | - | Aggregate handoff manifest required by `action: "worktree.discard"`. |
@@ -65,11 +66,11 @@ Bound writer work with a narrow task and an outer `timeoutMs` or `maxRuntimeMs` 
 
 ### Fork context details
 
-`context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created.
+Explicit `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. By contrast, an agent-level `defaultContext: fork` is a preference: when the parent has no persisted session file or current leaf yet, the launch uses `fresh` immediately instead of failing and requiring a retry.
 
-When the inherited transcript contains signed Anthropic `thinking` / `redacted_thinking` blocks, `pi-subagents` strips those provider-private blocks from the forked child session. It forces thinking `off` only when the child's effective primary or fallback model resolves through the model registry to the Anthropic provider or `anthropic-messages` API; unresolved models are treated conservatively. The result reports every affected child, including on failed runs. Use `context: "fresh"` when an Anthropic child needs thinking. Forking never silently downgrades to `fresh`.
+When the inherited transcript contains signed Anthropic `thinking` / `redacted_thinking` blocks, `pi-subagents` strips those provider-private blocks from the forked child session. It forces thinking `off` only when the child's effective primary or fallback model resolves through the model registry to the Anthropic provider or `anthropic-messages` API; unresolved models are treated conservatively. The result reports every affected child, including on failed runs. Use `context: "fresh"` when an Anthropic child needs thinking. Explicit `context: "fork"` never silently downgrades to `fresh`.
 
-In workflow runs that omit `context`, each `runs.run` child follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
+In workflow runs that omit `context`, each `runs.run` child follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. If the parent session file or current leaf is not available yet, implicit fork-default children also run fresh. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
 
 ### Output mode details
 
@@ -81,29 +82,24 @@ When a child also has `outputSchema`, the schema-validated `structured_output` v
 
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
 
-### Prompt fragments
-
-Use `await prompts.render(ref, vars?)` to render reusable plain task text. Refs require an explicit scope: `package:<name>` reads the installed package `prompts/` directory, `user:<name>` reads the Pi agent `prompts/` directory, and `project:<name>` reads the current workflow project's config `prompts/` directory. Each ref names a top-level `<name>.md` file. Frontmatter is removed. Scalar string, number, and boolean variables replace matching `{{name}}` placeholders. Unknown placeholders stay unchanged.
-
-Rendering only returns text to the sandbox. It does not give the script filesystem access and does not change child launch parameters, worktree capture, or cleanup. Pass the rendered result explicitly as `task`.
-
 ### Retained children
 
-Completed workflow children from the current parent session stay addressable as retained children. `{ action: "children.list" }` lists up to the last 10 with their run ids. A later workflow continues one by passing `resume` instead of `agent`:
+Completed workflow children from the current parent session stay addressable as retained children. `{ action: "children.list" }` lists up to the last 10 with their run ids and explicit `resumable` or `not resumable` state. Resume only rows reported `resumable`; if no row is resumable, start a same-role fallback challenge and label it as fallback. A later workflow continues a resumable child by passing `resume` instead of `agent`:
 
 ```js
 { workflowScript: `
   let writer = await runs.run("implement", { agent: "worker", task: "Implement the accepted contract" });
   for (const pass of [1, 2]) {
     if (!writer.runId) throw new Error("writer did not return a retained run id");
-    const task = await prompts.render("project:writer-followup", { pass, previous: writer.output });
-    writer = await runs.run("followup-" + pass, { resume: writer.runId, task });
+    writer = await runs.run("followup-" + pass, { resume: writer.runId, task: "Revisit pass " + pass + ": " + writer.output });
   }
   return writer;
 ` }
 ```
 
 Inside `workflowScript`, `await runs.run(key, { resume, task })` waits for the revived child to finish and returns its completed output and new `runId`. Each resume can return a new retained run id, so loops must continue from the latest returned `runId`. Top-level `{ action: "resume" }` remains detached and returns a background-run receipt.
+
+For a simple implementation challenge outside a workflow script, send the challenge through `subagent({ action: "resume", id: "<retained-writer-run>", message: "Reconsider the implementation and make any better current-scope change." })` only when `children.list` reports that retained writer as `resumable`. If no retained writer is resumable, start a same-role fallback challenge and record why it is a fallback. Use workflow `runs.run({ resume })` only when the script must await the revived writer output before the next step. Do not use `steer` as the sole challenge action for a completed retained child; `steer` with `mode: "follow_up"` only queues text for the next `resume`.
 
 `resume` and `agent` are mutually exclusive. The revived child keeps its stored agent, model, and tool contract. `gate` is rejected on retained resume items because resume uses the retained child contract.
 
@@ -113,7 +109,7 @@ Inside `workflowScript`, `await runs.run(key, { resume, task })` waits for the r
 
 `{ action: "guide" }` reads the packaged `README.md` from the installed version. Pass `topic` to read its packaged `docs/<topic>.md` file instead. Valid topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`. Unknown topics list the valid values and do not change files. Use `/subagents-guide [topic]` for the slash equivalent.
 
-Agent definitions are not loaded into context by default. Management actions let the LLM discover, inspect, create, update, and delete agents and chains at runtime. An unknown action returns safe next steps (`status` and `list`) and may suggest a close non-destructive action. Destructive actions are only named for a near-complete one-character typo, and suggestions never execute an action.
+Agent definitions are not loaded into context by default. Management actions let the LLM discover, inspect, create, update, and delete agents at runtime. An unknown action returns safe next steps (`status` and `list`) and may suggest a close non-destructive action. Destructive actions are only named for a near-complete one-character typo, and suggestions never execute an action.
 
 ```ts
 { action: "list" }
@@ -122,7 +118,6 @@ Agent definitions are not loaded into context by default. Management actions let
 { action: "models" }
 { action: "models", agent: "reviewer" }
 { action: "get", agent: "code-analysis.scout" }
-{ action: "get", chainName: "review-pipeline" }
 
 { action: "create", config: {
   name: "Code Scout",
@@ -146,22 +141,11 @@ Agent definitions are not loaded into context by default. Management actions let
   progress: true
 }}
 
-{ action: "create", config: {
-  name: "review-pipeline",
-  description: "Scout then review",
-  scope: "project",
-  steps: [
-    { agent: "scout", task: "Scan {task}", output: "context.md" },
-    { agent: "reviewer", task: "Review {previous}", reads: ["context.md"] }
-  ]
-}}
 
 { action: "update", agent: "code-analysis.scout", config: { model: "openai/gpt-4o" } }
 { action: "update", agent: "code-analysis.scout", config: { acceptance: "" } } // clear the frontmatter default
 { action: "update", agent: "code-analysis.scout", config: { acceptanceRole: false } } // restore inferred name fallback
-{ action: "update", chainName: "review-pipeline", config: { steps: [...] } }
 { action: "delete", agent: "scout" }
-{ action: "delete", chainName: "review-pipeline" }
 
 { action: "eject", agent: "reviewer" }
 { action: "eject", agent: "reviewer", agentScope: "project" }
@@ -201,9 +185,6 @@ subagent({ action: "resume", id: "<nested-run-id>", message: "follow-up for a ne
 subagent({ action: "steer", id: "<run-id>", message: "guidance for the running child" })
 subagent({ action: "steer", id: "<run-id>", mode: "follow_up", message: "check this after the current turn" })
 subagent({ action: "steer", id: "<run-id>", index: 1, mode: "auto", message: "guidance for child 2" })
-subagent({ action: "append-step", id: "<run-id>", step: { agent: "worker", task: "Continue from {previous}" } })
-subagent({ action: "approve-checkpoint", id: "<run-id>" })
-subagent({ action: "reject-checkpoint", id: "<run-id>" })
 subagent({ action: "doctor" })
 ```
 
@@ -241,15 +222,11 @@ subagent({ action: "doctor" })
 
 `steer` waits up to three seconds for a correlated child-Pi input acceptance and returns a request id with `delivered`, `scheduled`, `pending`, `partial`, `recovered`, or `failed` plus per-child states. The receipt also has `deliveryStatus: "delivered" | "queued"`. Delivery means Pi accepted the user message, not model compliance. A pending indexed child returns `scheduled`.
 
-The optional `mode` is `steer` by default and keeps the current interrupt behavior. `follow_up` waits for the next turn boundary. `auto` queues during an active turn and delivers immediately between turns. The bounded FIFO holds 20 messages and returns a clear error when full. Terminal details report queued messages that the run did not deliver. A `follow_up` sent to a completed retained workflow child becomes the first brief for its next `resume`.
+The optional `mode` is `steer` by default and keeps the current interrupt behavior. `follow_up` waits for the next turn boundary. `auto` queues during an active turn and delivers immediately between turns. The bounded FIFO holds 20 messages and returns a clear error when full. Terminal details report queued messages that the run did not deliver. A `follow_up` sent to a completed retained workflow child becomes the first brief for its next `resume`; it does not revive the child by itself.
 
 Only a top-level single run may interrupt after the acknowledgment deadline and recover after a further 15-second pause/revival bound; durable multi-child and nested runs never auto-interrupt. Recovery launches a replacement only after the source is confirmed paused, a valid persisted session exists, and deadline, turn, and tool budgets remain. It preserves the original child contract and remaining limits; otherwise the source stays paused with an explicit failure. Late acceptance is recorded but cannot cancel committed recovery.
 
 The persisted `steering` ledger retains 20 requests and replaces the old `steerCount`/`lastSteerAt` fields.
-
-### append-step
-
-`append-step` requires `legacyChainControls: true`. The default registered model-facing schema omits this legacy control surface. When enabled, it accepts exactly one `step` object for an existing durable chain for a top-level async chain whose status is still `running`. The step is persisted in the run directory and becomes eligible only after the chain's already-queued steps finish. Completed, failed, rejected, paused, foreground, single, and non-chain runs reject appends.
 
 ## Acceptance gates
 
@@ -317,6 +294,20 @@ For `attested` or stricter levels, the child prompt includes a standardized acce
 The parser canonicalizes known enum synonyms, snake_case report keys and wrappers, underscore fence tags, unambiguous scalar arrays, string booleans, and criterion-id separators. Unknown or ambiguous keys and enum values fail with field-level diagnostics. Explicit empty `changedFiles` and `testsAddedOrUpdated` arrays are recorded as not applicable; missing fields and empty required command or validation evidence still fail.
 
 Acceptance fences are removed from normal output artifacts, while the raw child transcript remains intact and per-child metadata stores the complete acceptance ledger and parsed report. Explicit failed gates fail the run. Inferred gates remain observable without failing the run.
+
+## Orca progress tabs (experimental observer)
+
+Orca progress tabs are a global, opt-in observer, not an agent runner. Enable them in the extension config:
+
+```json
+{ "orcaProgressTabs": { "enabled": true } }
+```
+
+Every foreground or background child keeps running through its normal native Pi or `external-cli` path. For each logical child, the observer asks Orca to create a background terminal tab in that child's current worktree and mirrors progress into it. Titles receive a persistent worktree-local sequence number, including across separate workflow calls. Model/startup retries reuse the same tab. Parallel and chain children each receive their own tab; attaching an already-running async root does not create a duplicate. Terminal control sequences are removed at the viewer sink across read boundaries. Each mirror is capped at 1 MiB and truncates when the cap or stream backpressure is reached. After the child finishes, its viewer returns to the terminal shell instead of ending the terminal session, so the tab and scrollback remain until the user closes them. Successful native Pi children with a known session append a safely quoted removal command for the exact verified session path; unsuccessful and sessionless children append only their terminal status.
+
+The observer supports macOS and Linux and is disabled on Windows. It requires executable `orca` on `PATH` (or `PI_SUBAGENT_ORCA_BINARY`) and a running Orca runtime that recognizes the child cwd. Availability and tab creation are best-effort: failures never fail, stop, or delay the subagent. Set `orcaProgressTabs.enabled` to `false` to guarantee that no Orca command or tab is created.
+
+Agent profile `runner.type` remains unchanged: supported values are native Pi (the default) and `external-cli`. Orca is intentionally not a profile runner and does not own subagent execution, completion, cancellation, artifacts, or result delivery.
 
 ## External CLI agent profiles
 

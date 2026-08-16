@@ -59,6 +59,7 @@ import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
+import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, type SubagentTaskDelivery } from "../shared/pi-args.ts";
@@ -76,6 +77,7 @@ import {
 } from "../shared/model-fallback.ts";
 import {
 	SUBAGENT_STARTUP_RETRY_DELAYS_MS,
+	formatSubagentExtensionConflictError,
 	formatSubagentStartupRetryExhaustedError,
 	formatSubagentStartupRetryNote,
 	isRetryableSubagentStartupFailure,
@@ -304,6 +306,7 @@ async function runSingleAttempt(
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
 		taskDelivery?: SubagentTaskDelivery;
+		orcaProgressTab?: OrcaProgressTab;
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
@@ -926,10 +929,12 @@ async function runSingleAttempt(
 			} catch {
 				rawStdoutTail.push(`${line}\n`);
 				shared.transcriptWriter?.writeStdoutLine(line);
+				shared.orcaProgressTab?.append(`${line}\n`);
 				// Non-JSON stdout lines are expected; only structured events are parsed.
 				return;
 			}
 			shared.transcriptWriter?.writeChildEvent(evt);
+			shared.orcaProgressTab?.event(evt);
 			if (evt.type === "agent_settled") agentSettledReceived = true;
 			applyChildLifecycle(projectChildLifecycle(evt));
 
@@ -1222,6 +1227,7 @@ async function runSingleAttempt(
 		proc.stderr.on("data", (chunk: Buffer) => {
 			stderrTail.push(chunk);
 			stderrReader.push(chunk);
+			shared.orcaProgressTab?.append(chunk.toString("utf-8"));
 		});
 		proc.on("exit", () => {
 			childExited = true;
@@ -1347,6 +1353,10 @@ async function runSingleAttempt(
 		};
 		return result;
 	}
+	result.error = formatSubagentExtensionConflictError(result.error, {
+		agent: agent.name,
+		ambientExtensionsEnabled: !launchResolvedExtensions.disableAmbientExtensions,
+	});
 	if (result.error && result.exitCode === 0) {
 		result.exitCode = 1;
 	}
@@ -1538,7 +1548,7 @@ async function runSingleAttempt(
 /**
  * Run a subagent synchronously (blocking until complete)
  */
-async function runSyncCompletion(
+async function runSyncCompletionInner(
 	runtimeCwd: string,
 	agents: AgentConfig[],
 	agentName: string,
@@ -1709,6 +1719,14 @@ async function runSyncCompletion(
 		}
 	}
 
+	const orcaProgressTab = createOrcaProgressTab({
+		cwd: options.cwd ?? runtimeCwd,
+		runId: options.runId,
+		agent: agentName,
+		index: options.index ?? 0,
+	});
+	if (orcaProgressTab) options.onOrcaProgressTabCreated?.(orcaProgressTab);
+
 	const persistResultMetadata = (target: SingleResult): void => {
 		persistSingleResultMetadata({
 			metadataPath: artifactPathsResult?.metadataPath,
@@ -1763,6 +1781,7 @@ async function runSyncCompletion(
 				outputSnapshot,
 				originalTask: task,
 				taskDelivery: taskDeliveryOverride,
+				orcaProgressTab,
 			});
 			lastResult = result;
 			if (startupAttemptIndex === 0) {
@@ -2002,6 +2021,27 @@ async function runSyncCompletion(
 	}
 
 	return result;
+}
+
+async function runSyncCompletion(
+	runtimeCwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	options: RunSyncOptions,
+): Promise<SingleResult> {
+	let orcaProgressTab: OrcaProgressTab | undefined;
+	try {
+		const result = await runSyncCompletionInner(runtimeCwd, agents, agentName, task, {
+			...options,
+			onOrcaProgressTabCreated: (tab) => { orcaProgressTab = tab; },
+		});
+		orcaProgressTab?.finish(result.stopped ? "stopped" : result.exitCode === 0 && !result.error ? "completed" : "failed", result.sessionFile);
+		return result;
+	} catch (error) {
+		orcaProgressTab?.finish("failed");
+		throw error;
+	}
 }
 
 /**

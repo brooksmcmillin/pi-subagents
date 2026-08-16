@@ -10,7 +10,7 @@ Use orchestration as parent-agent guidance, not as a runtime workflow mode. For 
 clarify → scout → worker → fresh reviewers → worker
 ```
 
-Packaged `worker`, `oracle`, and `advisor` default to forked context when a launch omits `context`; pass `context: "fresh"` when you intentionally want a fresh child run.
+Packaged `worker`, `oracle`, and `advisor` default to forked context when a launch omits `context`. If the parent has no persisted session file or current leaf yet, that implicit default falls back to `fresh`. Pass `context: "fresh"` when you intentionally want a fresh child run, or `context: "fork"` when fork must remain strict.
 
 Child-safety boundaries are enforced at runtime:
 
@@ -48,6 +48,111 @@ subagent({ workflowScript: `
 ` });
 ```
 
+Keep helper functions portable across Node and Bun. Use top-level `await`, plain helper functions that return `runs.run(...)`, or explicit Promise chains. Do not define nested `async function` helpers, async arrows, or async methods inside `workflowScript`; native async helpers hide child-launch observation in Bun and are rejected.
+
+```js
+subagent({ workflowScript: `
+  function scan() {
+    return runs.run("scan", { agent: "scout", task: "Scan the codebase" });
+  }
+  const result = await scan();
+  return result.output;
+` });
+```
+
+Chaining is still supported. The supported form is scripted chaining: await one `runs.run(...)` result, then pass its output into the next step. Parallel fanout uses `runs.all(...)` inside the same script.
+
+```js
+subagent({ workflowScript: `
+  const plan = await runs.run("plan", { agent: "scout", task: "Plan the migration" });
+  const patch = await runs.run("patch", { agent: "worker", task: "Implement this plan:\n" + plan.output });
+  return patch.output;
+` });
+```
+
+Use named outputs when later workflow steps need structured data or durable references:
+
+```js
+subagent({ workflowScript: `
+  const inventory = await runs.run("inventory", {
+    agent: "scout",
+    task: "List the files that need review.",
+    outputSchema: {
+      type: "object",
+      properties: { files: { type: "array", items: { type: "string" } } },
+      required: ["files"],
+      additionalProperties: false
+    }
+  });
+  return runs.run("review", {
+    agent: "reviewer",
+    task: "Review these files: " + inventory.structuredOutput.files.join(", ")
+  });
+` });
+```
+
+For dynamic fanout, have one step return a structured list, check it in JavaScript, then map the bounded entries into `runs.all(...)`:
+
+```js
+subagent({ workflowScript: `
+  const targets = await runs.run("targets", {
+    agent: "scout",
+    task: "Return up to five source files that need review.",
+    outputSchema: {
+      type: "object",
+      properties: { files: { type: "array", items: { type: "string" }, maxItems: 5 } },
+      required: ["files"],
+      additionalProperties: false
+    }
+  });
+  const files = targets.structuredOutput.files.slice(0, 5);
+  return runs.all(files.map((file, index) => ({
+    key: "review-" + index,
+    agent: "reviewer",
+    task: "Review " + file
+  })));
+` });
+```
+
+For intermediate data that only later steps need, prefer the prior child's returned output or `structuredOutput` instead of writing shared files:
+
+```js
+subagent({ workflowScript: `
+  const scan = await runs.run("scan", { agent: "scout", task: "Find the files that need fixes." });
+  return runs.run("fix", { agent: "worker", task: "Implement these findings:\n" + scan.output });
+` });
+```
+
+`{chain_dir}` remains available inside scripted workflow step templates for legacy-compatible path templates. It expands to the workflow cwd, not to private temporary storage.
+
+### Migrating old chain shapes
+
+Legacy top-level `chain`, `tasks`, `parallel`, `chainDir`, `/chain`, `/parallel`, `/run-chain`, and durable `.chain.md` execution are no longer the public workflow API. Rewrite them as JavaScript:
+
+```js
+// Old shape, no longer supported:
+// { chain: [{ agent: "scout", task: "Scan" }, { agent: "worker", task: "Fix from {previous}" }] }
+
+// Current shape:
+{ workflowScript: `
+  const scan = await runs.run("scan", { agent: "scout", task: "Scan" });
+  return runs.run("fix", { agent: "worker", task: "Fix from: " + scan.output });
+` }
+```
+
+```js
+// Old shape, no longer supported:
+// { tasks: [{ agent: "reviewer", task: "Review API" }, { agent: "reviewer", task: "Review UI" }] }
+
+// Current shape:
+{ workflowScript: `
+  return runs.all([
+    { key: "api", agent: "reviewer", task: "Review API" },
+    { key: "ui", agent: "reviewer", task: "Review UI" }
+  ]);
+` }
+```
+
 For long task text with Markdown fences or shell blocks, use quoted lines instead of a raw template literal:
 
 ````js
@@ -61,6 +166,25 @@ return runs.run("test", { agent: "worker", task });
 ````
 
 A plain workflow creates one enclosing mission by default. Its children do not create separate missions. The result exposes the id as `details.missionId`, and human-readable output ends with `Mission: <id> (<status>)`. Pass `mission:false` for an ephemeral workflow with no mission or durable `state` global.
+
+### Repeatable workflows
+
+Use stable child keys and keep process logic in ordinary JavaScript. `runs.run` launches one child, `runs.all` launches independent children together, and later steps can use each completed child's `output`. Put long task text in arrays joined with `"\n"` so Markdown fences do not conflict with the script string.
+
+For a process you run often, save the task as a prompt template under `.pi/prompts/` or `~/.pi/agent/prompts/` and launch it with `/prompt-workflow`. The adapter compiles prompt steps into `workflowScript`, so templates describe the work instead of embedding raw `subagent` tool-call JSON. You can ask the parent agent to create or update these prompt files from a process described in natural language.
+
+```md
+---
+description: Review a release candidate
+subagent: reviewer
+fresh: true
+---
+Review $@. Return concrete findings with source proof, or state that no issue was found.
+```
+
+```text
+/prompt-workflow review-release-candidate v0.51.0
+```
 
 For watched same-repo workflows, pass `async:false` to show the live in-chat workflow card. `chatProgress` can force `off` or `live-card` when the automatic policy is not what you want. Foreground workflows default to a 30-minute timeout; async workflows have no default timeout. See the [tool reference](tool-reference.md) for the full parameter list.
 
@@ -90,12 +214,12 @@ Configure the worktree base directory and setup hook in [configuration.md](confi
 
 ## Supervisor coordination (child asks parent)
 
-Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent_supervisor({ action: "reply" })` path natively. If no external `pi-intercom` tool owns the `intercom` name, the native channel also exposes `intercom` as a compatibility fallback.
+Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent_supervisor({ action: "reply" })` path natively. Generic `intercom` remains available only when an explicitly loaded external provider supplies it.
 
 Use it for work where the child might need a decision instead of guessing:
 
 ```text
-Run this implementation in the background. If the worker gets blocked or needs a product decision, have it ask me through intercom.
+Run this implementation in the background. If the worker gets blocked or needs a product decision, have it ask me through the supervisor channel.
 ```
 
 ```text

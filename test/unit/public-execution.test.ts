@@ -11,13 +11,19 @@ describe("public subagent execution normalization", () => {
 			params: {
 				context: "fresh",
 				async: false,
-				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", ${JSON.stringify({ agent: "worker", task })})`,
+				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", ${JSON.stringify({ agent: "worker", task, output: true })})`,
 			},
 		});
 		assert.deepEqual(normalizePublicSubagentExecution({ agent: "worker" }), {
 			ok: true,
 			params: {
-				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", {"agent":"worker"})`,
+				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", {"agent":"worker","output":true})`,
+			},
+		});
+		assert.deepEqual(normalizePublicSubagentExecution({ agent: "worker", output: false }), {
+			ok: true,
+			params: {
+				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", {"agent":"worker","output":false})`,
 			},
 		});
 		assert.deepEqual(normalizePublicSubagentExecution({ action: " list " }), { ok: true, params: { action: "list" } });
@@ -44,6 +50,9 @@ describe("public subagent execution normalization", () => {
 			{ action: "single" },
 			{ action: "parallel" },
 			{ action: "chain" },
+			{ action: "append-step", id: "run", step: { agent: "worker" } },
+			{ action: "approve-checkpoint", id: "run" },
+			{ action: "reject-checkpoint", id: "run" },
 			{ agent: "" },
 			{ agent: 42 },
 			{ task: "work" },
@@ -54,6 +63,8 @@ describe("public subagent execution normalization", () => {
 			{ chain: [{ agent: "worker" }] },
 			{ parallel: [{ agent: "worker" }] },
 			{ concurrency: 2 },
+			{ action: "get", chainName: "review-pipeline" },
+			{ action: "create", config: { name: "review-pipeline", steps: [{ agent: "worker" }] } },
 			{ clarify: true, workflowScript: "return 1" },
 			{ resume: "retained-run", workflowScript: "return 1" },
 			{},

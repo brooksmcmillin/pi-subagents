@@ -154,6 +154,54 @@ Project prompt.
 		}
 	});
 
+	it("rejects an unresolved configured model when the host registry is available", async () => {
+		const cwd = path.join(tempDir, "repo-unresolved-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+model: fast
+---
+Project prompt.
+`);
+
+		await assert.rejects(
+			resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+			}),
+			/Unknown subagent model 'fast'/,
+		);
+	});
+
+	it("bypasses native model validation for external CLI runners", async () => {
+		const cwd = path.join(tempDir, "repo-external-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), {
+			subagents: { defaultModel: "mock/default-model" },
+		});
+		writeAgent(path.join(cwd, ".pi", "agents", "external.md"), `---
+name: external
+description: External runner
+runner:
+  type: external-cli
+  command: ${JSON.stringify(process.execPath)}
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "external",
+			cwd,
+			availableModels: [{ provider: "other", id: "known", fullId: "other/known" }],
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.model, undefined);
+		assert.deepEqual(result.contract.modelCandidates, []);
+	});
+
 	it("resolves agent aliases to the canonical launch contract agent", async () => {
 		const cwd = path.join(tempDir, "repo-alias");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -320,10 +368,14 @@ defaultContext: fork
 Project prompt.
 `);
 
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
 		const result = await resolveSubagentLaunchContract({
 			agent: "fanout",
 			cwd,
 			outputSchema: { type: "object", additionalProperties: false },
+			parentSessionFile,
+			parentLeafId: "leaf-current",
 		});
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.context, "fork");
@@ -340,6 +392,50 @@ Project prompt.
 		assert.ok(result.contract.tools.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fanout-child.ts")));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/config-ext.ts"));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/subagent-only.ts"));
+	});
+
+	it("falls back implicit default fork to fresh when the parent session is not forkable", async () => {
+		const cwd = path.join(tempDir, "repo-implicit-fork");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+defaultContext: fork
+---
+Project prompt.
+`);
+
+		const missingSession = await resolveSubagentLaunchContract({ agent: "worker", cwd });
+		assert.equal(missingSession.ok, true);
+		assert.equal(missingSession.contract.context, "fresh");
+
+		const missingFile = path.join(tempDir, "missing-parent.jsonl");
+		const unpersisted = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile: missingFile,
+			parentLeafId: "leaf-current",
+		});
+		assert.equal(unpersisted.ok, true);
+		assert.equal(unpersisted.contract.context, "fresh");
+
+		const parentSessionFile = path.join(tempDir, "implicit-parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
+		const missingLeaf = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile,
+		});
+		assert.equal(missingLeaf.ok, true);
+		assert.equal(missingLeaf.contract.context, "fresh");
+
+		const explicitFork = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			context: "fork",
+		});
+		assert.equal(explicitFork.ok, true);
+		assert.equal(explicitFork.contract.context, "fork");
 	});
 
 	it("fails closed when a capability ceiling denies read required for child skills", async () => {

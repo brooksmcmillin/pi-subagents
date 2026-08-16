@@ -28,14 +28,6 @@ Controls the parent-facing `subagent` tool description registered at startup. `f
 
 `custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.pi/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart Pi after changing the mode or custom file.
 
-## `legacyChainControls`
-
-```json
-{ "legacyChainControls": true }
-```
-
-Defaults to `false`. The default registered model-facing tool schema and description omit the legacy `append-step` `step` schema and legacy checkpoint controls. This does not change runtime support for existing durable legacy chains. Set this to `true` before directly managing a legacy chain with `append-step`, `approve-checkpoint`, or `reject-checkpoint`.
-
 ## `inlineToolDisplay`
 
 ```json
@@ -66,6 +58,38 @@ With `"summary"`, a tool result looks like this:
 ```text
 ✓ reviewer · completed
 ```
+
+## `foregroundDetachShortcut`
+
+```json
+{ "foregroundDetachShortcut": "ctrl+b" }
+```
+
+Optionally binds a shortcut that detaches the active foreground single-subagent run without terminating it. The running foreground card shows the configured shortcut beside its live-detail hint. The default is unset, so pi-subagents does not reserve a global key.
+
+Pi binds `Ctrl+B` to editor cursor-left by default. The extension shortcut takes precedence, but Pi reports the conflict at startup. To reserve the key without that warning, override the editor action in `~/.pi/agent/keybindings.json`:
+
+```json
+{
+  "tui.editor.cursorLeft": "left"
+}
+```
+
+## `orcaProgressTabs` (experimental)
+
+```json
+{
+  "orcaProgressTabs": {
+    "enabled": true
+  }
+}
+```
+
+Opt in to a best-effort Orca observer that creates one Orca terminal tab for each subagent child and mirrors its live tool, assistant, stdout, and stderr progress. Tab titles use a persistent worktree-local sequence (`subagent · <agent> · 1`, `... · 2`, and so on), so separate workflows and concurrent children do not reuse the same number. This does **not** replace Pi as the child runner: native Pi children keep the same process, lifecycle, status, control, artifact, and result paths. External CLI profiles also keep their existing runner and can mirror their stdout/stderr.
+
+The integration is off by default and supports macOS and Linux. It is disabled on Windows. When enabled, `pi-subagents` looks for executable `orca` on `PATH`, or uses the executable path in `PI_SUBAGENT_ORCA_BINARY`. If no executable is available, Orca is not running, the cwd is not an Orca-managed worktree, or `terminal create` fails, the authoritative subagent still runs normally. Tab creation is deliberately best-effort and never changes the child result.
+
+Set `enabled` to `false` (or remove the block) as a kill switch. In that state, `pi-subagents` does not invoke `orca` and creates no Orca tabs. The temporary mirror files contain child output, use private file modes where supported, and are removed shortly after the child finishes. Each mirror is capped at 1 MiB. The observer stops accepting progress when the cap or stream backpressure is reached and appends a truncation notice. The viewer removes terminal control sequences with parser state that persists across file reads. On completion, the viewer exits back to the Orca terminal's shell prompt; the tab and its terminal scrollback remain open until the user closes the tab. A successfully completed native Pi child with a recorded session ends with a safely quoted `rm -- <exact-session-path>` command; failed, stopped, timed-out, and sessionless children do not show the removal command.
 
 ## `asyncByDefault`
 
@@ -287,7 +311,7 @@ Use `file` on hosts where endpoint protection (EDR) pre-execution scanning denie
 }
 ```
 
-Controls whether subagents receive runtime intercom coordination instructions and whether `intercom` and `contact_supervisor` are auto-added to their tool allowlist when needed.
+Controls whether subagents receive runtime coordination instructions and whether `contact_supervisor` is auto-added to their tool allowlist when needed.
 
 Fields:
 
@@ -295,9 +319,9 @@ Fields:
 - `instructionFile`: optional Markdown template replacing the default bridge instructions. `{orchestratorTarget}` is interpolated. Relative paths resolve from `~/.pi/agent/extensions/subagent/`.
 - `resultDelivery`: default `false`; set `true` only when an external listener consumes `subagent:result-intercom` and acknowledges the grouped completion payload. This is optional external result delivery, not native supervisor messaging. Enabled delivery waits for acknowledgement and reports acknowledgement failures. It does not change supervisor asks or progress updates.
 
-Bridge activation requires a targetable current parent session id, which `pi-subagents` passes to children automatically. Native supervisor messaging does not require an external `pi-intercom` installation or per-agent extension allowlists: children use `contact_supervisor`, and parents use `subagent_supervisor` to inspect or reply. The external `intercom` tool is fallback plumbing when present.
+Bridge activation requires a targetable current parent session id, which `pi-subagents` passes to children automatically. Native supervisor messaging does not require an external `pi-intercom` installation or per-agent extension allowlists: children use `contact_supervisor`, and parents use `subagent_supervisor` to inspect or reply. Agents can still use an external `intercom` tool when they explicitly request a provider that supplies it.
 
-The default injected guidance tells children to use `contact_supervisor` with `reason: "need_decision"` when blocked or needing a decision, `reason: "progress_update"` only for meaningful blocked/progress updates, generic `intercom` as fallback plumbing, and avoid routine completion handoffs.
+The default injected guidance tells children to use `contact_supervisor` with `reason: "need_decision"` when blocked or needing a decision, `reason: "progress_update"` only for meaningful blocked/progress updates, and avoid routine completion handoffs.
 
 ## `worktreeBaseDir`
 
@@ -374,9 +398,9 @@ Controls where subagent artifact files (inputs, outputs, transcripts, metadata) 
 - `"session"` (default): stores artifacts under pi's session directory (`~/.pi/agent/sessions/<session>/subagent-artifacts/`), keeping the working directory clean. It falls back to the OS temp directory when no session file exists.
 - `"temp"`: uses the OS temp directory.
 
-This preference also controls the default chain scratch directory. `"project"` uses `<cwd>/.pi/subagents/chain-runs/`, while the default `"session"` and `"temp"` use the user-scoped temp chain directory.
+This preference also controls the default workflow artifact directory used by scripted chaining. `"project"` uses `<cwd>/.pi/subagents/chain-runs/`; the directory keeps its legacy name for compatibility. The default `"session"` and `"temp"` use the user-scoped temp workflow artifact directory.
 
-The `"session"` option uses the same directory that `cleanupAllArtifactDirs` already scans for age-based cleanup, so artifacts are still cleaned up automatically. Temporary chain directories are cleaned up separately after 24 hours.
+The `"session"` option uses the same directory that `cleanupAllArtifactDirs` already scans for age-based cleanup, so artifacts are still cleaned up automatically. Temporary workflow artifact directories are cleaned up separately after 24 hours.
 
 When a project-scoped launch runs from an npm package directory, pi-subagents warns if package settings can include `.pi/subagents/` in the published package. Add `.pi/subagents/` to `.npmignore` (or `.gitignore` when no `.npmignore` exists), use a `files` allowlist that does not include `.pi/subagents/`, or select `"session"` or `"temp"`.
 
@@ -405,3 +429,19 @@ Controls smart batching of async-completion notifications. When several backgrou
 ## `permissions`
 
 Native child tool permission rules. See [watchdog.md](watchdog.md#native-child-tool-permissions).
+
+## `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS`
+
+Caps the total time a single retried filesystem operation may sleep, in milliseconds. Environment-only; there is no config key.
+
+Atomic status and result writes retry on `EACCES`, `EBUSY`, and `EPERM`, which on Windows are usually a scanner or a sibling process holding the destination of a rename for a moment. The retry ladder sleeps up to about 7.9s in total, and it sleeps *synchronously* — `Atomics.wait` parks the calling thread rather than spinning.
+
+That is the right trade-off for a CLI. It is the wrong one for a long-lived process that loads `pi-subagents` in-process and runs those writers on its event loop: one contended rename stalls everything it serves for the length of the ladder, and because the thread is parked rather than busy, it presents as an unresponsive process sitting at 0% CPU. A wide fanout makes contention on a single `status.json` likely.
+
+Set this to bound that stall. The ladder keeps its number of attempts and only the sleeps shrink, because `run-fanout-budget` and mission state locking use the ladder's length as their attempt budget:
+
+```text
+PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS=1000
+```
+
+Unset by default, so behaviour is unchanged unless you opt in. Opting in trades lock-wait tolerance for responsiveness: entries clamped to `0` return immediately, so contention that would previously have been waited out surfaces as an error sooner. Values that are not a non-negative integer fail instead of being coerced.

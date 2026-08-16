@@ -108,20 +108,20 @@ function hasExistingSessionFile(value: unknown): value is string {
 	return typeof value === "string" && fs.existsSync(value);
 }
 
-function formatCheckpointGuidance(runId: string | undefined, checkpoint: AsyncStatus["checkpoint"] | undefined): string | undefined {
-	if (!runId || !checkpoint || checkpoint.status !== "pending") return undefined;
-	return `Checkpoint: ${checkpoint.name}${checkpoint.message ? ` — ${checkpoint.message}` : ""}\nApprove: subagent({ action: "approve-checkpoint", id: "${runId}" })\nReject: subagent({ action: "reject-checkpoint", id: "${runId}" })`;
-}
-
-function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown; runId?: unknown; workflowKey?: unknown }>, fallbackSessionFile?: unknown, options: { stopped?: boolean } = {}): string {
+function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown; runId?: unknown; workflowKey?: unknown; status?: unknown; activityState?: unknown }>, fallbackSessionFile?: unknown, options: { stopped?: boolean } = {}): string {
 	if (options.stopped) return "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
 	const knownChildren = children
 		.map((child, index) => ({ child, index }))
 		.filter(({ child }) => typeof child.agent === "string");
 	if (!runId || knownChildren.length === 0) return "Resume: unavailable; no child session file was persisted.";
 	const workflowChildren = knownChildren.filter(({ child }) => typeof child.runId === "string" && child.runId.trim() && hasExistingSessionFile(child.sessionFile));
+	const supervisorDetachedWorkflowChildren = workflowChildren.filter(({ child }) => child.status === "paused" && child.activityState === "needs_attention");
+	const resumableWorkflowChildren = workflowChildren.filter(({ child }) => !(child.status === "paused" && child.activityState === "needs_attention"));
 	if (workflowChildren.length > 0) {
-		return workflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`).join("\n");
+		return [
+			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with subagent_wait({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
+			...resumableWorkflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`),
+		].join("\n");
 	}
 	const singleSessionFile = knownChildren[0]?.child.sessionFile ?? fallbackSessionFile;
 	if (children.length === 1 && knownChildren.length === 1 && hasExistingSessionFile(singleSessionFile)) {
@@ -205,12 +205,6 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	else lines.push(`Transcript: subagent({ action: "status", id: "${run.runId}", index: 0, view: "transcript" })`);
 	const detached = run.children.some((child) => child.status === "detached");
 	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
-	if (run.checkpoint?.status === "pending") {
-		lines.push(`Checkpoint: ${run.checkpoint.name}${run.checkpoint.message ? ` — ${run.checkpoint.message}` : ""}`);
-		lines.push(`Approve: subagent({ action: "approve-checkpoint", id: "${run.runId}" })`);
-		lines.push(`Reject: subagent({ action: "reject-checkpoint", id: "${run.runId}" })`);
-		return lines.join("\n");
-	}
 	if (detached) {
 		lines.push(`Recovery: reply to the supervisor request first, then wait with subagent_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
 	} else if (resumable) {
@@ -550,7 +544,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (status.state !== "running") {
 				lines.push(allExternal
 					? "Resume: unavailable; one-shot external CLI runners do not persist sessions."
-					: formatCheckpointGuidance(status.runId, status.checkpoint) ?? formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
+					: formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
