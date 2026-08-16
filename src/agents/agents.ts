@@ -617,12 +617,16 @@ function isProjectRootCandidate(dir: string): boolean {
 
 function findProjectRootCandidates(cwd: string): string[] {
 	const roots: string[] = [];
-	let currentDir = cwd;
+	const tempDir = path.resolve(os.tmpdir());
+	let currentDir = path.resolve(cwd);
 	while (true) {
-		if (isProjectRootCandidate(currentDir)) roots.push(currentDir);
+		// A configuration at the system temporary-directory root is not a project
+		// configuration for every temporary checkout beneath it. This also keeps
+		// stale /tmp/.pi artifacts from changing discovery outside their project.
+		if (currentDir !== tempDir && isProjectRootCandidate(currentDir)) roots.push(currentDir);
 
 		const parentDir = path.dirname(currentDir);
-		if (parentDir === currentDir) return roots;
+		if (parentDir === currentDir || currentDir === tempDir) return roots;
 		currentDir = parentDir;
 	}
 }

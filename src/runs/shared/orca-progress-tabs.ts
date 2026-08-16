@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { Message } from "@earendil-works/pi-ai";
@@ -138,12 +139,15 @@ function sleepSync(ms: number): void {
 function resolveSequenceScope(cwd: string): string {
 	let current = path.resolve(cwd);
 	try { current = fs.realpathSync(current); } catch { /* use the lexical cwd */ }
+	const tempDir = path.resolve(os.tmpdir());
 	while (true) {
+		// Do not treat metadata at the system temp root as a repository for every
+		// temporary child directory.
 		try {
-			if (fs.existsSync(path.join(current, ".git"))) return current;
+			if (current !== tempDir && fs.existsSync(path.join(current, ".git"))) return current;
 		} catch { /* keep walking */ }
 		const parent = path.dirname(current);
-		if (parent === current) return path.resolve(cwd);
+		if (parent === current || current === tempDir) return path.resolve(cwd);
 		current = parent;
 	}
 }
