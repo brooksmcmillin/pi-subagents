@@ -106,6 +106,24 @@ function refreshChildToolDiagnostic(pi: ExtensionAPI): ChildToolDiagnostic | und
 	return writeChildToolDiagnostic(filePath, required, available, process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim(), readMcpDirectChildTools());
 }
 
+function activateStructuredOutputTool(pi: ExtensionAPI): void {
+	const registered = pi.getAllTools().map((tool) => tool.name);
+	if (!registered.includes("structured_output")) {
+		throw new Error(
+			`Structured output runtime failed: the prompt-runtime extension did not register 'structured_output'. Registered tools: ${registered.join(", ") || "(none)"}.`,
+		);
+	}
+
+	const activeBefore = pi.getActiveTools();
+	pi.setActiveTools([...new Set([...activeBefore, "structured_output"])]);
+	const activeAfter = pi.getActiveTools();
+	if (!activeAfter.includes("structured_output")) {
+		throw new Error(
+			`Structured output runtime failed: 'structured_output' was registered but could not be activated. Active tools before activation: ${activeBefore.join(", ") || "(none)"}; after activation: ${activeAfter.join(", ") || "(none)"}.`,
+		);
+	}
+}
+
 function registerRuntimeExtensionAcknowledgements(pi: ExtensionAPI): void {
 	const outputPath = process.env[RUNTIME_EXTENSION_ACK_PATH_ENV]?.trim();
 	if (!outputPath) return;
@@ -646,6 +664,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				};
 			},
 		});
+		onRuntimeEvent("session_start", () => activateStructuredOutputTool(pi));
 	}
 
 	onRuntimeEvent("context", (event: unknown, ctx?: ExtensionContext) => {
