@@ -41,7 +41,7 @@ export type WorkflowNodeStatus = "pending" | "running" | "completed" | "failed" 
 
 export interface WorkflowGraphNode {
 	id: string;
-	kind: "step" | "parallel-group" | "dynamic-parallel-group" | "agent" | "checkpoint";
+	kind: "step" | "parallel-group" | "dynamic-parallel-group" | "agent";
 	agent?: string;
 	phase?: string;
 	label: string;
@@ -61,16 +61,6 @@ export interface WorkflowGraphNode {
 	structured?: boolean;
 	acceptanceStatus?: AcceptanceLedgerStatus;
 	error?: string;
-	checkpoint?: ChainCheckpointState;
-}
-
-export interface ChainCheckpointState {
-	name: string;
-	message?: string;
-	status: "pending" | "approved" | "rejected";
-	stepIndex: number;
-	approvedAt?: number;
-	rejectedAt?: number;
 }
 
 export interface WorkflowGraphSnapshot {
@@ -282,7 +272,7 @@ export interface ParallelHandoffGroup {
 export interface ParallelHandoffManifest {
 	version: 1;
 	runId: string;
-	mode: "parallel" | "chain";
+	mode: "single" | "parallel" | "chain";
 	source: "foreground" | "async";
 	cwd: string;
 	createdAt: number;
@@ -1031,6 +1021,7 @@ export interface Details {
 	controlEvents?: ControlEvent[];
 	steering?: SteerActionResult;
 	asyncId?: string;
+	background?: boolean;
 	asyncDir?: string;
 	timeoutMs?: number;
 	deadlineAt?: number;
@@ -1056,7 +1047,6 @@ export interface Details {
 	totalSteps?: number;         // Total steps in chain
 	currentStepIndex?: number;   // 0-indexed current step (for running chains)
 	workflowGraph?: WorkflowGraphSnapshot;
-	checkpoint?: ChainCheckpointState;
 	outputs?: ChainOutputMap;
 	// Aggregated child usage across all agents in the run
 	totalChildUsage?: Usage;
@@ -1088,7 +1078,7 @@ export interface Details {
 		trace: Array<{
 			operation: "run" | "status";
 			key: string;
-			state: "started" | "completed" | "failed" | "stopped" | "reused";
+			state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused";
 			agent?: string;
 			runId?: string;
 			phase?: string;
@@ -1276,7 +1266,6 @@ export interface AsyncStartedEvent {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
-	checkpoint?: ChainCheckpointState;
 	launchContractDigest?: string;
 	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
@@ -1365,7 +1354,6 @@ export interface AsyncStatus {
 	pendingAppends?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
-	checkpoint?: ChainCheckpointState;
 	processTerminal?: ProcessTerminalV1;
 	runFanoutBudget?: RunFanoutBudgetSnapshot;
 	runFanoutBudgetDescriptor?: RunFanoutBudgetDescriptor;
@@ -1395,7 +1383,6 @@ export interface AsyncStatus {
 		parentWorkflowRunId?: string;
 		outputName?: string;
 		structured?: boolean;
-		checkpoint?: ChainCheckpointState;
 		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped" | "rejected";
 		children?: NestedRunSummary[];
 		sessionFile?: string;
@@ -1493,7 +1480,6 @@ export interface AsyncJobState {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	steps?: AsyncJobStep[];
-	checkpoint?: ChainCheckpointState;
 	stepsTotal?: number;
 	runningSteps?: number;
 	completedSteps?: number;
@@ -1571,7 +1557,6 @@ export interface ForegroundResumeRun {
 	/** Originating parent session. Detached exits can outlive the active session. */
 	sessionId?: string;
 	updatedAt: number;
-	checkpoint?: ChainCheckpointState;
 	children: ForegroundResumeChild[];
 }
 
@@ -1839,6 +1824,8 @@ export interface RunSyncOptions {
 	};
 	/** Private live callback for the exact child prompt after runtime acceptance injection. */
 	onEffectivePrompt?: (prompt: string) => void;
+	/** Internal lifecycle hook for the observer shared across retries of one logical child. */
+	onOrcaProgressTabCreated?: (tab: import("../runs/shared/orca-progress-tabs.ts").OrcaProgressTab) => void;
 }
 
 export type IntercomBridgeMode = "off" | "fork-only" | "always";
@@ -1900,6 +1887,11 @@ export const FLEET_KEYBINDING_ACTIONS = [
 export type FleetKeybindingAction = typeof FLEET_KEYBINDING_ACTIONS[number];
 export type FleetKeybindingsConfig = Partial<Record<FleetKeybindingAction, string[]>>;
 
+export interface OrcaProgressTabsConfig {
+	/** Create one Orca terminal tab per running subagent. Experimental and opt-in. */
+	enabled?: boolean;
+}
+
 export interface MainWindowRendererConfig {
 	/** Unit of horizontal space in main chat subagent call/result rows. Omit to preserve current spacing. Set 0 for no extra padding. */
 	horizontalSpacing?: number;
@@ -1909,6 +1901,8 @@ export interface MainWindowRendererConfig {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	/** Optional shortcut that detaches the active foreground single-subagent run. */
+	foregroundDetachShortcut?: string;
 	/** Show the Claude Code-style navigable fleet. Defaults to true. */
 	fleetView?: boolean;
 	/** Place the persistent FleetView above or below the editor. Defaults to belowEditor. */
@@ -1919,12 +1913,12 @@ export interface ExtensionConfig {
 	asyncWidget?: boolean;
 	/** Tool description variant registered for the parent-facing subagent tool. Defaults to full. */
 	toolDescriptionMode?: ToolDescriptionMode;
-	/** Include legacy append-step and checkpoint controls in the registered tool schema. Defaults to false. */
-	legacyChainControls?: boolean;
 	/** Inline chat rendering for the subagent tool. Defaults to rich. */
 	inlineToolDisplay?: InlineToolDisplay;
 	/** Density controls for the main chat subagent call/result renderer. */
 	mainWindowRenderer?: MainWindowRendererConfig;
+	/** Experimental observer: mirror each native subagent's progress into a new Orca tab. */
+	orcaProgressTabs?: OrcaProgressTabsConfig;
 	forceTopLevelAsync?: boolean;
 	waitTool?: WaitToolConfig;
 	defaultSessionDir?: string;
@@ -2057,7 +2051,10 @@ export function resolveTempScopeId(options?: {
 
 const MAX_PARALLEL = 8;
 export const MAX_CONCURRENCY = 4;
-export const TEMP_ROOT_DIR = path.join(os.tmpdir(), `pi-subagents-${resolveTempScopeId()}`);
+const configuredTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+export const TEMP_ROOT_DIR = configuredTempRoot
+	? path.resolve(configuredTempRoot)
+	: path.join(os.tmpdir(), `pi-subagents-${resolveTempScopeId()}`);
 export const RESULTS_DIR = path.join(TEMP_ROOT_DIR, "async-subagent-results");
 export const ASYNC_DIR = path.join(TEMP_ROOT_DIR, "async-subagent-runs");
 export const CHAIN_RUNS_DIR = path.join(TEMP_ROOT_DIR, "chain-runs");
@@ -2080,7 +2077,7 @@ export const SLASH_SUBAGENT_CANCEL_EVENT = "subagent:slash:cancel";
 export const POLL_INTERVAL_MS = 250;
 export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
-export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "steer", "stop", "dismiss", "append-step", "approve-checkpoint", "reject-checkpoint", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
+export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "steer", "stop", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
 
 export const DEFAULT_FORK_PREAMBLE =
 	"You are a delegated subagent running from a fork of the parent session. " +

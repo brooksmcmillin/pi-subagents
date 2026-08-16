@@ -10,10 +10,12 @@ practices, and error handling.
 
 ## Important Constraints
 
-- **Forking requires a persisted parent session.** If the current session does not
-  have a persisted session file, forked runs fail. Packaged `worker`, `oracle`,
-  and `advisor` default to forked context, so use `context: "fresh"` explicitly
-  when that is not available or not wanted.
+- **Explicit forking requires a persisted parent session.** If the current session
+  does not have a persisted session file or current leaf, explicit `context: "fork"`
+  fails. An agent-level `defaultContext: fork` is a preference: packaged `worker`,
+  `oracle`, and `advisor` fall back to `fresh` when those fork preconditions are not
+  met yet. Use `context: "fresh"` when you do not want a fork even after the parent
+  session exists.
 - **Forked runs inherit parent history.** They are branched threads, not fresh
   filtered contexts. Use fresh context for adversarial reviewers unless the user explicitly asks for forked context.
 - **Default subagent nesting depth is 2.** Deeper recursive delegation is blocked
@@ -67,7 +69,7 @@ Give subagents specific tasks rather than vague mandates.
 
 ### Escalate decisions upward
 
-If a subagent encounters an unapproved product, architecture, scope, merge, release, credential, or authority choice, it should use `contact_supervisor` and wait for the reply instead of deciding alone. Generic `intercom` is a fallback only when the bridge-provided supervisor tool is unavailable. External checks, receipts, and review bots provide evidence only; they do not grant authority.
+If a subagent encounters an unapproved product, architecture, scope, merge, release, credential, or authority choice, it should use `contact_supervisor` and wait for the reply instead of deciding alone. Generic `intercom` is external or provider-supplied only. Use it only when external bridge instructions provide an explicit safe target. External checks, receipts, and review bots provide evidence only; they do not grant authority.
 
 ### Intervene only on clear control signals
 
@@ -82,7 +84,8 @@ Use `/name` so intercom targeting stays stable.
 **"Unknown agent"**
 ```typescript
 subagent({ action: "list" })
-// Check available agents and chains, then confirm scope/precedence.
+// Check available agents, then confirm scope/precedence. Saved chains are not a
+// public execution surface; author orchestration with workflowScript.
 ```
 
 **Setup, discovery, or intercom confusion**

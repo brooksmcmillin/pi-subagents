@@ -2,8 +2,68 @@
 
 ## [Unreleased]
 
+### Added
+- Add `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS` so a host embedding the extension can bound how long a contended filesystem retry blocks its thread. Unset by default. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1143.
+
+### Fixed
+- Keep structured delegation integration coverage active when the test process inherits a subagent-child environment marker.
+- Restore and list schedules after their project directory is deleted, and skip orphan schedule directories without letting create reuse their stale state. Thanks to [@ELA718](https://github.com/ELA718) for #1171 and [@colinb4987](https://github.com/colinb4987) for #1167.
+- Isolate test async state from the user temp root and write each missing-mission sync diagnostic only once (#1164, #1165).
+- Show FleetView transcript fallbacks for trusted session roots instead of warning about an untrusted session file. Thanks to [@aliceisjustplaying](https://github.com/aliceisjustplaying) for #1154.
+- Keep workflowScript child-launch tracking working on Bun-built Pi by avoiding a hard dependency on V8 promise hooks and rejecting non-portable nested async helpers. Thanks to [@rochecompaan](https://github.com/rochecompaan) for #1158 and [@rholak](https://github.com/rholak) for the version-window diagnosis.
+- Skip fallback models that are unavailable in the active registry, so shared agent configs still run where their primary model is available. Thanks to [@JPFrancoia](https://github.com/JPFrancoia) for #1147.
+- Sweep expired wait subscriptions armed by another session, so a record left behind by a session that never returns stops accumulating in the subscriptions directory. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1142.
+- Keep `mcp:<server>` direct tools available when pi-mcp-adapter cache identity includes a request-header command. Thanks to [@xz-dev](https://github.com/xz-dev) for #1141.
+- Fall back from an implicit `defaultContext: fork` to `fresh` when the parent session file or current leaf is not available yet, instead of failing the first launch. Explicit `context: "fork"` remains fail-fast. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1137.
+- Preserve a child's file-only report when its output path also names the workflow summary output.
+- Keep concurrent async result promotion from deleting a newer payload or another promoter's published result. Thanks to [@albertgwo](https://github.com/albertgwo) for #1130.
+- Bound opaque tool-call IDs used by async active-run and result indexes, preventing provider-generated IDs longer than the filesystem component limit from aborting background launches with `ENAMETOOLONG`. Optional active-run aliases now fail open without losing the authoritative run marker. Thanks to [@hlstwizard](https://github.com/hlstwizard) for #1131.
+- Bound async result session and run path segments so long identities do not make `subagent_wait` fail with `ENAMETOOLONG`. Thanks to [@zhouatie](https://github.com/zhouatie) for #1135.
+- Preserve workflow child task output when neither the workflow nor child configures an output file (#1136).
+
 ### Changed
 - Split bundled `pi-subagents` skill into a lean router plus on-demand references. The agent catalog now lives in `references/agent-catalog.md` and orchestration recipes in `references/orchestration-recipes.md`; the router explicitly gates both reads to "after deciding to delegate," so sessions that do not delegate do not pay the catalog/recipe cost. Removed `references/prompting-and-roles.md` (folded into `agent-catalog.md` and `orchestration-recipes.md`) and moved the always-on constraints, best practices, and error handling into a slimmer `references/constraints-and-recipes.md`.
+- Keep `worktree: true` workflow children on the single-child path while preserving managed patch handoffs, and remove unused foreground chain/parallel execution and durable chain management surfaces.
+- Document scripted chaining as the supported workflow API, with migration examples for removed top-level chain/task inputs.
+- Document that a host's session lifetime owns completion wakes, and how to key an idle check on live run state rather than parent activity. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1144.
+- Remove legacy subagent tool compatibility fields for append-step control, schedule aliases, async recovery metadata, and string mission goals.
+- Remove chain approval checkpoint steps and the `approve-checkpoint` / `reject-checkpoint` controls.
+- Clarify that subagent reviews and gates should stay async unless foreground behavior is the actual requirement.
+- Remove `prompts.render` from `workflowScript`; pass explicit task text to `runs.run` or use `/prompt-workflow` for reusable prompt templates.
+
+## [0.50.0] - 2026-08-15
+
+### Added
+- Add optional Orca progress tabs with bounded, sanitized mirrors for native Pi and external CLI children. Thanks to @hyein-cbio for #1080.
+- Show caller-owned external jobs in FleetView through a bounded push/cache API, without polling or exposing managed controls. Thanks to @ssyram for #1083.
+- Add a bounded current-status snapshot for async runs in RPC surfaces, without replaying terminal history. Thanks to @yanqianglu for #1078.
+- Add an optional `foregroundDetachShortcut` binding and show it in the running single-subagent card, so foreground work can be moved to the background without editing package source. Thanks to @Lewis-E for #1097.
+
+### Changed
+- Clarify retained-child resumability and native supervisor coordination guidance. Thanks to @ELA718 for #1126.
+- Clarify that completed retained writers should use `resume`, while `steer` with `mode: "follow_up"` only queues text for the next revival (#1104).
+- Treat oracle/advisor consultation prompts as supervisor-backed dialogue when material unknowns remain (#1102).
+- Show explicit resumable and not-resumable states, with fallback guidance, in retained child listings (#1101).
+- Reduce reload work for large async histories by indexing the async result inbox by session, observer, and tool-call id instead of scanning every old result file. Stale terminal active markers now age out, and replay cleanup scans run less often.
+
+### Fixed
+- Keep Orca progress tabs from treating write-stream backpressure as mirror truncation.
+- Stop advertising an `output-<index>.log` artifact in run transcripts when that file was never written, so workflow runs no longer point at a path that cannot exist. Thanks to @lbijeau for #1124.
+- Keep FleetView working when a session file path is longer than a short identity, instead of failing external-job inspection on every poll. Thanks to @albertgwo for #1121 and @Don-Yin for #1122.
+- Keep structured single-child runs from overriding output paths in the task, while preserving explicit and agent-configured outputs. Thanks to @pasemes for #1119.
+- Keep no-edit confirmations guarded after later changes retract a prior implementation (#1115).
+- Remove the native generic `intercom` compatibility fallback from supervisor coordination while preserving `contact_supervisor`, `subagent_supervisor`, and external `intercom` providers. Thanks to @jaudiger for #1107.
+- Report an actionable project-settings override when duplicate ambient Pi extensions prevent a child from starting (#1114).
+- Keep the FleetView overlay refreshed while open and count active leaf agents in the compact summary. Thanks to @Don-Yin for #1108.
+- Keep user-requested foreground detaches from showing supervisor-response recovery guidance. Thanks to @Lewis-E for #1109.
+- Reject configured subagent models that are not in the active host model registry before spawning a child, instead of forwarding an invalid `--model` argument to Pi. Thanks to @DresvyanskiyDenis for #1093.
+- Start Herdr inspector and project pane commands with a shell-safe executable token, including paths that need quoting in Nushell. Thanks to @Rival for #1092.
+- Stop `agentContract.version` from using an `enum` on an integer, which Gemini's function-calling schema subset rejects. Integer bounds express the same constraint and are valid everywhere. Thanks to @MarcusNeufeldt for #1095.
+- Show supervisor-detached workflow children as paused and needing attention instead of failed while preserving recovery guidance (#1096).
+- Show workflow-owned foreground children and recursive nested runs as a bounded tree in FleetView. Thanks to @expoli for #1086.
+- Warn once, instead of on every heartbeat, when a long-running workflow child outlives its mission record. Thanks to @albertgwo for #1079.
+- Keep deleted-schedule timers from exiting Pi and re-arm recurring schedules after unexpected timer fire failures. Thanks to @albertgwo for #1084.
+- Count native `await` use of `runs.run`, `runs.all`, and launch-containing Promise combinators as consumed without allowing fire-and-forget launches. Thanks to @kebinzhi for #1082.
 
 ## [0.49.0] - 2026-08-13
 

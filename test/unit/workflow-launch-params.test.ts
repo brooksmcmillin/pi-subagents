@@ -99,6 +99,40 @@ describe("workflow launch params", () => {
 		);
 	});
 
+	it("passes an omitted child timeout parent deadline for default resolution", () => {
+		const parentDeadlineAt = Date.now() + 60_000;
+		const params = prepareWorkflowLaunchParams(
+			{},
+			{ agent: "worker", task: "Run" },
+			"workflow-run",
+			"run",
+			{ parentDeadlineAt },
+		);
+		assert.equal(params.async, false);
+		assert.equal(params.timeoutMs, undefined);
+		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
+	});
+
+	it("preserves explicit child timeout aliases over the parent deadline", () => {
+		const parentDeadlineAt = Date.now() + 60_000;
+		assert.equal(prepareWorkflowLaunchParams(
+			{},
+			{ agent: "worker", task: "Run", timeoutMs: 90_000 },
+			"workflow-run",
+			"timeout",
+			{ parentDeadlineAt },
+		).timeoutMs, 90_000);
+		const maxRuntimeParams = prepareWorkflowLaunchParams(
+			{},
+			{ agent: "worker", task: "Run", maxRuntimeMs: 90_000 },
+			"workflow-run",
+			"max-runtime",
+			{ parentDeadlineAt },
+		);
+		assert.equal(maxRuntimeParams.maxRuntimeMs, 90_000);
+		assert.equal(maxRuntimeParams.timeoutMs, undefined);
+	});
+
 	it("preserves explicit async workflow children", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
@@ -137,7 +171,7 @@ describe("workflow launch params", () => {
 		assert.equal(prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "sibling").intercomBridge, undefined);
 	});
 
-	it("places workflow child gates inside managed worktree tasks", () => {
+	it("keeps managed worktree children on the single-run contract", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
 				{},
@@ -146,15 +180,13 @@ describe("workflow launch params", () => {
 				"gated",
 			),
 			{
+				agent: "worker",
+				task: "Implement",
 				worktree: true,
 				async: false,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "gated",
-				tasks: [{
-					agent: "worker",
-					task: "Implement",
-					acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
-				}],
+				acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
 			},
 		);
 	});
@@ -174,6 +206,44 @@ describe("workflow launch params", () => {
 				workflowParentRunId: "workflow-run",
 				workflowKey: "continue",
 				intercomBridge: { mode: "off" },
+			},
+		);
+	});
+
+	it("does not inherit parent deadlines for retained workflow children", () => {
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{},
+				{ resume: "retained-run", task: "Continue" },
+				"workflow-run",
+				"continue",
+				{ parentDeadlineAt: Date.now() + 60_000 },
+			),
+			{
+				action: "resume",
+				id: "retained-run",
+				message: "Continue",
+				workflowParentRunId: "workflow-run",
+				workflowKey: "continue",
+			},
+		);
+	});
+
+	it("preserves worktree isolation for retained workflow children", () => {
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{},
+				{ resume: "retained-run", task: "Continue", worktree: true },
+				"workflow-run",
+				"continue",
+			),
+			{
+				action: "resume",
+				id: "retained-run",
+				message: "Continue",
+				workflowParentRunId: "workflow-run",
+				workflowKey: "continue",
+				worktree: true,
 			},
 		);
 	});

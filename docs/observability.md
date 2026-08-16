@@ -81,6 +81,22 @@ Without a TUI, `/subagents-fleet` retains the textual `subagent({ action: "statu
 
 Use `/subagents-detach [run-id]` only for an active foreground single-subagent run you want to leave running without terminating; the eventual result remains available through status/wait.
 
+Set `foregroundDetachShortcut` in `~/.pi/agent/extensions/subagent/config.json` to bind the same action to a shortcut. The running foreground card shows the configured shortcut beside its live-detail hint:
+
+```json
+{
+  "foregroundDetachShortcut": "ctrl+b"
+}
+```
+
+Pi binds `Ctrl+B` to editor cursor-left by default. The extension shortcut takes precedence, but Pi reports the conflict at startup. To reserve the key without that warning, override the editor action in `~/.pi/agent/keybindings.json`:
+
+```json
+{
+  "tui.editor.cursorLeft": "left"
+}
+```
+
 If something feels misconfigured, run `/subagents-doctor` or ask: "Check whether subagents and intercom are set up correctly."
 
 ## Async run artifacts
@@ -148,15 +164,15 @@ Foreground and async runners share bounded child-protocol handling:
 - `agent_end.willRetry` defers completion until the child settles.
 - Current Pi builds use `agent_settled` as the terminal watermark; older builds retain the bounded terminal-message fallback.
 
-## Chain and debug artifacts
+## Workflow and debug artifacts
 
-Each chain run creates a scratch directory under its resolved chain root. With the default `artifactDir: "session"` or with `"temp"`, it is user-scoped temp storage. With `artifactDir: "project"`, the root is `<cwd>/.pi/subagents/chain-runs/`:
+Each scripted workflow stores runtime artifacts under a workflow artifact directory. The on-disk directory is still named `chain-runs` for compatibility. With the default `artifactDir: "session"` or with `"temp"`, it is user-scoped temp storage. With `artifactDir: "project"`, the root is `<cwd>/.pi/subagents/chain-runs/`:
 
 ```text
 <tmpdir>/pi-subagents-<scope>/chain-runs/{runId}/
 ```
 
-A run directory may contain files such as `context.md`, `plan.md`, `progress.md`, and `parallel-{stepIndex}/.../output.md`. User-scoped temp chain directories older than 24 hours are cleaned up on extension startup; project-local and explicit persistent roots are not age-scanned.
+A run directory may contain files such as `context.md`, `plan.md`, `progress.md`, and `parallel-{stepIndex}/.../output.md`. User-scoped temp workflow artifact directories older than 24 hours are cleaned up on extension startup; project-local and explicit persistent roots are not age-scanned.
 
 Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi/subagents/artifacts/` for project-scoped runs, or a user-scoped temp artifact directory. Single-run relative `output` files are saved under `{artifactsDir}/outputs/{runId}/` unless `singleRunOutputBaseDir` is configured. Per task you may see:
 
@@ -171,7 +187,7 @@ For npm package projects, project-scoped artifacts need a `.npmignore` rule (or 
 
 ## Sessions
 
-Session files are stored under a per-run session directory. With `context: "fork"`, each child starts with `--session <branched-session-file>` produced from the parent's current leaf. That is a real session fork, not an injected summary.
+Session files are stored under a per-run session directory. With `context: "fork"`, each child starts with `--session <branched-session-file>` produced from the parent's current leaf. That is a real session fork, not an injected summary. An omitted launch `context` that resolves through `defaultContext: fork` uses the same branch when the parent session file and current leaf exist, and otherwise starts fresh.
 
 ## Completion notifications
 

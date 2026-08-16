@@ -8,7 +8,10 @@ export interface PublicSubagentExecutionParams {
 	parallel?: unknown;
 	concurrency?: unknown;
 	chainDir?: unknown;
+	chainName?: unknown;
+	config?: unknown;
 	workflowScript?: unknown;
+	output?: unknown;
 	resume?: unknown;
 	clarify?: unknown;
 	runFanoutBudget?: unknown;
@@ -37,6 +40,12 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 	if (params.clarify !== undefined) {
 		return { ok: false, error: "Public workflowScript execution does not support clarify UI.", mode: "workflow" };
 	}
+	if (params.chainName !== undefined) {
+		return { ok: false, error: "Durable chain management was removed; use workflowScript or /prompt-workflow for repeatable workflows.", mode: "management" };
+	}
+	if (params.config && typeof params.config === "object" && !Array.isArray(params.config) && Object.prototype.hasOwnProperty.call(params.config, "steps")) {
+		return { ok: false, error: "Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", mode: "management" };
+	}
 	if (params.resume !== undefined) {
 		return { ok: false, error: "Top-level resume execution is not available. Put resume on a workflowScript runs.run/runs.all item.", mode: "workflow" };
 	}
@@ -46,6 +55,12 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 	}
 	if (normalizedAction !== undefined) {
 		const legacyAction = normalizedAction.toLowerCase();
+		if (legacyAction === "append-step") {
+			return { ok: false, error: "Legacy append-step control was removed from the public subagent tool; use current workflowScript orchestration.", mode: "management" };
+		}
+		if (legacyAction === "approve-checkpoint" || legacyAction === "reject-checkpoint") {
+			return { ok: false, error: "Legacy checkpoint approval controls were removed from the public subagent tool; use current workflowScript orchestration.", mode: "management" };
+		}
 		if (legacyAction === "single") {
 			return { ok: false, error: "action='single' is not supported. Omit action and pass { agent, task } for one child.", mode: "workflow" };
 		}
@@ -70,7 +85,7 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		return { ok: true, params: { ...params, action: normalizedAction } };
 	}
 	if (params.step !== undefined) {
-		return { ok: false, error: "step is only available with action='append-step'; it is not an execution mode.", mode: "workflow" };
+		return { ok: false, error: "step is not a public execution field; use workflowScript for orchestration.", mode: "workflow" };
 	}
 	if (params.workflowScript !== undefined && (params.agent !== undefined || params.task !== undefined)) {
 		return { ok: false, error: "Structured single-child execution cannot be combined with workflowScript.", mode: "workflow" };
@@ -82,10 +97,11 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		if (params.task !== undefined && typeof params.task !== "string") {
 			return { ok: false, error: "Structured single-child task must be a string when provided.", mode: "workflow" };
 		}
-		const { agent: _agent, task: _task, ...workflowDefaults } = params;
+		const { agent: _agent, task: _task, output, ...workflowDefaults } = params;
 		const child = {
 			agent: params.agent.trim(),
 			...(params.task !== undefined ? { task: params.task } : {}),
+			output: output === undefined ? true : output,
 		};
 		return {
 			ok: true,
