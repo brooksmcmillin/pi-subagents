@@ -1,12 +1,16 @@
+import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
+
+const require = createRequire(import.meta.url);
+const ACORN_PATH = require.resolve("acorn");
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 const WORKER_SOURCE = String.raw`
-const { parentPort } = require("node:worker_threads");
+const { parentPort, workerData } = require("node:worker_threads");
 const vm = require("node:vm");
 const { inspect } = require("node:util");
-const { parse } = require("acorn");
+const { parse } = require(workerData.acornPath);
 
 let promiseHooks;
 try {
@@ -682,7 +686,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
 	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
 
-	const worker = new Worker(WORKER_SOURCE, { eval: true });
+	const worker = new Worker(WORKER_SOURCE, {
+		eval: true,
+		workerData: { acornPath: ACORN_PATH },
+		// The eval source is CommonJS. Do not inherit host flags such as
+		// --input-type=module, which would make `require` unavailable.
+		execArgv: [],
+	});
 	const emits: unknown[] = [];
 	const consoleEntries: WorkflowScriptResult["console"] = [];
 	const trace: WorkflowScriptTraceEntry[] = [];
