@@ -48,6 +48,16 @@ if (isRemove) {
 // Install
 console.log("Installing pi-subagents...\n");
 
+function installDependencies() {
+	console.log("Installing production dependencies...");
+	try {
+		execSync("npm ci --omit=dev", { cwd: EXTENSION_DIR, stdio: "inherit" });
+	} catch {
+		console.error("Failed to install production dependencies.");
+		process.exit(1);
+	}
+}
+
 // Ensure parent directory exists
 const parentDir = path.dirname(EXTENSION_DIR);
 if (!fs.existsSync(parentDir)) {
@@ -83,6 +93,8 @@ if (fs.existsSync(EXTENSION_DIR)) {
 		process.exit(1);
 	}
 }
+
+installDependencies();
 
 console.log(`
 The extension is now available in pi. Tools added:

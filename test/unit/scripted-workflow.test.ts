@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Worker } from "node:worker_threads";
 import { formatWorkflowJsonPreview, previewSimpleWorkflowRun, runWorkflowScript, WorkflowScriptError } from "../../src/workflows/scripted-workflow.ts";
@@ -18,6 +21,23 @@ describe("scripted workflow runtime", () => {
 
 		assert.equal(implicit.value, null);
 		assert.deepEqual(explicit.value, { answer: 42 });
+	});
+
+	it("resolves acorn from the extension when the host cwd has no dependencies", async () => {
+		const originalCwd = process.cwd();
+		const foreignCwd = mkdtempSync(join(tmpdir(), "pi-subagents-foreign-cwd-"));
+		process.chdir(foreignCwd);
+		try {
+			const result = await runWorkflowScript({
+				script: `return { answer: 42 };`,
+				async launch(key) { return { key, ok: true, output: "done", artifactPaths: [] }; },
+				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+			});
+			assert.deepEqual(result.value, { answer: 42 });
+		} finally {
+			process.chdir(originalCwd);
+			rmSync(foreignCwd, { recursive: true, force: true });
+		}
 	});
 
 	it("guides invalid JavaScript caused by Markdown fence backticks", async () => {
