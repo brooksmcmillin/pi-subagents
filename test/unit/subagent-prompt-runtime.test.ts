@@ -1145,6 +1145,48 @@ describe("subagent prompt runtime", () => {
 		assert.ok(rewritten.systemPrompt.includes("Current date: 2026-04-16"));
 	});
 
+	it("adds the structured-output contract even without inheritance overrides", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-structured-output-contract-"));
+		const schemaPath = path.join(dir, "schema.json");
+		fs.writeFileSync(schemaPath, JSON.stringify({ type: "object" }));
+		process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = path.join(dir, "output.json");
+		process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = schemaPath;
+		delete process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT;
+		delete process.env.PI_SUBAGENT_INHERIT_SKILLS;
+		delete process.env[SUBAGENT_FANOUT_CHILD_ENV];
+		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
+		registerSubagentPromptRuntime({
+			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
+				if (event === "before_agent_start") beforeAgentStart = handler;
+			},
+			getAllTools: () => [{ name: "structured_output" }],
+			registerTool() {},
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }>; registerTool(): void });
+
+		try {
+			const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
+			assert.ok(rewritten);
+			assert.ok(rewritten.systemPrompt.startsWith(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
+			assert.match(rewritten.systemPrompt, /strict structured output contract/);
+			assert.match(rewritten.systemPrompt, /final action must be to call the `structured_output` tool/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not inject the structured-output contract when its schema is absent", async () => {
+		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
+		process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = "/tmp/structured-output.json";
+		registerSubagentPromptRuntime({
+			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
+				if (event === "before_agent_start") beforeAgentStart = handler;
+			},
+			getAllTools: () => [],
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> });
+
+		assert.equal(await beforeAgentStart?.({ systemPrompt: BASE_PROMPT }), undefined);
+	});
+
 	it("uses the fanout boundary through before_agent_start when fanout env is set", async () => {
 		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
 		registerSubagentPromptRuntime({
