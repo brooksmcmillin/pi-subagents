@@ -580,7 +580,11 @@ export class WorkflowScriptError extends Error {
 	readonly partial: Omit<WorkflowScriptResult, "value">;
 	readonly errorKind?: "detached-child";
 
-	constructor(message: string, partial: Omit<WorkflowScriptResult, "value">, errorKind?: "detached-child") {
+	constructor(
+		message: string,
+		partial: Omit<WorkflowScriptResult, "value">,
+		errorKind?: "detached-child",
+	) {
 		super(message);
 		this.name = "WorkflowScriptError";
 		this.partial = partial;
@@ -614,47 +618,74 @@ function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
 	return prototype === null || prototype === Object.prototype;
 }
 
-function omitUndefinedWorkflowValues(value: unknown, seen = new Set<object>()): unknown {
+function omitUndefinedWorkflowValues(
+	value: unknown,
+	seen = new Set<object>(),
+): unknown {
 	if (value === null || typeof value !== "object") return value;
 	if (seen.has(value)) return value;
 	seen.add(value);
 	const normalized = Array.isArray(value)
-		? value.map((entry) => entry === undefined ? null : omitUndefinedWorkflowValues(entry, seen))
+		? value.map((entry) =>
+				entry === undefined ? null : omitUndefinedWorkflowValues(entry, seen),
+			)
 		: isPlainJsonObject(value)
-			? Object.fromEntries(Object.entries(value).flatMap(([key, entry]) => entry === undefined ? [] : [[key, omitUndefinedWorkflowValues(entry, seen)]]))
+			? Object.fromEntries(
+					Object.entries(value).flatMap(([key, entry]) =>
+						entry === undefined
+							? []
+							: [[key, omitUndefinedWorkflowValues(entry, seen)]],
+					),
+				)
 			: value;
 	seen.delete(value);
 	return normalized;
 }
 
-export function assertWorkflowJsonValue(value: unknown, path = "value", seen = new Set<object>()): void {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return;
+export function assertWorkflowJsonValue(
+	value: unknown,
+	path = "value",
+	seen = new Set<object>(),
+): void {
+	if (value === null || typeof value === "string" || typeof value === "boolean")
+		return;
 	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new Error(`${path} must contain only finite JSON numbers.`);
+		if (!Number.isFinite(value))
+			throw new Error(`${path} must contain only finite JSON numbers.`);
 		return;
 	}
-	if (typeof value !== "object") throw new Error(`${path} must be a JSON value; received ${typeof value}.`);
+	if (typeof value !== "object")
+		throw new Error(`${path} must be a JSON value; received ${typeof value}.`);
 	if (seen.has(value)) throw new Error(`${path} must not contain cycles.`);
 	seen.add(value);
 	if (Array.isArray(value)) {
 		for (let index = 0; index < value.length; index++) {
-			if (!Object.hasOwn(value, index)) throw new Error(`${path} must not contain sparse array entries.`);
+			if (!Object.hasOwn(value, index))
+				throw new Error(`${path} must not contain sparse array entries.`);
 			assertWorkflowJsonValue(value[index], `${path}[${index}]`, seen);
 		}
 	} else {
 		const prototype = Object.getPrototypeOf(value);
-		if (prototype !== null && prototype !== Object.prototype) throw new Error(`${path} must contain only plain JSON objects.`);
-		if (Object.getOwnPropertySymbols(value).length > 0) throw new Error(`${path} must not contain symbol keys.`);
-		for (const [key, entry] of Object.entries(value)) assertWorkflowJsonValue(entry, `${path}.${key}`, seen);
+		if (prototype !== null && prototype !== Object.prototype)
+			throw new Error(`${path} must contain only plain JSON objects.`);
+		if (Object.getOwnPropertySymbols(value).length > 0)
+			throw new Error(`${path} must not contain symbol keys.`);
+		for (const [key, entry] of Object.entries(value))
+			assertWorkflowJsonValue(entry, `${path}.${key}`, seen);
 	}
 	seen.delete(value);
 }
 
-export function formatWorkflowJsonPreview(value: unknown, maxLength: number): string | undefined {
+export function formatWorkflowJsonPreview(
+	value: unknown,
+	maxLength: number,
+): string | undefined {
 	try {
 		assertWorkflowJsonValue(value);
 		const serialized = JSON.stringify(value);
-		return typeof serialized === "string" ? serialized.slice(0, maxLength) : undefined;
+		return typeof serialized === "string"
+			? serialized.slice(0, maxLength)
+			: undefined;
 	} catch {
 		return undefined;
 	}
@@ -666,50 +697,86 @@ export interface SimpleWorkflowRunPreview {
 }
 
 /** Display-only preview for the exact simple `return runs.run(key, {...})` form. */
-export function previewSimpleWorkflowRun(script: string | undefined): SimpleWorkflowRunPreview | undefined {
-	const body = script?.match(/^\s*return\s+(?:await\s+)?runs\.run\s*\(\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`$\\]*`)\s*,\s*\{([\s\S]*)\}\s*\)\s*;?\s*$/)?.[1];
+export function previewSimpleWorkflowRun(
+	script: string | undefined,
+): SimpleWorkflowRunPreview | undefined {
+	const body = script?.match(
+		/^\s*return\s+(?:await\s+)?runs\.run\s*\(\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`$\\]*`)\s*,\s*\{([\s\S]*)\}\s*\)\s*;?\s*$/,
+	)?.[1];
 	if (body === undefined) return undefined;
 	const readProperty = (name: "agent" | "task"): string | undefined => {
-		const match = body.match(new RegExp(`(?:^|,)\\s*(?:${name}|["']${name}["'])\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\u0060[^\u0060$\\\\]*\u0060)`));
+		const match = body.match(
+			new RegExp(
+				`(?:^|,)\\s*(?:${name}|["']${name}["'])\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\u0060[^\u0060$\\\\]*\u0060)`,
+			),
+		);
 		if (!match?.[1]) return undefined;
 		const literal = match[1];
 		if (literal.startsWith('"')) {
-			try { return JSON.parse(literal) as string; } catch { return undefined; }
+			try {
+				return JSON.parse(literal) as string;
+			} catch {
+				return undefined;
+			}
 		}
 		if (literal.slice(1, -1).includes("\\")) return undefined;
 		return literal.slice(1, -1);
 	};
 	const agent = readProperty("agent");
 	const task = readProperty("task");
-	return { ...(agent !== undefined ? { agent } : {}), ...(task !== undefined ? { task } : {}) };
+	return {
+		...(agent === undefined ? {} : { agent }),
+		...(task === undefined ? {} : { task }),
+	};
 }
 
 function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-	if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+	if (isRecord(value))
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+			.join(",")}}`;
 	return JSON.stringify(value) ?? "undefined";
 }
 
 function validateKey(value: unknown, owner = "runs.run"): string {
 	if (typeof value !== "string" || !KEY_PATTERN.test(value)) {
-		throw new Error(`${owner} key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.`);
+		throw new Error(
+			`${owner} key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.`,
+		);
 	}
 	return value;
 }
 
-function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowScriptTraceEntry, "phase" | "label" | "agent"> {
+function workflowStringMetadata(
+	params: Record<string, unknown>,
+): Pick<WorkflowScriptTraceEntry, "phase" | "label" | "agent"> {
 	return {
-		...(typeof params.phase === "string" && params.phase.trim() ? { phase: params.phase.trim() } : {}),
-		...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
+		...(typeof params.phase === "string" && params.phase.trim()
+			? { phase: params.phase.trim() }
+			: {}),
+		...(typeof params.label === "string" && params.label.trim()
+			? { label: params.label.trim() }
+			: {}),
 		// Requested agent name, so a child is identifiable while it runs. Launch
 		// resolution overwrites this with the canonical name on the terminal entry.
-		...(typeof params.agent === "string" && params.agent.trim() ? { agent: params.agent.trim() } : {}),
+		...(typeof params.agent === "string" && params.agent.trim()
+			? { agent: params.agent.trim() }
+			: {}),
 	};
 }
 
-export async function runWorkflowScript(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
-	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
-	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
+export async function runWorkflowScript(
+	options: RunWorkflowScriptOptions,
+): Promise<WorkflowScriptResult> {
+	if (!options.script.trim())
+		throw new Error("workflowScript must not be empty.");
+	if (
+		options.timeoutMs !== undefined &&
+		(!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)
+	)
+		throw new Error("workflow script timeout must be a positive integer.");
 
 	let acornPath: string;
 	try {
@@ -717,7 +784,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	} catch (error) {
 		throw new Error("Workflow parser dependency 'acorn' is unavailable from pi-subagents. Reinstall pi-subagents dependencies before launching workflowScript.", { cause: error });
 	}
-	const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { acornPath } });
+	const worker = new Worker(WORKER_SOURCE, {
+		eval: true,
+		workerData: { acornPath },
+		// The eval source is CommonJS. Do not inherit host flags such as
+		// --input-type=module, which would make `require` unavailable.
+		execArgv: [],
+	});
 	const emits: unknown[] = [];
 	const consoleEntries: WorkflowScriptResult["console"] = [];
 	const trace: WorkflowScriptTraceEntry[] = [];
@@ -733,10 +806,15 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	let settled = false;
 	let finishing = false;
 
-	const partial = (): Omit<WorkflowScriptResult, "value"> => ({ emits, console: consoleEntries, trace, children: childOrder.flatMap((key) => {
-		const child = children.get(key);
-		return child ? [child] : [];
-	}) });
+	const partial = (): Omit<WorkflowScriptResult, "value"> => ({
+		emits,
+		console: consoleEntries,
+		trace,
+		children: childOrder.flatMap((key) => {
+			const child = children.get(key);
+			return child ? [child] : [];
+		}),
+	});
 	const traceChanged = () => options.onTrace?.([...trace]);
 
 	return await new Promise<WorkflowScriptResult>((resolve, reject) => {
@@ -766,15 +844,21 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		};
 		const onAbort = () => {
 			const signalReason = options.signal?.reason;
-			const error = signalReason instanceof Error
-				? signalReason
-				: typeof signalReason === "string"
-					? new Error(signalReason)
-					: new Error("Workflow script aborted.");
+			const error =
+				signalReason instanceof Error
+					? signalReason
+					: typeof signalReason === "string"
+						? new Error(signalReason)
+						: new Error("Workflow script aborted.");
 			for (const key of launches.keys()) {
 				if (children.has(key)) continue;
 				stoppedLaunches.add(key);
-				const started = trace.findLast((entry) => entry.operation === "run" && entry.key === key && entry.state === "started");
+				const started = trace.findLast(
+					(entry) =>
+						entry.operation === "run" &&
+						entry.key === key &&
+						entry.state === "started",
+				);
 				trace.push({
 					operation: "run",
 					key,
@@ -788,15 +872,31 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			traceChanged();
 			finish({ error });
 		};
-		const timer = options.timeoutMs === undefined
-			? undefined
-			: setTimeout(() => finish({ error: new Error(`Workflow script timed out after ${options.timeoutMs}ms.`) }), options.timeoutMs);
+		const timer =
+			options.timeoutMs === undefined
+				? undefined
+				: setTimeout(
+						() =>
+							finish({
+								error: new Error(
+									`Workflow script timed out after ${options.timeoutMs}ms.`,
+								),
+							}),
+						options.timeoutMs,
+					);
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		if (options.signal?.aborted) return onAbort();
 
-		worker.on("error", (error) => finish({ error: new Error(`Workflow worker failed: ${error instanceof Error ? error.message : String(error)}`) }));
+		worker.on("error", (error) =>
+			finish({
+				error: new Error(
+					`Workflow worker failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			}),
+		);
 		worker.on("exit", (code) => {
-			if (!settled && code !== 0) finish({ error: new Error(`Workflow worker exited with code ${code}.`) });
+			if (!settled && code !== 0)
+				finish({ error: new Error(`Workflow worker exited with code ${code}.`) });
 		});
 		worker.on("message", (message: Record<string, unknown>) => {
 			if (settled) return;
@@ -804,7 +904,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				try {
 					assertWorkflowJsonValue(message.value, "emit");
 				} catch (error) {
-					finish({ error: new Error(`Workflow emit could not be persisted: ${error instanceof Error ? error.message : String(error)}`) });
+					finish({
+						error: new Error(
+							`Workflow emit could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					});
 					return;
 				}
 				emits.push(message.value);
@@ -812,26 +916,46 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					options.onEmit?.([...emits]);
 				} catch (error) {
 					emits.pop();
-					finish({ error: new Error(`Workflow emit could not be persisted: ${error instanceof Error ? error.message : String(error)}`) });
+					finish({
+						error: new Error(
+							`Workflow emit could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					});
 				}
 				return;
 			}
 			if (message.type === "console") {
 				const level = message.level;
-				if ((level === "log" || level === "info" || level === "warn" || level === "error") && typeof message.text === "string") consoleEntries.push({ level, text: message.text });
+				if (
+					(level === "log" ||
+						level === "info" ||
+						level === "warn" ||
+						level === "error") &&
+					typeof message.text === "string"
+				)
+					consoleEntries.push({ level, text: message.text });
 				return;
 			}
 			if (message.type === "complete") {
 				try {
 					assertWorkflowJsonValue(message.value, "return");
 				} catch (error) {
-					return finish({ error: new Error(`Workflow return could not be persisted: ${error instanceof Error ? error.message : String(error)}`) });
+					return finish({
+						error: new Error(
+							`Workflow return could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					});
 				}
 				return finish({ value: message.value });
 			}
 			if (message.type === "error") {
-				const workflowError = new Error(typeof message.error === "string" ? message.error : "Workflow script failed.") as Error & { workflowErrorKind?: "detached-child" };
-				if (message.errorKind === "detached-child") workflowError.workflowErrorKind = "detached-child";
+				const workflowError = new Error(
+					typeof message.error === "string"
+						? message.error
+						: "Workflow script failed.",
+				) as Error & { workflowErrorKind?: "detached-child" };
+				if (message.errorKind === "detached-child")
+					workflowError.workflowErrorKind = "detached-child";
 				return finish({ error: workflowError });
 			}
 			if (message.type === "callObserved" && typeof message.callId === "number") {
@@ -847,42 +971,83 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				}
 				return;
 			}
-			if (message.type !== "call" || typeof message.callId !== "number" || typeof message.method !== "string" || !isRecord(message.args)) return;
+			if (
+				message.type !== "call" ||
+				typeof message.callId !== "number" ||
+				typeof message.method !== "string" ||
+				!isRecord(message.args)
+			)
+				return;
 
 			const respond = (promise: Promise<unknown>) => {
 				void promise.then(
 					(value) => {
-						if (!settled) worker.postMessage({ type: "response", callId: message.callId, ok: true, value: omitUndefinedWorkflowValues(value) });
+						if (!settled)
+							worker.postMessage({
+								type: "response",
+								callId: message.callId,
+								ok: true,
+								value: omitUndefinedWorkflowValues(value),
+							});
 					},
 					(error: unknown) => {
-						if (!settled) worker.postMessage({ type: "response", callId: message.callId, ok: false, error: error instanceof Error ? error.message : String(error), ...(error instanceof Error && (error as { workflowErrorKind?: unknown }).workflowErrorKind === "detached-child" ? { errorKind: "detached-child" } : {}) });
+						if (!settled)
+							worker.postMessage({
+								type: "response",
+								callId: message.callId,
+								ok: false,
+								error: error instanceof Error ? error.message : String(error),
+								...(error instanceof Error &&
+								(error as { workflowErrorKind?: unknown }).workflowErrorKind ===
+									"detached-child"
+									? { errorKind: "detached-child" }
+									: {}),
+							});
 					},
 				);
 			};
 			if (message.method === "state.get" || message.method === "state.set") {
-				if (!options.state) return respond(Promise.reject(new Error("Workflow state is unavailable without a mission.")));
+				if (!options.state)
+					return respond(
+						Promise.reject(
+							new Error("Workflow state is unavailable without a mission."),
+						),
+					);
 				let key: string;
 				try {
 					key = validateKey(message.args.key, "state");
 				} catch (error) {
 					return respond(Promise.reject(error));
 				}
-				if (message.method === "state.get") return respond(Promise.resolve().then(() => options.state!.get(key)));
+				if (message.method === "state.get")
+					return respond(Promise.resolve().then(() => options.state!.get(key)));
 				const value = message.args.value;
 				try {
 					assertWorkflowJsonValue(value, `state.set('${key}') value`);
 				} catch (error) {
 					return respond(Promise.reject(error));
 				}
-				return respond(Promise.resolve().then(() => options.state!.set(key, value)));
+				return respond(
+					Promise.resolve().then(() => options.state!.set(key, value)),
+				);
 			}
 
 			if (message.method === "status") {
 				const keyOrRunId = message.args.keyOrRunId;
-				if (typeof keyOrRunId !== "string" || !keyOrRunId.trim()) return respond(Promise.reject(new Error("runs.status(keyOrRunId) requires a non-empty string.")));
+				if (typeof keyOrRunId !== "string" || !keyOrRunId.trim())
+					return respond(
+						Promise.reject(
+							new Error("runs.status(keyOrRunId) requires a non-empty string."),
+						),
+					);
 				const known = children.get(keyOrRunId);
 				const target = known?.runId ?? keyOrRunId;
-				trace.push({ operation: "status", key: keyOrRunId, state: "started", ...(known?.runId ? { runId: known.runId } : {}) });
+				trace.push({
+					operation: "status",
+					key: keyOrRunId,
+					state: "started",
+					...(known?.runId ? { runId: known.runId } : {}),
+				});
 				traceChanged();
 				if (settled || finishing) return;
 				respond(options.status(target, childController.signal).then((result) => {
@@ -934,64 +1099,171 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return respond(Promise.reject(error));
 			}
 			const params = message.args.params;
-			if (!isRecord(params)) return respond(Promise.reject(new Error(`runs.run('${key}', params) requires a params object.`)));
-			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
-			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
-			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') accepts one child via { agent, task }; use runs.all(...) and JavaScript control flow for orchestration.`)));
+			if (!isRecord(params))
+				return respond(
+					Promise.reject(
+						new Error(`runs.run('${key}', params) requires a params object.`),
+					),
+				);
+			if (params.action !== undefined)
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') accepts execution params only; management action is not allowed.`,
+						),
+					),
+				);
+			if (params.workflowScript !== undefined)
+				return respond(
+					Promise.reject(
+						new Error(`runs.run('${key}') cannot start a nested workflow script.`),
+					),
+				);
+			if (
+				params.tasks !== undefined ||
+				params.chain !== undefined ||
+				params.parallel !== undefined ||
+				params.concurrency !== undefined ||
+				params.chainDir !== undefined
+			) {
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') accepts one child via { agent, task }; use runs.all(...) and JavaScript control flow for orchestration.`,
+						),
+					),
+				);
 			}
 			if (params.worktree !== undefined && typeof params.worktree !== "boolean") {
-				return respond(Promise.reject(new Error(`runs.run('${key}') worktree must be true or false.`)));
+				return respond(
+					Promise.reject(
+						new Error(`runs.run('${key}') worktree must be true or false.`),
+					),
+				);
 			}
-			if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') gate must be a non-empty command string.`)));
+			if (
+				params.gate !== undefined &&
+				(typeof params.gate !== "string" || !params.gate.trim())
+			) {
+				return respond(
+					Promise.reject(
+						new Error(`runs.run('${key}') gate must be a non-empty command string.`),
+					),
+				);
 			}
 			if (params.gate !== undefined && params.acceptance !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.`)));
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.`,
+						),
+					),
+				);
 			}
 			if (params.gate !== undefined && params.resume !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') gate is not supported with retained resume.`)));
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') gate is not supported with retained resume.`,
+						),
+					),
+				);
 			}
-			if (params.resume !== undefined && (typeof params.resume !== "string" || !params.resume.trim())) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') resume must be a non-empty retained run id.`)));
+			if (
+				params.resume !== undefined &&
+				(typeof params.resume !== "string" || !params.resume.trim())
+			) {
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') resume must be a non-empty retained run id.`,
+						),
+					),
+				);
 			}
 			if (params.resume !== undefined && params.agent !== undefined) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') resume and agent are mutually exclusive.`)));
+				return respond(
+					Promise.reject(
+						new Error(`runs.run('${key}') resume and agent are mutually exclusive.`),
+					),
+				);
 			}
-			if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') resume requires a non-empty task follow-up.`)));
+			if (
+				params.resume !== undefined &&
+				(typeof params.task !== "string" || !params.task.trim())
+			) {
+				return respond(
+					Promise.reject(
+						new Error(
+							`runs.run('${key}') resume requires a non-empty task follow-up.`,
+						),
+					),
+				);
 			}
 			const collectFailure = message.args.collectFailure === true;
 			const callObserved = observedRunCalls.delete(message.callId);
-			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
-				? promise
-				: promise.then((result) => {
-					if (!result.ok) {
-						const childError = new Error(result.detached ? `Run '${key}' detached: ${result.error ?? result.output}` : `Run '${key}' failed: ${result.error ?? result.output}`) as Error & { workflowErrorKind?: "detached-child" };
-						if (result.detached) childError.workflowErrorKind = "detached-child";
-						throw childError;
-					}
-					return result;
-				});
+			const deliver = (promise: Promise<WorkflowScriptChildResult>) =>
+				collectFailure
+					? promise
+					: promise.then((result) => {
+							if (!result.ok) {
+								const childError = new Error(
+									result.detached
+										? `Run '${key}' detached: ${result.error ?? result.output}`
+										: `Run '${key}' failed: ${result.error ?? result.output}`,
+								) as Error & { workflowErrorKind?: "detached-child" };
+								if (result.detached) childError.workflowErrorKind = "detached-child";
+								throw childError;
+							}
+							return result;
+						});
 			const fingerprint = stableJson(params);
 			const existing = launches.get(key);
 			if (existing) {
-				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
+				if (existing.fingerprint !== fingerprint)
+					return respond(
+						Promise.reject(
+							new Error(
+								`Duplicate workflow key '${key}' used with incompatible launch params.`,
+							),
+						),
+					);
 				if (callObserved) existing.observed = true;
-				trace.push({ operation: "run", key, state: "reused", ...workflowStringMetadata(params) });
+				trace.push({
+					operation: "run",
+					key,
+					state: "reused",
+					...workflowStringMetadata(params),
+				});
 				traceChanged();
 				return respond(deliver(existing.promise));
 			}
 
 			const startedAt = Date.now();
-			const batch = isRecord(message.args.batch) && typeof message.args.batch.id === "string" && Array.isArray(message.args.batch.calls)
-				? { id: message.args.batch.id, calls: message.args.batch.calls.filter((call): call is { key: string; params: Record<string, unknown> } => isRecord(call) && typeof call.key === "string" && isRecord(call.params)) }
-				: undefined;
+			const batch =
+				isRecord(message.args.batch) &&
+				typeof message.args.batch.id === "string" &&
+				Array.isArray(message.args.batch.calls)
+					? {
+							id: message.args.batch.id,
+							calls: message.args.batch.calls.filter(
+								(call): call is { key: string; params: Record<string, unknown> } =>
+									isRecord(call) &&
+									typeof call.key === "string" &&
+									isRecord(call.params),
+							),
+						}
+					: undefined;
 			let admission = batch ? batchAdmissions.get(batch.id) : undefined;
 			if (!admission) {
 				const seenKeys = new Set<string>();
 				const calls = (batch?.calls ?? [{ key, params }]).filter((call) => {
-					if (seenKeys.has(call.key) || launches.has(call.key) || call.params.resume !== undefined) return false;
+					if (
+						seenKeys.has(call.key) ||
+						launches.has(call.key) ||
+						call.params.resume !== undefined
+					)
+						return false;
 					seenKeys.add(call.key);
 					return true;
 				});
@@ -1027,11 +1299,20 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			});
 			launches.set(key, { fingerprint, promise, observed: callObserved });
 			childOrder.push(key);
-			trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(params) });
+			trace.push({
+				operation: "run",
+				key,
+				state: "started",
+				...workflowStringMetadata(params),
+			});
 			traceChanged();
 			respond(deliver(promise));
 		});
 
-		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined });
+		worker.postMessage({
+			type: "start",
+			script: options.script,
+			stateEnabled: options.state !== undefined,
+		});
 	});
 }
