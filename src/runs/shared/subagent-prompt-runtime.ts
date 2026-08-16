@@ -659,8 +659,9 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		const inheritProjectContext = readBooleanEnv(SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV);
 		const inheritSkills = readBooleanEnv(SUBAGENT_INHERIT_SKILLS_ENV);
 		const fanoutChild = readBooleanEnv(SUBAGENT_FANOUT_CHILD_ENV);
+		const structuredOutput = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] && process.env[STRUCTURED_OUTPUT_SCHEMA_ENV]);
 		let rewritten = event.systemPrompt;
-		if (inheritProjectContext !== undefined || inheritSkills !== undefined || fanoutChild !== undefined) {
+		if (inheritProjectContext !== undefined || inheritSkills !== undefined || fanoutChild !== undefined || structuredOutput) {
 			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
 				inheritProjectContext: inheritProjectContext ?? true,
 				inheritSkills: inheritSkills ?? true,
