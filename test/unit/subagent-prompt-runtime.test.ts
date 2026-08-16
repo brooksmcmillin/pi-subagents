@@ -15,6 +15,7 @@ import {
 	SUBAGENT_STEER_CAPABILITY_ENV,
 	SUBAGENT_STEER_INBOX_ENV,
 	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
+	buildPiArgs,
 } from "../../src/runs/shared/pi-args.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "../../src/runs/shared/structured-output.ts";
@@ -666,6 +667,82 @@ describe("subagent prompt runtime", () => {
 			const result = await execute("tool-1", { value: { ok: true } });
 			assert.equal(result.terminate, true);
 			assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf-8")), { ok: true });
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("activates structured_output for an explicit child tool allowlist with outputSchema", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-allowlist-"));
+		try {
+			const schemaPath = path.join(dir, "schema.json");
+			fs.writeFileSync(schemaPath, JSON.stringify({ type: "object" }), "utf-8");
+			const { args, env } = buildPiArgs({
+				baseArgs: ["-p"],
+				task: "Return structured data.",
+				sessionEnabled: false,
+				inheritProjectContext: false,
+				inheritSkills: false,
+				tools: ["read"],
+				structuredOutput: {
+					schema: { type: "object" },
+					schemaPath,
+					outputPath: path.join(dir, "output.json"),
+				},
+			});
+			assert.equal(args[args.indexOf("--tools") + 1], "read,structured_output");
+			process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = env[STRUCTURED_OUTPUT_SCHEMA_ENV];
+			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = env[STRUCTURED_OUTPUT_CAPTURE_ENV];
+			process.env[REQUIRED_CHILD_TOOLS_ENV] = env[REQUIRED_CHILD_TOOLS_ENV];
+			const registered = ["read"];
+			let active = ["read"];
+			const handlers = new Map<string, Array<() => unknown>>();
+
+			registerSubagentPromptRuntime({
+				on(event: string, handler: () => unknown) {
+				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+				},
+				registerTool(tool: { name: string }) {
+					registered.push(tool.name);
+				},
+				getAllTools: () => registered.map((name) => ({ name })),
+				getActiveTools: () => active,
+				setActiveTools: (names: string[]) => {
+					active = names.filter((name) => registered.includes(name));
+				},
+			} as { on(event: string, handler: () => unknown): void; registerTool(tool: { name: string }): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
+
+			const sessionStart = handlers.get("session_start")?.at(-1);
+			assert.ok(sessionStart, "structured output runtime should verify activation at session start");
+			sessionStart();
+			assert.deepEqual(active, ["read", "structured_output"]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails clearly when structured_output cannot be activated", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-inactive-"));
+		try {
+			const schemaPath = path.join(dir, "schema.json");
+			fs.writeFileSync(schemaPath, JSON.stringify({ type: "object" }), "utf-8");
+			process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = schemaPath;
+			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = path.join(dir, "output.json");
+			const handlers = new Map<string, Array<() => unknown>>();
+
+			registerSubagentPromptRuntime({
+				on(event: string, handler: () => unknown) {
+					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+				},
+				registerTool() {},
+				getAllTools: () => [{ name: "structured_output" }],
+				getActiveTools: () => ["read"],
+				setActiveTools() {},
+			} as { on(event: string, handler: () => unknown): void; registerTool(): void; getAllTools(): Array<{ name: string }>; getActiveTools(): string[]; setActiveTools(names: string[]): void });
+
+			const sessionStart = handlers.get("session_start")?.at(-1);
+			assert.ok(sessionStart);
+			assert.throws(sessionStart, /structured_output.*could not be activated/i);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
