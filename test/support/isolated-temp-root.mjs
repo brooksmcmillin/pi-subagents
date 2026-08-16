@@ -14,5 +14,11 @@ if (!process.env.PI_SUBAGENTS_TEMP_ROOT) {
 	process.env.HOME = path.join(tempRoot, "home");
 	process.env.USERPROFILE = process.env.HOME;
 	delete process.env.PI_CODING_AGENT_DIR;
-	process.on("exit", () => fs.rmSync(tempRoot, { recursive: true, force: true }));
+	process.on("exit", () => {
+		try {
+			fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+		} catch {
+			// Windows can retain child-process file handles until after exit.
+		}
+	});
 }
