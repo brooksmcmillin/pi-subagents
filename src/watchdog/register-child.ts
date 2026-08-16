@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { MainWatchdogRuntime } from "./runtime.ts";
-import { createMainWatchdogReview } from "./review.ts";
+import { MainWatchdogRuntime, type WatchdogReviewFunction } from "./runtime.ts";
 import { DEFAULT_WATCHDOG_CONFIG } from "./settings.ts";
 import { createWatchdogWarningMessage } from "./warning-format.ts";
 import {
@@ -72,9 +71,19 @@ export function registerChildWatchdog(pi: ExtensionAPI, rawConfig = process.env[
 		});
 	};
 	const resolved = childResolvedConfig(childConfig);
+	let review: WatchdogReviewFunction | undefined;
+	const lazyReview: WatchdogReviewFunction = async (request) => {
+		// pi-agent-core is optional. Resolve the watchdog's model-review runtime only
+		// after an enabled watchdog actually has work to review.
+		if (!review) {
+			const { createMainWatchdogReview } = await import("./review.ts");
+			review = createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel() });
+		}
+		return review(request);
+	};
 	const runtime = new MainWatchdogRuntime({
 		resolveConfig: () => ({ ok: true, config: resolved, errors: [], sources: [{ scope: "session", exists: true }] }),
-		review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel() }),
+		review: lazyReview,
 		reviewDescription: "child model review",
 		reviewChangesOnly: true,
 		displayWarning: (details) => {

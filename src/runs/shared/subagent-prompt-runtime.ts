@@ -21,7 +21,7 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
 import { registerChildWatchdog } from "../../watchdog/register-child.ts";
 import { CHILD_WATCHDOG_CONFIG_ENV } from "../../watchdog/child-status.ts";
-import { requestWatchdogPermission, type WatchdogPermissionRequest, type WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
+import type { WatchdogPermissionRequest, WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { resolveWaitToolConfig } from "../background/wait-config.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
@@ -281,6 +281,23 @@ export function formatSteerMessage(request: SteerRequest): string {
 		"",
 		"Incorporate this guidance at the next safe point. Do not restart the task unless the guidance explicitly asks you to.",
 	].join("\n");
+}
+
+async function requestWatchdogPermission(request: WatchdogPermissionRequest): Promise<WatchdogPermissionResult> {
+	// pi-agent-core is an optional peer used only by the watchdog arbiter. Keep it
+	// out of the normal child-runtime load path so unrelated tools (notably
+	// structured_output) remain available when watchdog support is not installed.
+	try {
+		const { requestWatchdogPermission: arbitrate } = await import("../../watchdog/permission-arbiter.ts");
+		return await arbitrate(request);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return {
+			approved: false,
+			reason: `Watchdog permission arbiter failed closed: ${reason}`,
+			source: "watchdog",
+		};
+	}
 }
 
 export function registerPermissionGate(
