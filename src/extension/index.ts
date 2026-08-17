@@ -9,7 +9,7 @@
  * Toggle: async parameter (default: true; set asyncByDefault:false in config.json to opt out)
  *
  * Config file: ~/.pi/agent/extensions/subagent/config.json
- *   { "asyncByDefault": true, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
+ *   { "asyncByDefault": true, "defaultSubagentContext": "fork", "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
  */
 
 import { randomUUID } from "node:crypto";
@@ -32,6 +32,7 @@ import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foregro
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { getActiveAsyncCapacitySnapshot, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
 import { cleanupResultIndexes } from "../runs/background/result-files.ts";
+import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createScheduledRunManager } from "../runs/background/scheduled-runs.ts";
 import { registerSlashCommands } from "../slash/slash-commands.ts";
@@ -53,7 +54,7 @@ import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
-import { buildSubagentToolDescription } from "./tool-description.ts";
+import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
 import { collectGoalContinuationNotices } from "../missions/goal-driver.ts";
 import { restoreForegroundRunHistory } from "../runs/foreground/foreground-history.ts";
 import { resolveMissionStoreLocation } from "../missions/store.ts";
@@ -471,9 +472,29 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			deliverIntercomResults: config.intercomBridge?.resultDelivery === true,
 		},
 	);
+	const asyncRetentionAbort = new AbortController();
+	const asyncRetentionTimer = setTimeout(async () => {
+		try {
+			await cleanupAsyncRetention({
+				asyncDirRoot: DIRS.async,
+				resultsDir: DIRS.results,
+				signal: asyncRetentionAbort.signal,
+				protectedRunIds: new Set([
+					...state.asyncJobs.keys(),
+					...(state.workflowControllers?.keys() ?? []),
+					...scheduledRunManager.referencedAsyncRunIds(),
+				]),
+			});
+		} catch (error) {
+			console.error("Failed to clean retained async subagent state:", error);
+		}
+	}, ASYNC_RETENTION_DELAY_MS);
+	asyncRetentionTimer.unref?.();
 
 	const runtimeCleanup = () => {
 		clearTimeout(resultIndexCleanupTimer);
+		clearTimeout(asyncRetentionTimer);
+		asyncRetentionAbort.abort();
 		stopResultWatcher();
 		state.currentSessionId = null;
 		completionNotifier.dispose();
@@ -597,6 +618,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "subagent",
 		label: "Subagent",
 		description: buildSubagentToolDescription(config),
+		...buildSubagentToolPromptMetadata(config),
 		parameters,
 
 		execute(id, params, signal, onUpdate, ctx) {
@@ -880,6 +902,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		state.widgetsSuspended = false;
 		clearTimeout(resultIndexCleanupTimer);
+		clearTimeout(asyncRetentionTimer);
+		asyncRetentionAbort.abort();
 		stopResultWatcher();
 		state.currentSessionId = null;
 		state.parentSessionFile = null;

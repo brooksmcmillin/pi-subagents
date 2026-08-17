@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverAgents, discoverAgentsAll, resolveAgentName, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
+import { discoverAgents, discoverAgentsAll, findBlockingAgentDiagnostic, resolveAgentName, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
@@ -17,7 +17,8 @@ import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
 import type { ResolvedTurnBudget } from "../shared/types.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
-import { canPreferForkFromSnapshot } from "../shared/fork-context.ts";
+import { canPreferForkFromSnapshot, resolveSubagentLaunchContext } from "../shared/fork-context.ts";
+import { loadConfig } from "../extension/config.ts";
 import { agentDefinitionDigest, AGENT_DEFINITION_PROJECTION_VERSION, launchBindingDigest } from "../shared/launch-contract.ts";
 import { DIRS, TEMP_ROOT_DIR } from "../shared/types.ts";
 import { processTerminalCandidatePath, processTerminalPath } from "../runs/background/process-terminal.ts";
@@ -194,12 +195,15 @@ function normalizeAvailableModels(models: SubagentLaunchContractInput["available
 }
 
 function resolveLaunchContractContext(input: SubagentLaunchContractInput, agent: AgentConfig): "fresh" | "fork" {
-	if (input.context !== undefined) return input.context;
-	if (agent.defaultContext !== "fork") return agent.defaultContext ?? "fresh";
-	return canPreferForkFromSnapshot({
-		parentSessionFile: input.parentSessionFile,
-		leafId: input.parentLeafId,
-	}) ? "fork" : "fresh";
+	return resolveSubagentLaunchContext({
+		explicitContext: input.context,
+		agentDefaultContext: agent.defaultContext,
+		defaultSubagentContext: loadConfig().defaultSubagentContext,
+		canUseImplicitFork: canPreferForkFromSnapshot({
+			parentSessionFile: input.parentSessionFile,
+			leafId: input.parentLeafId,
+		}),
+	});
 }
 
 function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string): SubagentLaunchContractAgentCandidate[] {
@@ -237,6 +241,14 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const discovered = discoverAgents(effectiveCwd, scope);
 	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
+	const ambiguousCandidates = resolvedAgent.error
+		? discovered.agents.filter((agent) => resolveAgentName(input.agent, [agent]).agent)
+		: resolvedAgent.agent;
+	const invalidAgent = findBlockingAgentDiagnostic(input.agent, ambiguousCandidates, discovered.agentDiagnostics);
+	if (invalidAgent) {
+		const message = `Agent '${input.agent}' has invalid configuration: ${invalidAgent.error}`;
+		return { ok: false, code: "missing_agent", message, diagnostics: [{ code: "missing_agent", severity: "error", message }] };
+	}
 	if (resolvedAgent.error) {
 		return { ok: false, code: "ambiguous_agent", message: resolvedAgent.error, diagnostics };
 	}
@@ -273,7 +285,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	if (resolvedSkills.missing.length > 0) diagnostics.push({ code: "missing_skill", severity: "error", message: `Missing skills: ${resolvedSkills.missing.join(", ")}` });
 
-	const externalRunner = agent.runner?.type === "external-cli";
+	const externalRunner = agent.runner?.type === "external-cli" || agent.runner?.type === "external-job";
 	const availableModels = normalizeAvailableModels(input.availableModels);
 	const preferredProvider = input.preferredProvider ?? input.parentModel?.provider;
 	const primaryModel = externalRunner

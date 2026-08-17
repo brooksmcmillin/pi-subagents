@@ -507,6 +507,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));
+			const liveWorkflowControls = status.mode === "workflow" && deps.state?.currentSessionId === status.sessionId && deps.state?.workflowControllers?.has(status.runId)
+				? [...(deps.state?.foregroundControls.values() ?? [])].filter((control) => control.parentWorkflowRunId === status.runId
+					&& control.sessionId === status.sessionId
+					&& Boolean(control.workflowSteeringDir && fs.existsSync(control.workflowSteeringDir))
+					&& (control.activeChildren?.size ?? 0) > 0)
+				: [];
 			for (const [index, step] of (status.steps ?? []).entries()) {
 				const stepActivityText = step.status === "running" ? formatActivityLabel(step.lastActivityAt, step.activityState) : undefined;
 				const modelThinking = formatModelThinking(step.model, step.thinking);
@@ -523,27 +529,41 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					lines.push(`  Runner: external-cli (${step.runner.command}${step.runner.args.length ? ` ${step.runner.args.join(" ")}` : ""})`);
 					if (step.externalProcess?.pid !== undefined) lines.push(`  Process: ${step.externalProcess.pid}`);
 					if (step.externalProcess) lines.push(`  Stdout: ${step.externalProcess.stdoutPath}`, `  Stderr: ${step.externalProcess.stderrPath}`);
+				} else if (step.runner?.type === "external-job") {
+					lines.push(`  Runner: external-job (${step.runner.provider})`);
+					if (step.externalJob?.providerJobId) lines.push(`  Provider job: ${step.externalJob.providerJobId}`);
+					if (step.externalJob?.state) lines.push(`  Provider state: ${step.externalJob.state}`);
+					if (step.externalJob?.conversationUrl) lines.push(`  Conversation: ${step.externalJob.conversationUrl}`);
+					if (step.externalJob?.resultArtifactPath) lines.push(`  Result artifact: ${step.externalJob.resultArtifactPath}`);
 				}
 				lines.push(...formatNestedRunStatusLines(step.children, { indent: "  ", commandHints: true, maxLines: 20 }));
 				const stepOutputPath = path.join(asyncDir, `output-${index}.log`);
 				if (stepOutputPath !== outputPath && fs.existsSync(stepOutputPath)) lines.push(`  Output: ${stepOutputPath}`);
-				if (step.status === "running" && step.runner?.type !== "external-cli") {
+				if (step.status === "running" && step.runner?.type !== "external-cli" && step.runner?.type !== "external-job" && status.mode !== "workflow") {
 					lines.push(`  Intercom target: ${resolveSubagentIntercomTarget(status.runId, step.agent, index)} (if registered)`);
 					lines.push(`  Steer: subagent({ action: "steer", id: "${status.runId}", index: ${index}, message: "..." })`);
-				} else if (step.status === "running" && step.runner?.type === "external-cli") {
-					lines.push("  Steer: unavailable; one-shot external CLI runners do not accept live messages.");
+				} else if (step.status === "running" && (step.runner?.type === "external-cli" || step.runner?.type === "external-job")) {
+					lines.push("  Steer: unavailable; external runners do not accept live messages.");
 				}
 			}
 			const attached = new Set((status.steps ?? []).flatMap((step) => step.children?.map((child) => child.id) ?? []));
 			const unattached = nestedChildren.filter((child) => !attached.has(child.id));
 			lines.push(...formatNestedRunStatusLines(unattached, { indent: "", commandHints: true, maxLines: 20 }));
+			if (status.mode === "workflow" && status.state === "running") {
+				if (liveWorkflowControls.length === 0) lines.push("Steer: unavailable; no live foreground route is registered in the active session.");
+				else for (const control of liveWorkflowControls) {
+					for (const index of [...control.activeChildren!.keys()].sort((left, right) => left - right)) {
+						lines.push(`Steer live foreground child: subagent({ action: "steer", id: "${control.runId}", index: ${index}, message: "..." })`);
+					}
+				}
+			}
 			if (nestedWarning) lines.push(`Warning: ${nestedWarning}`);
 			if (status.sessionFile) lines.push(`Session: ${status.sessionFile}`);
-			const allExternal = (status.steps?.length ?? 0) > 0 && status.steps!.every((step) => step.runner?.type === "external-cli");
-			if (status.state === "running" && !allExternal) lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
+			const allExternal = (status.steps?.length ?? 0) > 0 && status.steps!.every((step) => step.runner?.type === "external-cli" || step.runner?.type === "external-job");
+			if (status.state === "running" && !allExternal && status.mode !== "workflow") lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
 			if (status.state !== "running") {
 				lines.push(allExternal
-					? "Resume: unavailable; one-shot external CLI runners do not persist sessions."
+					? "Resume: unavailable; external runners do not persist Pi sessions."
 					: formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);

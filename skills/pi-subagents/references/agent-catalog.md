@@ -31,6 +31,7 @@ Prefer the tool when you are writing agent logic. Prefer the slash commands when
 you are guiding a human through an interactive flow.
 
 Packaged prompt shortcuts are also available for repeatable workflows. Treat them as reusable orchestration recipes, not just human slash commands. When the user asks for one of these shapes, or when the workflow clearly fits, apply the same pattern directly with `subagent(...)` and other tools (see `references/orchestration-recipes.md` for the full recipes):
+
 - `/parallel-review` — fresh-context reviewers with distinct review angles, then synthesis
 - `/review-loop` — parent-orchestrated worker, fresh-reviewer, and fix-worker cycles until clean or capped
 - `/parallel-research` — combine `researcher` and `scout` for external evidence plus local code context
@@ -43,7 +44,7 @@ Builtin agents load at the lowest priority. Project agents override user agents,
 and user/project agents override builtins with the same name.
 
 | Agent | Purpose | Model | Typical output / role |
-|-------|---------|-------|------------------------|
+| ------- | --------- | ------- | ------------------------ |
 | `scout` | Fast codebase recon | inherits default | Writes `context.md` handoff material |
 | `worker` | Implementation and approved oracle handoffs | inherits default | Single-writer implementation with decision escalation |
 | `reviewer` | Review specialist | inherits default | Default recipes are review-only; tools include edit/write when a fix pass is explicit |
@@ -83,6 +84,7 @@ For model fleets, use the profile commands instead of hand-editing repeated over
 Builtin role agents inherit the current Pi default model unless you override them. When launching them, write the task prompt as a compact contract, not a long procedural script. Define the destination and let the role choose the efficient path.
 
 A strong subagent prompt usually includes:
+
 - **Goal**: the concrete outcome the child should produce.
 - **Target**: repository, explicit `cwd`, branch/ref/head, and source seam when the target is not the parent cwd.
 - **Authority boundary**: whether the child may read, edit, commit, push, comment, close, merge, publish, or release. Omit or forbid actions that are not approved.
@@ -98,6 +100,7 @@ Avoid carrying over old prompt habits that over-specify every step. Use `must`, 
 For implementation handoffs, name the approved scope and success criteria more clearly than the process. Good prompts say what to change, what not to change, where the evidence lives, how to validate, and when to escalate. They should not ask the child to create another subagent plan or continue the parent conversation.
 
 Settings locations:
+
 - User scope: `~/.pi/agent/settings.json`
 - Project scope: `.pi/settings.json`
 
@@ -144,4 +147,4 @@ override can opt one builtin back in. Existing custom-agent frontmatter remains 
 
 Set `subagents.defaultExtensions` to give agents without an `extensions` field a shared child extension allowlist. Omit it to preserve ambient extension discovery, set it to `[]` to disable ambient extensions by default, or use `agentOverrides.<name>.extensions` for one agent. Explicit custom-agent frontmatter still wins.
 
-Tool description modes live in `~/.pi/agent/extensions/subagent/config.json`, not `subagents` settings. Set `toolDescriptionMode` to `compact` to reduce tool-description prompt cost while keeping the execution, async/`subagent_wait`, child-safety, one-writer, management/action, and artifact/status guardrails. Set it to `custom` to read `subagent-tool-description.md` from the project config dir or agent dir; invalid custom files fall back to full mode and the safety guidance is still appended.
+Tool description modes live in `~/.pi/agent/extensions/subagent/config.json`, not `subagents` settings. The default uses split prompt metadata: a short tool description plus active `promptSnippet` and `promptGuidelines`. Set `toolDescriptionMode` to `full` or `compact` to force one description string, or `custom` to read `subagent-tool-description.md` from the project config dir or agent dir; invalid custom files fall back to full mode and the safety guidance is still appended.

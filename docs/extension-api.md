@@ -132,6 +132,7 @@ Boundaries:
 - Raw prompts are not exposed in public contract output.
 - It is side-effect-free for launch state: it does not create child sessions, temp prompt files, structured-output runtimes, tool-diagnostic files, or run artifacts.
 - Some host-owned facts, such as exact fork snapshots, nested async roots, and live model registries, can only be proven by the Pi host; those appear as `host_required` diagnostics instead of silently pretending to be exact.
+- Preflight reads the extension config, so `defaultSubagentContext: "fresh"` or `"fork"` affects omitted context in the same way as execution. Explicit `context` still wins.
 
 ## Structured delegation API
 
@@ -261,6 +262,26 @@ Semantics:
 - Registration is reload-safe: a new provider with the same name replaces the old callback, and the old disposer cannot remove the replacement. Call the disposer during extension shutdown when possible.
 
 Child processes do not gain provider tools or extensions automatically. Add `subagent_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting is serialized through foreground, async, resume, chain, parallel, and fanout launch paths; `PI_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence.
+
+## External job provider bridge
+
+Extensions that own long-running advisor jobs can register a process-local provider for `runner.type: external-job` agents:
+
+```ts
+import { registerExternalJobProvider } from "pi-subagents/external-job-provider";
+
+const dispose = registerExternalJobProvider({
+  name: "surf-oracle",
+  start: ({ prompt, promptDigest, cwd, runId, stepIndex, agent, options }) => startSurfJob({ prompt, promptDigest, cwd, runId, stepIndex, agent, options }),
+  status: (providerJobId) => getSurfJobStatus(providerJobId),
+  result: (providerJobId) => getSurfJobResult(providerJobId),
+  reattach: (providerJobId) => reattachSurfJob(providerJobId),
+});
+```
+
+The provider returns handles with `providerJobId`, `state`, optional `handleUrl`/`conversationUrl`, optional `failureCode`/`failureMessage`, and optional `blockingJobId` for capacity conflicts. `result` can also return `output` and/or `artifactPath`.
+
+The async runner process does not import provider internals. It writes operation requests into its async run directory. The parent Pi process services those requests against the registered provider and writes operation responses. If the provider is not registered, the bridge fails closed with an actionable error. If a run is recovered after provider job metadata exists, the runner calls `reattach` and `result`; it does not call `start` again.
 
 ## Herdr integration
 

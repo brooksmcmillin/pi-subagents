@@ -70,6 +70,48 @@ subagent({ workflowScript: `
 ` });
 ```
 
+### Steering a workflow child
+
+Use `await runs.steer(key, message, options?)` after `runs.run` or `runs.all` has launched that stable key. Scripts do not target raw run ids. The optional fields are `mode: "steer" | "follow_up" | "auto"`, a non-negative child `index`, and a positive `ackTimeoutMs`.
+
+```js
+subagent({ workflowScript: `
+  const writer = runs.run("writer", { agent: "worker", task: "Implement the change" });
+  const evidence = await runs.run("evidence", { agent: "scout", task: "Find the exact contract" });
+  const receipt = await runs.steer("writer", "Also check: " + evidence.output, { mode: "follow_up" });
+  return { writer: await writer, receipt };
+` });
+```
+
+The receipt state is `queued`, `delivered`, `missed`, or `failed`. `delivered` means the child Pi session accepted the input. It does not mean the model followed it. `missed` means the keyed child became terminal or had no live route before delivery. This first slice uses the existing foreground and async steering transports but does not start steering recovery. Workflow traces include one steering attempt entry and one receipt entry.
+
+Always await or return a `runs.steer` promise. The workflow waits for an observed steering side effect to settle before it exits and rejects fire-and-forget calls. Use ordinary `Promise.race` when the first child or steering receipt should advance the script. There is no callback API or child inbox access.
+
+### Rolling child runs
+
+`runs.run` starts a keyed child when you call it. You do not need separate `runs.start`, `runs.next`, or `runs.collect` helpers for rolling councils or staged reviews. Keep the launched promises, use `Promise.race` to wait for the next completed child, steer a still-running sibling by its stable key, and use `Promise.all` to collect the remaining children.
+
+```js
+subagent({ workflowScript: `
+  let pending = [
+    { key: "analysis-a", promise: runs.run("analysis-a", { agent: "reviewer", task: "Analyze option A" }).then((result) => ({ key: "analysis-a", result })) },
+    { key: "analysis-b", promise: runs.run("analysis-b", { agent: "reviewer", task: "Analyze option B" }).then((result) => ({ key: "analysis-b", result })) },
+    { key: "critic", promise: runs.run("critic", { agent: "reviewer", task: "Find the strongest objection" }).then((result) => ({ key: "critic", result })) }
+  ];
+
+  const first = await Promise.race(pending.map((child) => child.promise));
+  pending = pending.filter((child) => child.key !== first.key);
+
+  const target = pending.find((child) => child.key === "critic") ?? pending[0];
+  const receipt = await runs.steer(target.key, "Challenge this early result:\n" + first.result.output, { mode: "auto" });
+  const rest = await Promise.all(pending.map((child) => child.promise));
+
+  return { first: first.result.output, rest: rest.map((child) => child.result.output), receipt };
+` });
+```
+
+The workflow trace records the run completions and steering receipt. Scripts still never see raw async directories, inbox paths, or session files. If the keyed child is terminal, stale, or has no live route when `runs.steer` runs, the receipt reports `missed` or `failed` and the script can decide whether to continue.
+
 Use named outputs when later workflow steps need structured data or durable references:
 
 ```js
@@ -186,7 +228,7 @@ Review $@. Return concrete findings with source proof, or state that no issue wa
 /prompt-workflow review-release-candidate v0.51.0
 ```
 
-For watched same-repo workflows, pass `async:false` to show the live in-chat workflow card. `chatProgress` can force `off` or `live-card` when the automatic policy is not what you want. Foreground workflows default to a 30-minute timeout; async workflows have no default timeout. See the [tool reference](tool-reference.md) for the full parameter list.
+For watched same-repo workflows, pass `async:false` only when the parent must block until completion. That blocking mode also shows the live in-chat workflow card. `chatProgress` can force `off` or `live-card` when the automatic policy is not what you want. Blocking workflows default to a 30-minute timeout; async workflows have no default timeout. See the [tool reference](tool-reference.md) for the full parameter list.
 
 The legacy `/chain`, `/parallel`, and `/run-chain` commands are not registered.
 

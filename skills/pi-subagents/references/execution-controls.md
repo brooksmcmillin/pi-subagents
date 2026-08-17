@@ -26,6 +26,14 @@ An agent may set `runner.type: external-cli` with a non-empty `command`, optiona
 
 External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support foreground/clarify, steer/resume/interrupt-as-pause, Pi models/tools/extensions/skills, tool or turn budgets, structured output, nested subagents, fallbacks, or sessions.
 
+### External job profiles
+
+An agent may set `runner.type: external-job` with a non-empty `provider` and optional JSON `options`. The bundled `gpt-pro` agent uses provider `surf-oracle`. The provider must be registered in the host Pi process through `pi-subagents/external-job-provider`; the async runner talks to that parent-owned registry through a local operation bridge.
+
+External job profiles are async-only. The provider owns the remote job and Pi owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
+
+External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool or turn budgets, structured output, native child permissions, fallbacks, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
+
 ### Single agent
 
 ```typescript
@@ -76,9 +84,9 @@ Completed workflow children from this parent session stay addressable as retaine
 
 ### Async/background
 
-Prefer async mode for every subagent launch. Set `async: true` no matter the task unless foreground behavior is the actual requirement. This applies to scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, final review gates, backlog gates, and scripted workflows. Keep the write path single-threaded even when the run is async.
+Prefer async mode for every subagent launch. Set `async: true` no matter the task unless the parent must block until completion. This applies to scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, final review gates, backlog gates, and scripted workflows. Keep the write path single-threaded even when the run is async.
 
-Use `async:false` only for foreground-specific needs: the user explicitly asked to watch that child live in chat; you are testing foreground rendering, live cards, detach, or foreground-only control behavior; or the feature under inspection exists only in the foreground runner. Do not use `async:false` because a task is short, because it is the last gate, because no other work is ready, because the user asked to finish the overall job, or because blocking is convenient.
+Use `async:false` only when the parent must block until completion. Async mode still shows progress. Do not use `async:false` because a task is short, because it is the last gate, because no other work is ready, because the user asked to finish the overall job, or because blocking is convenient.
 
 Async does not mean parallel writes. Do not edit the same active worktree while an async worker is changing it. Parent-side overlap should be reading, validation prep, synthesis, command planning, or review of unaffected context unless the writer is isolated in a separate worktree.
 

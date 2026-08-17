@@ -29,8 +29,8 @@ const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
 const HEALTHY_SCAN_INTERVAL_MS = 60_000;
 const RETRY_DELAY_MS = 100;
-const MAX_INCOMPLETE_RESULT_RETRIES = 3;
 const SLOW_RESULT_SCAN_MS = 500;
+const MAX_INCOMPLETE_RESULT_RETRIES = 3;
 
 type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "realpathSync" | "statSync" | "watch">;
 
@@ -146,10 +146,6 @@ function shouldPoll(error: unknown): boolean {
 	return code === "EMFILE" || code === "ENOSPC";
 }
 
-function isIncompleteJson(error: unknown): boolean {
-	return error instanceof SyntaxError;
-}
-
 function hasDeliveredNotification(data: ResultFileData): boolean {
 	return typeof data.notificationDeliveredAt === "number" && Number.isFinite(data.notificationDeliveredAt);
 }
@@ -158,6 +154,10 @@ function markDeliveredNotification(resultPath: string, data: ResultFileData, run
 	const marked = { ...data, runId, notificationDeliveredAt: now };
 	writeAsyncResultFile(resultPath, marked);
 	return marked;
+}
+
+function isIncompleteJson(error: unknown): boolean {
+	return error instanceof SyntaxError;
 }
 
 /**

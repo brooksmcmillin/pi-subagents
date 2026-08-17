@@ -1,10 +1,8 @@
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 
-const require = createRequire(import.meta.url);
-const ACORN_PATH = require.resolve("acorn");
-
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const requireFromPackage = createRequire(import.meta.url);
 
 const WORKER_SOURCE = String.raw`
 const { parentPort, workerData } = require("node:worker_threads");
@@ -37,7 +35,7 @@ const trackedPromiseTrackers = new WeakMap();
 const trackedPromiseTargets = new WeakMap();
 let nativePromiseTrackers = new WeakMap();
 let nativePromiseParents = new WeakMap();
-const observedRunCallIds = new Set();
+const observedCallIds = new Set();
 
 function stableRunJson(value) {
   if (Array.isArray(value)) return "[" + value.map(stableRunJson).join(",") + "]";
@@ -96,7 +94,7 @@ function mergeObservations(...groups) {
   const merged = [];
   for (const group of groups) {
     for (const observation of group) {
-      if (!observation || typeof observation.callId !== "number" || typeof observation.key !== "string" || seen.has(observation.callId)) continue;
+      if (!observation || typeof observation.callId !== "number" || typeof observation.key !== "string" || typeof observation.operation !== "string" || seen.has(observation.callId)) continue;
       seen.add(observation.callId);
       merged.push(observation);
     }
@@ -116,9 +114,9 @@ function addTrackedObservations(tracker, observations) {
   tracker.observations = mergeObservations(tracker.observations, observations);
   if (!tracker.consumed) return;
   for (const observation of tracker.observations) {
-    if (observedRunCallIds.has(observation.callId)) continue;
-    observedRunCallIds.add(observation.callId);
-    parentPort.postMessage({ type: "runObserved", callId: observation.callId, key: observation.key });
+    if (observedCallIds.has(observation.callId)) continue;
+    observedCallIds.add(observation.callId);
+    parentPort.postMessage({ type: "callObserved", callId: observation.callId, key: observation.key, operation: observation.operation });
   }
 }
 
@@ -228,8 +226,8 @@ function hostCall(method, args, observation) {
     pending.set(callId, { resolve, reject });
     parentPort.postMessage({ type: "call", callId, method, args });
   });
-  return observation && typeof observation.key === "string"
-    ? trackRunObservation([{ key: observation.key, callId }], promise)
+  return observation && typeof observation.key === "string" && typeof observation.operation === "string"
+    ? trackRunObservation([{ key: observation.key, operation: observation.operation, callId }], promise)
     : promise;
 }
 
@@ -276,7 +274,7 @@ function validateRunCall(key, params, label, fingerprints) {
 const runs = Object.freeze({
   run(key, params) {
     validateRunCall(key, params, "runs.run", runFingerprints);
-    return hostCall("run", { key, params }, { key });
+    return hostCall("run", { key, params }, { key, operation: "run" });
   },
   all(items) {
     if (!Array.isArray(items)) throw new Error("runs.all(items) requires an array.");
@@ -293,7 +291,18 @@ const runs = Object.freeze({
     for (const { key, params } of calls) runFingerprints.set(key, stableRunJson(params));
     const batch = { id: "batch-" + (++nextCallId), calls };
     const launched = calls.map(({ key, params }) => runHostCall(key, params, true, batch));
-    return trackRunObservation(launched.map(({ key, callId }) => ({ key, callId })), Promise.all(launched.map(({ promise }) => promise)));
+    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), Promise.all(launched.map(({ promise }) => promise)));
+  },
+  steer(key, message, options = {}) {
+    if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("runs.steer has an invalid key.");
+    if (typeof message !== "string" || !message.trim()) throw new Error("runs.steer message must be a non-empty string.");
+    if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("runs.steer options must be an object.");
+    const allowed = new Set(["mode", "index", "ackTimeoutMs"]);
+    for (const option of Object.keys(options)) if (!allowed.has(option)) throw new Error("runs.steer options contain unsupported field '" + option + "'.");
+    if (options.mode !== undefined && options.mode !== "steer" && options.mode !== "follow_up" && options.mode !== "auto") throw new Error("runs.steer mode must be 'steer', 'follow_up', or 'auto'.");
+    if (options.index !== undefined && (!Number.isInteger(options.index) || options.index < 0 || options.index > 1000000)) throw new Error("runs.steer index must be an integer between 0 and 1000000.");
+    if (options.ackTimeoutMs !== undefined && (!Number.isInteger(options.ackTimeoutMs) || options.ackTimeoutMs < 1)) throw new Error("runs.steer ackTimeoutMs must be a positive integer.");
+    return hostCall("steer", { key, message: message.trim(), options }, { key, operation: "steer" });
   },
   status(keyOrRunId) { return hostCall("status", { keyOrRunId }); },
   ref: formatRef,
@@ -532,15 +541,30 @@ export interface WorkflowScriptChildResult {
 }
 
 export interface WorkflowScriptTraceEntry {
-	operation: "run" | "status";
+	operation: "run" | "status" | "steer";
 	key: string;
-	state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused";
+	state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused" | "queued" | "delivered" | "missed";
 	/** Canonical child agent name when resolved launch or result data is available. */
 	agent?: string;
 	runId?: string;
 	durationMs?: number;
 	phase?: string;
 	label?: string;
+	error?: string;
+}
+
+export interface WorkflowSteerOptions {
+	mode?: "steer" | "follow_up" | "auto";
+	index?: number;
+	ackTimeoutMs?: number;
+}
+
+export interface WorkflowSteerResult {
+	key: string;
+	state: "queued" | "delivered" | "missed" | "failed";
+	requestId?: string;
+	deliveryStatus?: "queued" | "delivered";
+	targets?: Array<{ index: number; state: string; reason?: string }>;
 	error?: string;
 }
 
@@ -572,19 +596,10 @@ export interface RunWorkflowScriptOptions {
 	script: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-	admit?: (
-		calls: Array<{ key: string; params: Record<string, unknown> }>,
-	) => void | Promise<void>;
-	launch: (
-		key: string,
-		params: Record<string, unknown>,
-		signal: AbortSignal,
-		admission: { admitted: boolean },
-	) => Promise<WorkflowScriptChildResult>;
-	status: (
-		keyOrRunId: string,
-		signal: AbortSignal,
-	) => Promise<WorkflowScriptChildResult>;
+	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
+	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean }) => Promise<WorkflowScriptChildResult>;
+	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
+	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
 	state?: {
 		get: (key: string) => unknown | Promise<unknown>;
 		set: (key: string, value: unknown) => void | Promise<void>;
@@ -763,9 +778,15 @@ export async function runWorkflowScript(
 	)
 		throw new Error("workflow script timeout must be a positive integer.");
 
+	let acornPath: string;
+	try {
+		acornPath = requireFromPackage.resolve("acorn");
+	} catch (error) {
+		throw new Error("Workflow parser dependency 'acorn' is unavailable from pi-subagents. Reinstall pi-subagents dependencies before launching workflowScript.", { cause: error });
+	}
 	const worker = new Worker(WORKER_SOURCE, {
 		eval: true,
-		workerData: { acornPath: ACORN_PATH },
+		workerData: { acornPath },
 		// The eval source is CommonJS. Do not inherit host flags such as
 		// --input-type=module, which would make `require` unavailable.
 		execArgv: [],
@@ -775,19 +796,15 @@ export async function runWorkflowScript(
 	const trace: WorkflowScriptTraceEntry[] = [];
 	const children = new Map<string, WorkflowScriptChildResult>();
 	const childOrder: string[] = [];
-	const launches = new Map<
-		string,
-		{
-			fingerprint: string;
-			promise: Promise<WorkflowScriptChildResult>;
-			observed: boolean;
-		}
-	>();
+	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean }>();
+	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const stoppedLaunches = new Set<string>();
 	const batchAdmissions = new Map<string, Promise<void>>();
 	const observedRunCalls = new Set<number>();
+	const observedSteerCalls = new Set<number>();
 	const childController = new AbortController();
 	let settled = false;
+	let finishing = false;
 
 	const partial = (): Omit<WorkflowScriptResult, "value"> => ({
 		emits,
@@ -801,46 +818,29 @@ export async function runWorkflowScript(
 	const traceChanged = () => options.onTrace?.([...trace]);
 
 	return await new Promise<WorkflowScriptResult>((resolve, reject) => {
-		const finish = (
-			outcome:
-				| { value: unknown }
-				| { error: Error & { workflowErrorKind?: unknown } },
-		) => {
-			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			options.signal?.removeEventListener("abort", onAbort);
-			void worker.terminate();
-			const unobservedKeys =
-				"value" in outcome
-					? [...launches]
-							.filter(([, launch]) => !launch.observed)
-							.map(([key]) => key)
-					: [];
-			const completionError =
-				unobservedKeys.length > 0
-					? new Error(
-							`workflowScript completed with unawaited runs.run launch(es): ${unobservedKeys.map((key) => `'${key}'`).join(", ")}. Await or return each launch.`,
-						)
-					: undefined;
-			childController.abort(
-				"error" in outcome
-					? outcome.error
-					: (completionError ?? new Error("Workflow script completed.")),
-			);
-			if ("error" in outcome)
-				reject(
-					new WorkflowScriptError(
-						outcome.error.message,
-						partial(),
-						outcome.error.workflowErrorKind === "detached-child"
-							? "detached-child"
-							: undefined,
-					),
-				);
-			else if (completionError)
-				reject(new WorkflowScriptError(completionError.message, partial()));
-			else resolve({ value: outcome.value, ...partial() });
+		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
+			if (settled || finishing) return;
+			finishing = true;
+			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
+			void Promise.allSettled([...steers.values()].map(({ promise }) => promise)).then(() => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				options.signal?.removeEventListener("abort", onAbort);
+				void worker.terminate();
+				const unobservedKeys = "value" in outcome ? [...launches].filter(([, launch]) => !launch.observed).map(([key]) => key) : [];
+				const completionError = unobservedKeys.length > 0
+					? new Error(`workflowScript completed with unawaited runs.run launch(es): ${unobservedKeys.map((key) => `'${key}'`).join(", ")}. Await or return each launch.`)
+					: "value" in outcome
+						? (() => {
+							const unobservedSteers = [...steers.values()].filter((steer) => !steer.observed).map((steer) => steer.key);
+							return unobservedSteers.length > 0 ? new Error(`workflowScript completed with unawaited runs.steer call(s): ${unobservedSteers.map((key) => `'${key}'`).join(", ")}. Await or return each call.`) : undefined;
+						})()
+						: undefined;
+				if ("error" in outcome) reject(new WorkflowScriptError(outcome.error.message, partial(), outcome.error.workflowErrorKind === "detached-child" ? "detached-child" : undefined));
+				else if (completionError) reject(new WorkflowScriptError(completionError.message, partial()));
+				else resolve({ value: outcome.value, ...partial() });
+			});
 		};
 		const onAbort = () => {
 			const signalReason = options.signal?.reason;
@@ -958,11 +958,17 @@ export async function runWorkflowScript(
 					workflowError.workflowErrorKind = "detached-child";
 				return finish({ error: workflowError });
 			}
-			if (message.type === "runObserved" && typeof message.callId === "number") {
+			if (message.type === "callObserved" && typeof message.callId === "number") {
 				const key = typeof message.key === "string" ? message.key : undefined;
-				const launch = key ? launches.get(key) : undefined;
-				if (launch) launch.observed = true;
-				else observedRunCalls.add(message.callId);
+				if (message.operation === "run") {
+					const launch = key ? launches.get(key) : undefined;
+					if (launch) launch.observed = true;
+					else observedRunCalls.add(message.callId);
+				} else if (message.operation === "steer") {
+					const steer = steers.get(message.callId);
+					if (steer) steer.observed = true;
+					else observedSteerCalls.add(message.callId);
+				}
 				return;
 			}
 			if (
@@ -1043,29 +1049,48 @@ export async function runWorkflowScript(
 					...(known?.runId ? { runId: known.runId } : {}),
 				});
 				traceChanged();
-				if (settled) return;
-				respond(
-					options.status(target, childController.signal).then((result) => {
-						if (settled) return result;
-						trace.push({
-							operation: "status",
-							key: keyOrRunId,
-							state: result.ok ? "completed" : "failed",
-							...(result.runId ? { runId: result.runId } : {}),
-							...(result.ok ? {} : { error: result.output }),
-						});
-						traceChanged();
-						if (!result.ok)
-							throw new Error(`Status '${keyOrRunId}' failed: ${result.output}`);
-						return result;
-					}),
-				);
+				if (settled || finishing) return;
+				respond(options.status(target, childController.signal).then((result) => {
+					if (settled || finishing) return result;
+					trace.push({ operation: "status", key: keyOrRunId, state: result.ok ? "completed" : "failed", ...(result.runId ? { runId: result.runId } : {}), ...(result.ok ? {} : { error: result.output }) });
+					traceChanged();
+					if (!result.ok) throw new Error(`Status '${keyOrRunId}' failed: ${result.output}`);
+					return result;
+				}));
 				return;
 			}
-			if (message.method !== "run")
-				return respond(
-					Promise.reject(new Error(`Unknown runs API method '${message.method}'.`)),
-				);
+			if (message.method === "steer") {
+				let key: string;
+				try {
+					key = validateKey(message.args.key, "runs.steer");
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				const steerMessage = message.args.message;
+				if (typeof steerMessage !== "string" || !steerMessage.trim()) return respond(Promise.reject(new Error(`runs.steer('${key}') requires a non-empty message.`)));
+				const steerOptions = isRecord(message.args.options) ? message.args.options as WorkflowSteerOptions : {};
+				const startedAt = Date.now();
+				trace.push({ operation: "steer", key, state: "started" });
+				traceChanged();
+				const promise = Promise.resolve().then(() => {
+					if (!launches.has(key)) throw new Error(`runs.steer('${key}') requires a prior runs.run/runs.all launch with that key.`);
+					if (!options.steer) throw new Error("Workflow steering is unavailable in this host.");
+					return options.steer(key, steerMessage.trim(), steerOptions, childController.signal);
+				}).then((receipt) => {
+					trace.push({ operation: "steer", key, state: receipt.state, durationMs: Date.now() - startedAt, ...(receipt.error ? { error: receipt.error } : {}) });
+					traceChanged();
+					return receipt;
+				}, (error: unknown) => {
+					const text = error instanceof Error ? error.message : String(error);
+					trace.push({ operation: "steer", key, state: "failed", durationMs: Date.now() - startedAt, error: text });
+					traceChanged();
+					throw error;
+				});
+				steers.set(message.callId, { key, promise, observed: observedSteerCalls.delete(message.callId) });
+				respond(promise);
+				return;
+			}
+			if (message.method !== "run") return respond(Promise.reject(new Error(`Unknown runs API method '${message.method}'.`)));
 
 			let key: string;
 			try {
@@ -1243,81 +1268,35 @@ export async function runWorkflowScript(
 					return true;
 				});
 				admission = Promise.resolve().then(() => {
-					if (settled) return;
+					if (settled || finishing) return;
 					return options.admit?.(calls);
 				});
 				if (batch) batchAdmissions.set(batch.id, admission);
 			}
-			const promise = admission
-				.then(() => {
-					if (settled || stoppedLaunches.has(key)) {
-						const reason = childController.signal.reason;
-						const text =
-							reason instanceof Error
-								? reason.message
-								: typeof reason === "string"
-									? reason
-									: "Workflow script aborted.";
-						return { key, ok: false, output: text, error: text, artifactPaths: [] };
-					}
-					return options.launch(
-						key,
-						{ ...params, async: params.async ?? false },
-						childController.signal,
-						{ admitted: true },
-					);
-				})
-				.then(
-					(result) => {
-						const normalized =
-							!result.ok && !result.error
-								? { ...result, error: result.output }
-								: result;
-						if (stoppedLaunches.has(key)) return normalized;
-						children.set(key, normalized);
-						const state = normalized.ok
-							? "completed"
-							: normalized.detached
-								? "detached"
-								: "failed";
-						trace.push({
-							operation: "run",
-							key,
-							state,
-							durationMs: Date.now() - startedAt,
-							...workflowStringMetadata(params),
-							...(normalized.agent ? { agent: normalized.agent } : {}),
-							...(normalized.runId ? { runId: normalized.runId } : {}),
-							...(normalized.ok
-								? {}
-								: { error: normalized.error ?? normalized.output }),
-						});
-						traceChanged();
-						return normalized;
-					},
-					(error: unknown) => {
-						const text = error instanceof Error ? error.message : String(error);
-						const failure: WorkflowScriptChildResult = {
-							key,
-							ok: false,
-							output: text,
-							error: text,
-							artifactPaths: [],
-						};
-						if (stoppedLaunches.has(key)) return failure;
-						children.set(key, failure);
-						trace.push({
-							operation: "run",
-							key,
-							state: "failed",
-							durationMs: Date.now() - startedAt,
-							...workflowStringMetadata(params),
-							error: text,
-						});
-						traceChanged();
-						return failure;
-					},
-				);
+			const promise = admission.then(() => {
+				if (settled || finishing || stoppedLaunches.has(key)) {
+					const reason = childController.signal.reason;
+					const text = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.";
+					return { key, ok: false, output: text, error: text, artifactPaths: [] };
+				}
+				return options.launch(key, { ...params, async: params.async ?? false }, childController.signal, { admitted: true });
+			}).then((result) => {
+				const normalized = !result.ok && !result.error ? { ...result, error: result.output } : result;
+				if (stoppedLaunches.has(key)) return normalized;
+				children.set(key, normalized);
+				const state = normalized.ok ? "completed" : normalized.detached ? "detached" : "failed";
+				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(normalized.ok ? {} : { error: normalized.error ?? normalized.output }) });
+				traceChanged();
+				return normalized;
+			}, (error: unknown) => {
+				const text = error instanceof Error ? error.message : String(error);
+				const failure: WorkflowScriptChildResult = { key, ok: false, output: text, error: text, artifactPaths: [] };
+				if (stoppedLaunches.has(key)) return failure;
+				children.set(key, failure);
+				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), error: text });
+				traceChanged();
+				return failure;
+			});
 			launches.set(key, { fingerprint, promise, observed: callObserved });
 			childOrder.push(key);
 			trace.push({

@@ -59,6 +59,8 @@ import {
 import { createNestedRoute, nestedRouteEnv, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
 import { resolveMissionStoreLocation } from "../../src/missions/store.ts";
 import { missionStatePath } from "../../src/missions/workflow-state.ts";
+import { discardPreservedWorktrees } from "../../src/runs/shared/parallel-handoff.ts";
+import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -532,6 +534,33 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			assert.match(result.content[0]?.text ?? "", /does not accept internal run fan-out fields/);
 		}
 		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("runs isolation none outside Git and keeps worktree isolation strict", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		assert.equal(fs.existsSync(path.join(tempDir, ".git")), false);
+		mockPi.onCall({ output: "shared cwd" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const script = `return runs.run("main", { agent: "echo", task: "work" })`;
+
+		const shared = await executor.executePublic(
+			"isolation-none",
+			{ async: false, isolation: "none", workflowScript: script },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(shared.isError, undefined, shared.content[0]?.text ?? "shared workflow failed");
+
+		const isolated = await executor.executePublic(
+			"isolation-worktree",
+			{ async: false, isolation: "worktree", workflowScript: script },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(isolated.isError, true);
+		assert.match(isolated.content[0]?.text ?? "", /worktree isolation requires a git repository/i);
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("allows schedule.create to carry the required workflowScript target", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1050,9 +1079,14 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(typeof childStatus.parallelHandoff?.path, "string");
 		assert.equal(childStatus.parallelHandoff?.changedPatches, 1);
 		assert.equal(fs.existsSync(path.join(tempDir, "feature.txt")), false);
-		const handoff = JSON.parse(fs.readFileSync(childStatus.parallelHandoff!.path!, "utf-8")) as { groups?: Array<{ children?: Array<{ patch?: { changed?: boolean; filesChanged?: number } }> }> };
+		const handoff = JSON.parse(fs.readFileSync(childStatus.parallelHandoff!.path!, "utf-8")) as { groups?: Array<{ children?: Array<{ patch?: { changed?: boolean; filesChanged?: number } }>; cleanup?: { state?: string; tasks?: Array<{ path?: string; preserved?: boolean; worktreeRemoved?: boolean; reason?: string }> } }> };
 		assert.equal(handoff.groups?.[0]?.children?.[0]?.patch?.changed, true);
 		assert.equal(handoff.groups?.[0]?.children?.[0]?.patch?.filesChanged, 1);
+		assert.equal(handoff.groups?.[0]?.cleanup?.state, "partial");
+		assert.equal(handoff.groups?.[0]?.cleanup?.tasks?.[0]?.preserved, true);
+		assert.equal(handoff.groups?.[0]?.cleanup?.tasks?.[0]?.worktreeRemoved, false);
+		assert.equal(handoff.groups?.[0]?.cleanup?.tasks?.[0]?.reason, "retained child resume requires managed worktree cwd");
+		assert.equal(fs.existsSync(handoff.groups?.[0]?.cleanup?.tasks?.[0]?.path ?? ""), true);
 		const childResultPath = path.join(DIRS.results, `${childRunId}.json`);
 		for (let attempt = 0; attempt < 200 && !fs.existsSync(childResultPath); attempt++) {
 			await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1061,6 +1095,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(childResult.parentWorkflowRunId, workflowRunId);
 		assert.equal(childResult.workflowKey, "background");
 		assert.equal(fs.existsSync(workflowStepSessionFile), true);
+		const retainedCwd = handoff.groups?.[0]?.cleanup?.tasks?.[0]?.path;
+		assert.ok(retainedCwd);
+		const resumeTarget = resolveAsyncResumeTarget({ id: childRunId }, { asyncDirRoot: DIRS.async, resultsDir: DIRS.results });
+		assert.equal(resumeTarget.recoveryDescriptor?.sourceRunId, childRunId);
+		assert.equal(path.resolve(resumeTarget.cwd ?? ""), path.resolve(retainedCwd));
+		discardPreservedWorktrees(childStatus.parallelHandoff!.path!, { kind: "confirmed" });
 		fs.rmSync(started.details.asyncDir!, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 		fs.rmSync(workflowResultPath, { force: true });
 		fs.rmSync(childDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
@@ -2756,7 +2796,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			const claims = fs.readdirSync(path.join(descriptor.directory, "claims"));
 			assert.equal(claims.length, 1);
 			const claim = JSON.parse(fs.readFileSync(path.join(descriptor.directory, "claims", claims[0]!), "utf-8")) as { path: string };
-			assert.match(claim.path, /^tasks\[0\]\/[a-f0-9]{8}\/single$/);
+			assert.match(claim.path, /^tasks\[0\]\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/single$/);
 		} finally {
 			if (previous === undefined) delete process.env[RUN_FANOUT_BUDGET_ENV];
 			else process.env[RUN_FANOUT_BUDGET_ENV] = previous;

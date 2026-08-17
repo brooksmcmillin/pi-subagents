@@ -214,6 +214,10 @@ export interface ControlEvent {
 	currentPath?: string;
 	elapsedMs?: number;
 	recentFailureSummary?: string;
+	workflowKey?: string;
+	phase?: string;
+	label?: string;
+	taskPreview?: string;
 }
 
 export type SubagentResultStatus = "completed" | "failed" | "paused" | "stopped" | "detached";
@@ -1076,9 +1080,9 @@ export interface Details {
 	workflow?: {
 		value?: unknown;
 		trace: Array<{
-			operation: "run" | "status";
+			operation: "run" | "status" | "steer";
 			key: string;
-			state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused";
+			state: "started" | "completed" | "failed" | "detached" | "stopped" | "reused" | "queued" | "delivered" | "missed";
 			agent?: string;
 			runId?: string;
 			phase?: string;
@@ -1286,6 +1290,11 @@ export type AgentRunnerConfig =
 		command: string;
 		args?: string[];
 		promptDelivery?: "stdin";
+	}
+	| {
+		type: "external-job";
+		provider: string;
+		options?: Record<string, unknown>;
 	};
 
 export interface ExternalCliRunnerStatus {
@@ -1300,6 +1309,35 @@ export interface ExternalCliRunnerStatus {
 		structuredOutput: false;
 		toolEvents: false;
 	};
+}
+
+export interface ExternalJobRunnerStatus {
+	type: "external-job";
+	provider: string;
+	options: Record<string, unknown>;
+	capabilities: {
+		stop: false;
+		steer: false;
+		resume: false;
+		structuredOutput: false;
+		toolEvents: false;
+	};
+}
+
+export interface ExternalJobStatus {
+	provider: string;
+	providerJobId?: string;
+	promptDigest: string;
+	options: Record<string, unknown>;
+	handleUrl?: string;
+	conversationUrl?: string;
+	resultArtifactPath?: string;
+	state: "queued" | "running" | "completed" | "failed" | "stopped" | "blocked";
+	failureCode?: string;
+	failureMessage?: string;
+	blockingJobId?: string;
+	startedAt?: number;
+	updatedAt?: number;
 }
 
 export interface ExternalProcessStatus {
@@ -1367,8 +1405,9 @@ export interface AsyncStatus {
 	workflowKey?: string;
 	steps?: Array<{
 		agent: string;
-		runner?: ExternalCliRunnerStatus;
+		runner?: ExternalCliRunnerStatus | ExternalJobRunnerStatus;
 		externalProcess?: ExternalProcessStatus;
+		externalJob?: ExternalJobStatus;
 		/** Resolved launch context for this child step. */
 		context?: "fresh" | "fork";
 		/** Short caller-facing task/goal shown in fleet surfaces when available. */
@@ -1901,6 +1940,8 @@ export interface MainWindowRendererConfig {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	/** Set the context for launches that omit an explicit context. */
+	defaultSubagentContext?: "fresh" | "fork";
 	/** Optional shortcut that detaches the active foreground single-subagent run. */
 	foregroundDetachShortcut?: string;
 	/** Show the Claude Code-style navigable fleet. Defaults to true. */
@@ -1911,7 +1952,7 @@ export interface ExtensionConfig {
 	fleetKeybindings?: FleetKeybindingsConfig;
 	/** Show the under-editor async runs widget. Defaults to true, including when FleetView is enabled. */
 	asyncWidget?: boolean;
-	/** Tool description variant registered for the parent-facing subagent tool. Defaults to full. */
+	/** Tool description variant registered for the parent-facing subagent tool. Defaults to split metadata. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	/** Inline chat rendering for the subagent tool. Defaults to rich. */
 	inlineToolDisplay?: InlineToolDisplay;

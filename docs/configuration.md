@@ -24,7 +24,7 @@ By default, project settings resolve from the nearest parent directory that cont
 { "toolDescriptionMode": "compact" }
 ```
 
-Controls the parent-facing `subagent` tool description registered at startup. `full` is the default. `compact` keeps the execution modes, async/`subagent_wait` guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
+Controls the parent-facing `subagent` tool description registered at startup. The default registers split prompt metadata: a short tool description plus `promptSnippet` and `promptGuidelines`. Set `"full"` to register the complete description as one tool description, or `"compact"` to keep the execution modes, async/`subagent_wait` guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
 
 `custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.pi/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart Pi after changing the mode or custom file.
 
@@ -85,7 +85,7 @@ Pi binds `Ctrl+B` to editor cursor-left by default. The extension shortcut takes
 }
 ```
 
-Opt in to a best-effort Orca observer that creates one Orca terminal tab for each subagent child and mirrors its live tool, assistant, stdout, and stderr progress. Tab titles use a persistent worktree-local sequence (`subagent · <agent> · 1`, `... · 2`, and so on), so separate workflows and concurrent children do not reuse the same number. This does **not** replace Pi as the child runner: native Pi children keep the same process, lifecycle, status, control, artifact, and result paths. External CLI profiles also keep their existing runner and can mirror their stdout/stderr.
+Opt in to a best-effort Orca observer that creates one Orca terminal tab for each subagent child and mirrors its live tool, assistant, stdout, and stderr progress. Tab titles use a persistent worktree-local sequence (`subagent · <agent> · 1`, `... · 2`, and so on), so separate workflows and concurrent children do not reuse the same number. For the same worktree, `orca terminal create` runs one at a time in that sequence so the UI can append tabs from left to right as `1`, then `2`, then `3`. This does **not** replace Pi as the child runner: native Pi children keep the same process, lifecycle, status, control, artifact, and result paths. External CLI profiles also keep their existing runner and can mirror their stdout/stderr.
 
 The integration is off by default and supports macOS and Linux. It is disabled on Windows. When enabled, `pi-subagents` looks for executable `orca` on `PATH`, or uses the executable path in `PI_SUBAGENT_ORCA_BINARY`. If no executable is available, Orca is not running, the cwd is not an Orca-managed worktree, or `terminal create` fails, the authoritative subagent still runs normally. Tab creation is deliberately best-effort and never changes the child result.
 
@@ -98,6 +98,16 @@ Set `enabled` to `false` (or remove the block) as a kill switch. In that state, 
 ```
 
 WorkflowScript calls use background execution when the request omits `async`. Set `asyncByDefault` to `false` to restore foreground-by-default behavior for tool launches that still use the internal single-run primitive. Callers can still force foreground with `async: false` unless `forceTopLevelAsync` is enabled.
+
+## `defaultSubagentContext`
+
+```json
+{ "defaultSubagentContext": "fresh" }
+```
+
+Sets `fresh` or `fork` for every subagent launch that omits `context`. This global preference replaces each agent-level `defaultContext`. Explicit `context: "fresh"` or `context: "fork"` still wins.
+
+With `"fork"`, the setting uses the existing implicit-fork behavior. A launch starts fresh when the parent session file or current leaf is not available. `"fresh"` starts fresh even when the selected agent defaults to fork. Scheduled runs continue to set fresh context explicitly. A runner or provider that does not support fork context keeps its existing rejection behavior.
 
 ## `fleetView`
 

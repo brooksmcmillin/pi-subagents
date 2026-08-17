@@ -741,11 +741,11 @@ describe("result watcher", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
 			const resultPath = path.join(resultsDir, "partial.json");
-			writeIndexedResult(resultPath, { id: "partial", runId: "partial", sessionId: "session-1", success: true, summary: "done" });
 			fs.writeFileSync(resultPath, '{"id":"partial"', "utf-8");
 			const emitted: unknown[] = [];
 			const state = createState();
 			state.currentSessionId = "session-1";
+			state.asyncJobs.set("partial", { asyncId: "partial", asyncDir: path.join(resultsDir, "partial"), status: "running", startedAt: Date.now(), updatedAt: Date.now() });
 			const watcher = createResultWatcher({
 				events: {
 					on: () => () => {},
@@ -770,7 +770,7 @@ describe("result watcher", () => {
 			}
 
 			assert.equal(emitted.length, 1);
-			assert.equal(logged.length, 0);
+			assert.equal(logged.some((entry) => /Failed to process subagent result file/.test(String(entry[0] ?? ""))), false);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
@@ -1731,7 +1731,7 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				});
 				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				await waitForPredicate(() => delivered.length === 1);
 			} finally {
 				watcher.stopResultWatcher();
 			}

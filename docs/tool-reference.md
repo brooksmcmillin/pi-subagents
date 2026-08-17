@@ -34,7 +34,7 @@ Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for 
 | `action` | string | - | Agent management (including `guide`, `children.list`, and `refine`/`refine.show`/`refine.rollback`), mission (`mission.create/list/show/update/resolve-decision/attach-run/close`), Herdr inspector (`inspector.open/status/close`), status/control, schedule, watchdog, or doctor action. |
 | `topic` | `overview \| workflows \| agents \| missions \| observability \| tool-reference \| configuration \| models \| watchdog \| extension-api` | `overview` | Packaged guide topic for `action: "guide"`. |
 | `config` | object/string | - | Agent config for management create/update. |
-| `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; an implicit `fork` creates a real branched session when the parent session file and current leaf exist, otherwise it falls back to `fresh` without a failed first attempt. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
+| `context` | `fresh \| fork` | global or per-agent default, else `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, [`defaultSubagentContext`](configuration.md#defaultsubagentcontext) wins over each agent's `defaultContext`; `"fork"` creates a real branched session when the parent session file and current leaf exist, otherwise it falls back to `fresh`. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
 | `missionId` | string | - | Attach a workflow to an existing project mission instead of creating its default enclosing mission. |
 | `mission` | object/false | auto-create | Override the default enclosing mission with `{ title \| summary, objective?, goal?, budget?, labels? }`. Set exactly one non-empty `title` or `summary`; `objective` and `labels` are optional. `goal` may only be `true`, requires `budget.tokens`, and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
 | `handoffPath` | string | - | Aggregate handoff manifest required by `action: "worktree.discard"`. |
@@ -42,8 +42,9 @@ Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for 
 | `view` | `fleet \| transcript` | - | Optional `status` view for the active fleet surface or transcript tail inspection. |
 | `lines` | number | `80` | Maximum transcript lines for `action: "status", view: "transcript"`; capped at 500. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
-| `async` | boolean | default-on | Background execution. Workflows default to background and accept `async:false` as an explicit foreground escape hatch. |
+| `async` | boolean | default-on | Background execution. Workflows default to background. `async:false` blocks the parent until completion. |
 | `chatProgress` | `auto \| off \| live-card` | `auto` | WorkflowScript chat projection. `auto` renders a live in-chat card only for watched foreground workflows in the same Git repository, including managed worktrees; it is off otherwise. Explicit `live-card` requires `async:false` and the same Git repository. |
+| `isolation` | `none \| worktree` | - | Workflow child isolation. `none` runs in the shared cwd and does not need Git. `worktree` requires a managed Git worktree. Do not combine it with a contradictory `worktree` value. |
 | `timeoutMs` / `maxRuntimeMs` | number | config `timeoutMs`, else 30 min foreground / single-agent async | Optional run-level max runtime in milliseconds. When omitted, the global [`timeoutMs`](configuration.md#timeoutms) config provides the default; absent that, foreground and plain single-agent async runs fall back to 30 minutes, while composite async runs (chains, parallel tasks, workflows) stay unbounded at the top level. |
 | `toolTimeoutMs` | number | fast-tool default | Optional positive hard per-tool-call deadline in milliseconds. Precedence: call value → agent frontmatter → config → `PI_SUBAGENT_TOOL_TIMEOUT_MS`. The timer starts on `tool_execution_start`, clears on the matching `tool_execution_end`, and terminates the run with `timedOut: true` if the tool remains open. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It never extends the run deadline; `contact_supervisor`, `intercom`, and `subagent_wait` are exempt. |
 | `turnBudget` | object | none | Optional assistant-turn budget `{ maxTurns, graceTurns }`. At `maxTurns` the child is warned to wrap up. After the grace window (default 1), termination occurs at the next assistant boundary; a response that starts tool work records `termination-deferred` until a later boundary. Partial output is returned on abort. |
@@ -66,11 +67,34 @@ Bound writer work with a narrow task and an outer `timeoutMs` or `maxRuntimeMs` 
 
 ### Fork context details
 
-Explicit `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. By contrast, an agent-level `defaultContext: fork` is a preference: when the parent has no persisted session file or current leaf yet, the launch uses `fresh` immediately instead of failing and requiring a retry.
+Explicit `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. By contrast, global `defaultSubagentContext: "fork"` and agent-level `defaultContext: fork` are preferences: when the parent has no persisted session file or current leaf yet, the launch uses `fresh` immediately instead of failing and requiring a retry. Global `defaultSubagentContext: "fresh"` starts fresh. Explicit `context: "fresh"` always wins over both preferences.
 
 When the inherited transcript contains signed Anthropic `thinking` / `redacted_thinking` blocks, `pi-subagents` strips those provider-private blocks from the forked child session. It forces thinking `off` only when the child's effective primary or fallback model resolves through the model registry to the Anthropic provider or `anthropic-messages` API; unresolved models are treated conservatively. The result reports every affected child, including on failed runs. Use `context: "fresh"` when an Anthropic child needs thinking. Explicit `context: "fork"` never silently downgrades to `fresh`.
 
-In workflow runs that omit `context`, each `runs.run` child follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. If the parent session file or current leaf is not available yet, implicit fork-default children also run fresh. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
+In workflow runs that omit `context`, each `runs.run` child follows the global `defaultSubagentContext` when set, then its own `defaultContext`. Without the global setting, a fresh-default scout can run fresh beside a fork-default worker. If the parent session file or current leaf is not available yet, implicit fork-default children run fresh. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
+
+### Workflow steering
+
+`runs.steer(key, message, options?)` targets a stable key already launched by `runs.run` or `runs.all`. It does not accept a raw run id. Options are `mode?: "steer" | "follow_up" | "auto"`, `index?: number`, and `ackTimeoutMs?: number`. The promise returns `{ key, state, requestId?, deliveryStatus?, targets?, error? }`, where `state` is `queued`, `delivered`, `missed`, or `failed`.
+
+The workflow trace records the attempt and receipt. Always await, return, or include the promise in an awaited standard Promise combinator. Unawaited steering calls reject workflow completion after the side effect settles. `Promise.race` remains the rolling primitive. This slice reuses the foreground and async steering transports and disables steering recovery.
+
+For rolling fanout, keep the launched `runs.run` promises in ordinary JavaScript data. `Promise.race` gives the next completed child, `runs.steer` can challenge a still-running keyed sibling, and `Promise.all` collects the rest. No separate `runs.start`, `runs.next`, or `runs.collect` API is exposed.
+
+```js
+{ workflowScript: `
+  let pending = [
+    { key: "writer", promise: runs.run("writer", { agent: "worker", task: "Draft the fix" }).then((result) => ({ key: "writer", result })) },
+    { key: "reviewer", promise: runs.run("reviewer", { agent: "reviewer", task: "Review likely risks" }).then((result) => ({ key: "reviewer", result })) }
+  ];
+  const first = await Promise.race(pending.map((child) => child.promise));
+  pending = pending.filter((child) => child.key !== first.key);
+  const target = pending[0];
+  const receipt = await runs.steer(target.key, "Use this early review:\n" + first.result.output, { mode: "auto" });
+  const rest = await Promise.all(pending.map((child) => child.promise));
+  return { first: first.key, rest: rest.map((child) => child.key), receipt };
+` }
+```
 
 ### Output mode details
 
@@ -303,11 +327,11 @@ Orca progress tabs are a global, opt-in observer, not an agent runner. Enable th
 { "orcaProgressTabs": { "enabled": true } }
 ```
 
-Every foreground or background child keeps running through its normal native Pi or `external-cli` path. For each logical child, the observer asks Orca to create a background terminal tab in that child's current worktree and mirrors progress into it. Titles receive a persistent worktree-local sequence number, including across separate workflow calls. Model/startup retries reuse the same tab. Parallel and chain children each receive their own tab; attaching an already-running async root does not create a duplicate. Terminal control sequences are removed at the viewer sink across read boundaries. Each mirror is capped at 1 MiB and truncates when the cap or stream backpressure is reached. After the child finishes, its viewer returns to the terminal shell instead of ending the terminal session, so the tab and scrollback remain until the user closes them. Successful native Pi children with a known session append a safely quoted removal command for the exact verified session path; unsuccessful and sessionless children append only their terminal status.
+Every foreground or background child keeps running through its normal native Pi or `external-cli` path. For each logical child, the observer asks Orca to create a background terminal tab in that child's current worktree and mirrors progress into it. Titles receive a persistent worktree-local sequence number, including across separate workflow calls. Creates for the same worktree are serialized in that sequence so tabs appear to the right in order (`1`, then `2`, then `3`) instead of racing. Model/startup retries reuse the same tab. Parallel and chain children each receive their own tab; attaching an already-running async root does not create a duplicate. Terminal control sequences are removed at the viewer sink across read boundaries. Each mirror is capped at 1 MiB and truncates when the cap or stream backpressure is reached. After the child finishes, its viewer returns to the terminal shell instead of ending the terminal session, so the tab and scrollback remain until the user closes them. Successful native Pi children with a known session append a safely quoted removal command for the exact verified session path; unsuccessful and sessionless children append only their terminal status.
 
 The observer supports macOS and Linux and is disabled on Windows. It requires executable `orca` on `PATH` (or `PI_SUBAGENT_ORCA_BINARY`) and a running Orca runtime that recognizes the child cwd. Availability and tab creation are best-effort: failures never fail, stop, or delay the subagent. Set `orcaProgressTabs.enabled` to `false` to guarantee that no Orca command or tab is created.
 
-Agent profile `runner.type` remains unchanged: supported values are native Pi (the default) and `external-cli`. Orca is intentionally not a profile runner and does not own subagent execution, completion, cancellation, artifacts, or result delivery.
+Agent profile `runner.type` supports native Pi (the default), `external-cli`, and `external-job`. Orca is intentionally not a profile runner and does not own subagent execution, completion, cancellation, artifacts, or result delivery.
 
 ## External CLI agent profiles
 
