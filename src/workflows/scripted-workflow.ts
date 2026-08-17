@@ -1052,7 +1052,7 @@ export async function runWorkflowScript(
 				if (settled || finishing) return;
 				respond(options.status(target, childController.signal).then((result) => {
 					if (settled || finishing) return result;
-					trace.push({ operation: "status", key: keyOrRunId, state: result.ok ? "completed" : "failed", ...(result.runId ? { runId: result.runId } : {}), ...(!result.ok ? { error: result.output } : {}) });
+					trace.push({ operation: "status", key: keyOrRunId, state: result.ok ? "completed" : "failed", ...(result.runId ? { runId: result.runId } : {}), ...(result.ok ? {} : { error: result.output }) });
 					traceChanged();
 					if (!result.ok) throw new Error(`Status '${keyOrRunId}' failed: ${result.output}`);
 					return result;
@@ -1285,7 +1285,7 @@ export async function runWorkflowScript(
 				if (stoppedLaunches.has(key)) return normalized;
 				children.set(key, normalized);
 				const state = normalized.ok ? "completed" : normalized.detached ? "detached" : "failed";
-				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });
+				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(normalized.ok ? {} : { error: normalized.error ?? normalized.output }) });
 				traceChanged();
 				return normalized;
 			}, (error: unknown) => {

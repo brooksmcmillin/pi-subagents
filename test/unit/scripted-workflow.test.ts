@@ -1994,7 +1994,7 @@ describe("scripted workflow runtime", () => {
 
 	it("drops a status response that settles after the workflow aborts", async () => {
 		const controller = new AbortController();
-		let traceLengths: number[] = [];
+		const traceLengths: number[] = [];
 		let resolveStatus!: (result: {
 			key: string;
 			ok: true;

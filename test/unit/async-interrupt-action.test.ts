@@ -43,7 +43,7 @@ function createRunningAsync(state: SubagentState, runId: string, options: { trac
 		mode: options.mode ?? "single",
 		state: runState,
 		sessionId: options.sessionId ?? "session",
-		...(options.pid !== undefined ? { pid: options.pid } : runState === "running" ? { pid: 12345 } : {}),
+		...(options.pid === undefined ? runState === "running" ? { pid: 12345 } : {} : { pid: options.pid }),
 		cwd: os.tmpdir(),
 		startedAt: 100,
 		lastUpdate: Date.now(),
