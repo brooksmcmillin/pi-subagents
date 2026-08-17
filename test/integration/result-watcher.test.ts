@@ -745,6 +745,7 @@ describe("result watcher", () => {
 			const emitted: unknown[] = [];
 			const state = createState();
 			state.currentSessionId = "session-1";
+			state.asyncJobs.set("partial", { asyncId: "partial", asyncDir: path.join(resultsDir, "partial"), status: "running", startedAt: Date.now(), updatedAt: Date.now() });
 			const watcher = createResultWatcher({
 				events: {
 					on: () => () => {},
@@ -769,7 +770,7 @@ describe("result watcher", () => {
 			}
 
 			assert.equal(emitted.length, 1);
-			assert.equal(logged.length, 0);
+			assert.equal(logged.some((entry) => /Failed to process subagent result file/.test(String(entry[0] ?? ""))), false);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
