@@ -825,8 +825,8 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			tools: reviewer.tools,
 		});
 
-		assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls,bash");
-		assert.doesNotMatch(args[args.indexOf("--tools") + 1] ?? "", /\b(?:edit|write)\b/);
+		assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls,inspection_shell");
+		assert.doesNotMatch(args[args.indexOf("--tools") + 1] ?? "", /\b(?:bash|edit|write)\b/);
 	});
 
 	it("keeps structured_output available under explicit tool allowlists", () => {
@@ -1245,6 +1245,23 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		);
 		assert.ok(extensionArgs.includes("./custom-tool.ts"));
 		assert.ok(extensionArgs.includes("./allowed-ext.ts"));
+	});
+
+	it("loads the inspection-shell provider only when the tool is declared", () => {
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "review",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read", "inspection_shell"],
+		});
+
+		const extensionArgs = args.filter(
+			(arg, index) => args[index - 1] === "--extension",
+		);
+		assert.equal(args[args.indexOf("--tools") + 1], "read,inspection_shell");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "extension", "inspection-shell.ts"))));
 	});
 
 	it("loads subagent-only extension paths only through child process extension args", () => {
