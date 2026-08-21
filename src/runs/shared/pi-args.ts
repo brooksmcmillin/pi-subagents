@@ -103,6 +103,13 @@ const FANOUT_CHILD_EXTENSION_PATH = path.join(
 	"extension",
 	"fanout-child.ts",
 );
+const INSPECTION_SHELL_EXTENSION_PATH = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"..",
+	"extension",
+	"inspection-shell.ts",
+);
 export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
 export const SUBAGENT_ORCHESTRATOR_TARGET_ENV =
 	"PI_SUBAGENT_ORCHESTRATOR_TARGET";
@@ -448,6 +455,9 @@ export function resolvePiLaunchToolPlan(
 	const runtimeExtensions = [
 		PROMPT_RUNTIME_EXTENSION_PATH,
 		...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
+		...(declaredBuiltinTools.includes("inspection_shell")
+			? [INSPECTION_SHELL_EXTENSION_PATH]
+			: []),
 		...(permSystemExt ? [permSystemExt] : []),
 	];
 	const disableAmbientExtensions =
