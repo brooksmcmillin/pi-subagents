@@ -41,43 +41,130 @@ Builtins load at the lowest priority, so a user or project agent with the same n
 | `worker` | Implementation work, including approved oracle handoffs. It edits files, validates, and escalates unapproved decisions instead of guessing. |
 | `reviewer` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. It challenges assumptions, catches drift, and recommends the safest next move without editing. |
-| `gpt-pro` | Read-only Surf GPT Pro advice through the `surf-oracle` external-job provider bridge. |
 | `delegate` | A lightweight general delegate when you want a child agent that behaves close to the parent session. |
 
 Rule of thumb: `scout` before you understand the code, `researcher` before you trust external facts, `worker` to implement, `reviewer` to check, and `oracle` when the decision itself feels risky.
 
 `oracle` is an advisory reviewer that critiques direction and proposes an execution prompt without editing files. `advisor` is the same bundled role under the Claude Code-compatible name.
 
-`gpt-pro` uses `runner.type: external-job` with provider `surf-oracle`. It starts through the same `subagent({ agent: "gpt-pro" })` mental model as any other agent, but the work is owned by Surf through the external-job provider bridge. The Pi async run remains the source of truth for status, artifacts, wake/wait, mission attachment, retention, and diagnostics.
+### Optional Surf integration
 
-Claude Code can be configured as a read-only advisor with `runner.type: external-cli` when the Claude Code CLI is installed and you have verified the flags for your local version. pi-subagents does not ship or enforce Claude Code flags. Use a project or user agent like this only after checking your CLI help:
+When `surf-cli` is installed and loaded, Surf can expose a `gpt-pro` package agent through the `surf-oracle` external-job provider. It starts through the same `subagent({ agent: "gpt-pro" })` mental model as any other agent, but Surf owns the package agent and provider. Surf maps `model: pro` to ChatGPT GPT-5.6 Sol Pro web mode. pi-subagents does not own that model mapping.
 
-```yaml
----
-name: claude-advisor
-description: Read-only Claude Code advisor through the local CLI
-runner:
-  type: external-cli
-  command: claude
-  args: ["<verified-read-only-flags>"]
-  promptDelivery: stdin
-async: true
----
+If you disabled the old bundled `gpt-pro` workaround with `agentOverrides.gpt-pro.disabled`, remove that override before using Surf's package agent.
 
-Review the task and return advice only. Do not edit files.
-```
+The Pi async run remains the source of truth for status, artifacts, wake/wait, mission attachment, retention, and diagnostics.
 
 ### Advisory runner data boundary
 
-Native `oracle` runs inside Pi and can use its configured read tools. `claude-advisor` sends the assembled prompt to the configured local external CLI through stdin. `gpt-pro` sends the assembled prompt to the registered Surf provider. Provider options and a prompt digest are persisted in Pi run state. The prompt text is delivered through the local host bridge to the provider and is not stored in the public result payload. Do not place secrets in advisory prompts unless the target provider is approved to receive them.
+The built-in `codex-exec` and `codex-exec-writer` profiles are the supported Codex one-shot modes. Both require an installed and authenticated Codex CLI. The adapters own `codex exec --json` argv with ignored user config and rules, ephemeral sessions, approval policy `never`, and a final-message artifact.
+
+| Profile | Access | Sandbox |
+|---|---|---|
+| `codex-exec` | Read-only analysis | `read-only` |
+| `codex-exec-writer` | Explicit workspace edits | `workspace-write` |
+
+Neither adapter uses full access, approval or sandbox bypasses, automatic approval review, or additional writable roots. User profiles cannot add argv. The `codex-exec` selection identity is reserved for the read-only adapter.
+
+Run it asynchronously:
+
+```text
+Use codex-exec to analyze this change without editing files.
+
+Use codex-exec-writer to make the requested workspace changes.
+```
+
+The adapter validates `codex --version` and `codex exec --help` only when a run launches. Discovery, list, status, and native Pi launches do not probe Codex. JSONL, stderr, and stdout are untrusted. A run succeeds only after bounded valid JSONL contains one `turn.completed` event and the bounded final-message artifact is present.
+
+Maintainers can collect real smoke evidence without making it part of the normal test suite:
+
+```bash
+PI_SUBAGENTS_CODEX_EXEC_SMOKE=1 \
+PI_SUBAGENTS_CODEX_EXEC_SMOKE_REPORT=/tmp/pi-subagents-codex-exec-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/codex-exec-smoke.test.ts
+
+PI_SUBAGENTS_CODEX_EXEC_WRITER_SMOKE=1 \
+PI_SUBAGENTS_CODEX_EXEC_WRITER_SMOKE_REPORT=/tmp/pi-subagents-codex-exec-writer-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/codex-exec-writer-smoke.test.ts
+```
+
+The read-only smoke must report `writeCanaryExists: false`. The writer smoke must report `writeCanaryMatches: true`. Both reports include startup duration and terminal proof without raw protocol output, prompts, or credentials.
+
+The built-in `claude-code` and `claude-code-writer` profiles are the supported Claude Code one-shot modes. Both require an installed Claude Code CLI that is already authenticated through its normal local login. Claude Code 2.1.150 needs the user setting source for normal OAuth/keychain authentication, so both adapters load user settings but exclude project and local settings. User-level Claude Code settings and hooks are therefore an operator-trusted prerequisite. Review or disable unsafe user hooks before using either profile.
+
+| Profile | Access | Permission mode | Built-in tools |
+|---|---|---|---|
+| `claude-code` | Handoff-only read-only advice | `plan` | none |
+| `claude-code-writer` | Explicit workspace file edits | `acceptEdits` | `Read,Write,Edit,Glob,Grep` |
+
+Both adapters own `claude -p` argv with stream JSON, strict empty MCP configuration, user-only setting sources, no session persistence, disabled slash commands, and disabled Chrome integration. The writer mode does not include Bash or any permission bypass. Neither mode uses `--bare`, which does not read normal OAuth/keychain authentication. Neither mode requires `--safe-mode`, which is absent from the installed 2.1.150 help. User profiles cannot add argv. Selecting the code-owned `claude-code-writer` adapter identity is the only way to opt into its write tools; the read-only adapter cannot be widened with user argv.
+
+Run it asynchronously:
+
+```text
+Use claude-code to analyze this handoff without editing files.
+
+Use claude-code-writer to make the requested file changes.
+```
+
+The adapter validates `claude --version` and `claude --help` only when a run launches. Discovery, list, status, and native Pi launches do not probe Claude Code or authentication. JSONL, stderr, and stdout are untrusted. A run succeeds only after bounded valid JSONL contains exactly one successful terminal `result` with non-empty final text. Missing or revoked local authentication, limit stops, malformed JSON, duplicate terminal results, and EOF before a terminal result fail closed.
+
+Maintainers can opt in to separate read-only and writer canaries:
+
+```bash
+PI_SUBAGENTS_CLAUDE_CODE_SMOKE=1 \
+PI_SUBAGENTS_CLAUDE_CODE_SMOKE_REPORT=/tmp/pi-subagents-claude-code-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/claude-code-smoke.test.ts
+
+PI_SUBAGENTS_CLAUDE_CODE_WRITER_SMOKE=1 \
+PI_SUBAGENTS_CLAUDE_CODE_WRITER_SMOKE_REPORT=/tmp/pi-subagents-claude-code-writer-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/claude-code-writer-smoke.test.ts
+```
+
+Both smoke reports record `authentication: "existing-cli-required"`, `settingSources: "user"`, and `userSettingsTrust: "required"` without recording credential details. For read-only, confirm `terminalState` is `completed` and `writeCanaryExists` is `false`. For writer, confirm `terminalState` is `completed` and `writeCanaryMatches` is `true`. `durationMs` records cold process time. If authentication is missing or revoked, repair the normal local Claude Code login and rerun the smoke. Reports do not contain raw protocol output or credentials.
+
+The built-in `cursor-agent` and `cursor-agent-writer` profiles are the supported Cursor CLI one-shot modes. Both require an installed Cursor CLI and either `CURSOR_API_KEY` or an existing local login.
+
+| Profile | Access | Cursor mode |
+|---|---|---|
+| `cursor-agent` | Read-only analysis | `ask` |
+| `cursor-agent-writer` | Explicit workspace edits | non-interactive print |
+
+Both adapters use stream JSON, the enabled sandbox, and the primary workspace. They write the full handoff to a private `0600` file in a private temporary directory. Process argv contains only a short instruction with that path. The temporary directory is added as a workspace root only when it is outside the primary workspace. The prompt file and directory are removed after completion, failure, or stop.
+
+The adapters do not pass force, yolo, auto-review, MCP approval, plugin, session resume, continue, worktree, or workspace trust flags. User profiles cannot add argv or workspace roots. The `cursor-agent` selection identity is reserved for the read-only adapter.
+
+Launch preflight validates `cursor-agent --version` and `cursor-agent --help` only when a run starts. Discovery, list, status, and native Pi launches do not execute Cursor or probe authentication. A run succeeds only when bounded valid JSONL ends with one successful `result` event that has non-empty final text. Error events, failed results, malformed JSON, output after the terminal event, and EOF before a result fail closed.
+
+Maintainers can run separate read-only and writer canaries:
+
+```bash
+PI_SUBAGENTS_CURSOR_AGENT_SMOKE=1 \
+PI_SUBAGENTS_CURSOR_AGENT_SMOKE_REPORT=/tmp/pi-subagents-cursor-agent-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/cursor-agent-smoke.test.ts
+
+PI_SUBAGENTS_CURSOR_AGENT_WRITER_SMOKE=1 \
+PI_SUBAGENTS_CURSOR_AGENT_WRITER_SMOKE_REPORT=/tmp/pi-subagents-cursor-agent-writer-smoke.json \
+node --experimental-strip-types --import ./test/support/register-loader.mjs \
+  --test test/integration/cursor-agent-writer-smoke.test.ts
+```
+
+The read-only smoke must report `writeCanaryExists: false`. The writer smoke must report `writeCanaryMatches: true`. Both reports include startup duration and terminal proof without raw protocol output, prompts, or credentials.
+
+Native `oracle` runs inside Pi and can use its configured read tools. The Claude profiles send the assembled prompt to the local Claude Code CLI through stdin. An external-job agent sends the assembled prompt to its registered provider. Provider options and a prompt digest are persisted in Pi run state. The prompt text is delivered through the local host bridge to the provider and is not stored in the public result payload. Do not place secrets in advisory prompts unless the target provider is approved to receive them.
 
 ### External-job state table
 
 | Durable file | Owner | States | Release predicate | Rollback predicate | Stale-head behavior | Fail-closed cases |
 |--------------|-------|--------|-------------------|--------------------|---------------------|-------------------|
-| `status.json` step `runner` and `externalJob` | pi-subagents async runner | `queued`, `running`, `completed`, `failed`, `stopped`, `blocked` | Provider `result` returns terminal data and the async result is written | Provider start/status/result/reattach returns an error | If a status file already has a provider job id, recovery calls `reattach` and `result`; it refuses to start a new prompt when the provider or prompt digest differs | Missing provider, capacity conflict, malformed provider response, bridge timeout, prompt digest mismatch |
+| `status.json` step `runner` and `externalJob` | pi-subagents async runner | `queued`, `running`, `completed`, `failed`, `stopped`, `blocked` | Provider `result` returns terminal data and the async result is written | Provider start/follow-up/status/result/reattach returns an error | If a status file already has a provider job id, recovery calls `reattach` and `result`; it refuses to start a new prompt when the provider, prompt digest, parent job id, request id, request digest, or options differ | Missing provider, unsupported follow-up provider, capacity conflict, malformed provider response, bridge timeout, prompt digest mismatch, parent conversation missing |
 | `result.json` or session result payload | pi-subagents async runner | `complete`, `failed`, `stopped` | All steps reach terminal state and result publication succeeds or is recoverably indexed | Result write fails and pending result repair records the terminal state | Stale status can repair from an existing result file | Unindexed sessionless stale failure |
-| `external-job-requests/` and `external-job-responses/` | Host-mediated provider bridge | pending request, terminal response | Host process writes a matching response and removes the request | Bridge timeout or malformed request response | Requests are operation-scoped. Recovery sends `reattach`/`result`, not `start`, when job metadata exists | Provider not registered, host bridge not loaded, malformed request, provider exception |
+| `external-job-requests/` and `external-job-responses/` | Host-mediated provider bridge | pending request, terminal response | Host process writes a matching response and removes the request | Bridge timeout or malformed request response | Requests are operation-scoped. Recovery sends `reattach`/`result`, not `start` or `follow-up`, when job metadata exists. `start` and `follow-up` use durable dispatch claims | Provider not registered, host bridge not loaded, malformed request, provider exception, ambiguous dispatch without a provider job id |
 | Provider artifact path | External provider | provider-defined terminal artifact | Provider returns `artifactPath`, or Pi writes returned text to `external-job-<index>.result.md` | Provider reports failure or no result | Existing artifact path is retained in `status.json` | Missing artifact with no text output returns a terminal message instead of inventing content |
 
 The `researcher` builtin uses `web_search`, `fetch_content`, and `get_search_content`. Those require [pi-web-access](https://github.com/nicobailon/pi-web-access):
@@ -106,10 +193,10 @@ You can override selected builtin fields without copying the whole agent. Overri
 }
 ```
 
-Supported override fields: `description`, `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
+Supported override fields: `description`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
 
 - `description` replaces the discovered description for builtin and custom agents, which lets list output show deployment-specific routing or model metadata.
-- Use `defaultContext: false` or `acceptanceRole: false` to clear an inherited override.
+- Use `output: false`, `defaultReads: false`, `defaultContext: false`, or `acceptanceRole: false` to clear an inherited value.
 - Use `tools: "inherit"` on a builtin when that one role should omit its bundled tool allowlist and receive Pi's normal builtins and ambient extensions. This keeps strict tools as the default for other builtins.
 - Project overrides beat user overrides.
 - Matching user and project agents also receive override fields that their frontmatter leaves unset, so a shared project config agent can keep the persona while local settings choose the model.

@@ -15,14 +15,18 @@ import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal
 import { ACTIVE_RUN_INDEX_DIR, DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS, activeRunMarkerAgeMs, isActiveAsyncState, readActiveRunIndex, releaseActiveRunIndex, updateActiveRunIndex } from "./active-run-index.ts";
 import { readRecentTerminalRunIndex, TERMINAL_RUN_INDEX_DIR } from "./terminal-run-index.ts";
 import { canScanAsyncRunPrefix } from "./run-id-query.ts";
+import { asyncStatusChildIdentity } from "../shared/child-identity.ts";
 
 interface AsyncRunStepSummary {
 	index: number;
+	childId?: string;
 	agent: string;
 	context?: ContextMode;
 	label?: string;
 	description?: string;
 	phase?: string;
+	workflowKey?: string;
+	runId?: string;
 	outputName?: string;
 	structured?: boolean;
 	status: AsyncJobStep["status"];
@@ -84,6 +88,7 @@ export interface AsyncRunSummary {
 	mode: SubagentRunMode;
 	context?: ContextSummary;
 	cwd?: string;
+	sessionRoot?: string;
 	startedAt: number;
 	lastUpdate?: number;
 	endedAt?: number;
@@ -250,11 +255,14 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		const stepLastActivityAt = step.lastActivityAt;
 		return {
 			index,
+			childId: asyncStatusChildIdentity(step, index),
 			agent: step.agent,
 			...(step.context ? { context: step.context } : {}),
 			...(step.label ? { label: step.label } : {}),
 			...(step.description ? { description: step.description } : {}),
 			...(step.phase ? { phase: step.phase } : {}),
+			...(step.workflowKey ? { workflowKey: step.workflowKey } : {}),
+			...(step.runId ? { runId: step.runId } : {}),
 			...(step.outputName ? { outputName: step.outputName } : {}),
 			...(step.structured ? { structured: step.structured } : {}),
 			status: step.status,
@@ -276,12 +284,15 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.skills ? { skills: step.skills } : {}),
 			...(step.model ? { model: step.model } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
+			...(step.thinkingCeiling ? { thinkingCeiling: step.thinkingCeiling } : {}),
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
 			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			...(step.transcriptPath ? { transcriptPath: step.transcriptPath } : {}),
 			...(step.error ? { error: step.error } : {}),
 			...(step.timedOut !== undefined ? { timedOut: step.timedOut } : {}),
 			...(step.stopped !== undefined ? { stopped: step.stopped } : {}),
+			...(step.stopRequested !== undefined ? { stopRequested: step.stopRequested } : {}),
+			...(step.stopRequestedAt !== undefined ? { stopRequestedAt: step.stopRequestedAt } : {}),
 			...(step.turnBudget ? { turnBudget: step.turnBudget } : {}),
 			...(step.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: step.turnBudgetExceeded } : {}),
 			...(step.wrapUpRequested !== undefined ? { wrapUpRequested: step.wrapUpRequested } : {}),
@@ -318,6 +329,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		mode: status.mode,
 		...(summarizeContextModes(summarizedSteps.map((step) => step.context)) ? { context: summarizeContextModes(summarizedSteps.map((step) => step.context)) } : {}),
 		cwd: status.cwd,
+		...(status.sessionRoot ? { sessionRoot: status.sessionRoot } : {}),
 		startedAt: status.startedAt,
 		lastUpdate: status.lastUpdate,
 		endedAt: status.endedAt,

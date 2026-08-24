@@ -11,6 +11,7 @@ import { DIRS, type AsyncStatus, type Details, type ForegroundResumeRun, type Ne
 import { inspectActiveAsyncCapacityOwner, type ActiveAsyncCapacityInspection } from "./active-async-capacity.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
+import { normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal.ts";
 import { formatWaitSubscriptions } from "./wait-subscriptions.ts";
@@ -22,6 +23,7 @@ import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegis
 import { readMissionBinding } from "../../missions/lifecycle.ts";
 import { formatWorkflowJsonPreview } from "../../workflows/scripted-workflow.ts";
 import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { getExternalJobProvider } from "../../api/external-job-provider.ts";
 
 interface RunStatusParams {
 	action?: string;
@@ -159,6 +161,14 @@ function formatSteeringSummary(input: { steering?: SteeringStatus }): string | u
 	if (!steering || steering.requested === 0) return undefined;
 	const lateAcknowledgments = steering.recent.reduce((count, request) => count + request.targets.filter((target) => target.lateDeliveredAt !== undefined).length, 0);
 	return `${steering.requested} requested, ${steering.scheduled} scheduled, ${steering.pending} pending, ${steering.delivered} delivered, ${steering.failed} failed, ${steering.recovered} recovered${lateAcknowledgments ? `, ${lateAcknowledgments} late acknowledged` : ""}`;
+}
+
+function externalJobFollowUpSupported(provider: string): boolean {
+	try {
+		return typeof getExternalJobProvider(provider)?.followUp === "function";
+	} catch {
+		return false;
+	}
 }
 
 function rememberedForegroundChildOutput(child: ForegroundResumeRun["children"][number]): string {
@@ -513,6 +523,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					&& Boolean(control.workflowSteeringDir && fs.existsSync(control.workflowSteeringDir))
 					&& (control.activeChildren?.size ?? 0) > 0)
 				: [];
+			let hasExternalJobFollowUpHint = false;
 			for (const [index, step] of (status.steps ?? []).entries()) {
 				const stepActivityText = step.status === "running" ? formatActivityLabel(step.lastActivityAt, step.activityState) : undefined;
 				const modelThinking = formatModelThinking(step.model, step.thinking);
@@ -526,15 +537,39 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				const phase = step.phase ? `[${step.phase}] ` : "";
 				lines.push(`${stepLineLabel(status, index)}: ${phase}${display} ${step.status}${modelText}${stepActivityText ? `, ${stepActivityText}` : ""}${steeringSuffix}${acceptanceText}${budgetText}${errorText}`);
 				if (step.runner?.type === "external-cli") {
-					lines.push(`  Runner: external-cli (${step.runner.command}${step.runner.args.length ? ` ${step.runner.args.join(" ")}` : ""})`);
+					const runner = normalizeExternalCliRunnerStatus(step.runner);
+					if (runner) {
+						lines.push(`  Runner: external-cli (${runner.command}${runner.args.length ? ` ${runner.args.join(" ")}` : ""})`);
+						lines.push(`  Adapter: ${runner.adapter.id} v${runner.adapter.version} (${runner.adapter.executionMode})`);
+						if (runner.safety) {
+							if ("approvalPolicy" in runner.safety) lines.push(`  Safety: ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
+							else if ("mode" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
+							else if ("authentication" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
+							else lines.push(`  Safety: access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
+						}
+						lines.push(`  Capabilities: stop=${runner.capabilities.stop}, steer=false, resume=false, structuredOutput=false, toolEvents=false, supervisor=unsupported, forkContext=false, extensionBindings=false`);
+						lines.push(`  Unsupported steer: ${runner.unsupportedReasons.steer}`);
+						lines.push(`  Unsupported resume: ${runner.nonResumableReason}`);
+						lines.push(`  Unsupported supervisor: ${runner.unsupportedReasons.supervisor}`);
+						lines.push(`  Context handoff: fresh only (${runner.unsupportedReasons.forkContext})`);
+					} else {
+						lines.push("  Runner: external-cli (invalid persisted runner metadata)");
+					}
 					if (step.externalProcess?.pid !== undefined) lines.push(`  Process: ${step.externalProcess.pid}`);
-					if (step.externalProcess) lines.push(`  Stdout: ${step.externalProcess.stdoutPath}`, `  Stderr: ${step.externalProcess.stderrPath}`);
+					if (step.externalProcess) {
+						lines.push(`  Stdout: ${step.externalProcess.stdoutPath}`, `  Stderr: ${step.externalProcess.stderrPath}`);
+						if (step.externalProcess.finalOutputPath) lines.push(`  Final output: ${step.externalProcess.finalOutputPath}`);
+					}
 				} else if (step.runner?.type === "external-job") {
 					lines.push(`  Runner: external-job (${step.runner.provider})`);
 					if (step.externalJob?.providerJobId) lines.push(`  Provider job: ${step.externalJob.providerJobId}`);
 					if (step.externalJob?.state) lines.push(`  Provider state: ${step.externalJob.state}`);
 					if (step.externalJob?.conversationUrl) lines.push(`  Conversation: ${step.externalJob.conversationUrl}`);
 					if (step.externalJob?.resultArtifactPath) lines.push(`  Result artifact: ${step.externalJob.resultArtifactPath}`);
+					if ((step.status === "complete" || step.status === "completed") && step.externalJob?.state === "completed" && step.externalJob.providerJobId && externalJobFollowUpSupported(step.runner.provider)) {
+						hasExternalJobFollowUpHint = true;
+						lines.push(`  Follow-up: subagent({ action: "resume", id: "${status.runId}", index: ${index}, message: "..." })`);
+					}
 				}
 				lines.push(...formatNestedRunStatusLines(step.children, { indent: "  ", commandHints: true, maxLines: 20 }));
 				const stepOutputPath = path.join(asyncDir, `output-${index}.log`);
@@ -563,7 +598,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (status.state === "running" && !allExternal && status.mode !== "workflow") lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
 			if (status.state !== "running") {
 				lines.push(allExternal
-					? "Resume: unavailable; external runners do not persist Pi sessions."
+					? hasExternalJobFollowUpHint ? "Resume: use the external-job follow-up hint above." : "Resume: unavailable; external runners do not persist Pi sessions."
 					: formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);

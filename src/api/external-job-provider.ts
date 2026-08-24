@@ -9,7 +9,7 @@ const MAX_FAILURE_MESSAGE_LENGTH = 4_096;
 const MAX_URL_LENGTH = 4_096;
 
 export type ExternalJobState = "queued" | "running" | "completed" | "failed" | "stopped" | "blocked";
-export type ExternalJobOperation = "start" | "status" | "result" | "reattach";
+export type ExternalJobOperation = "start" | "follow-up" | "status" | "result" | "reattach";
 
 export type ExternalJobOptions = Record<string, unknown>;
 
@@ -22,6 +22,14 @@ export interface ExternalJobStartInput {
 	agent: string;
 	options: ExternalJobOptions;
 	sessionId?: string;
+}
+
+export interface ExternalJobFollowUpInput extends ExternalJobStartInput {
+	sourceRunId: string;
+	sourceStepIndex: number;
+	parentProviderJobId: string;
+	requestId: string;
+	requestDigest: string;
 }
 
 export interface ExternalJobHandle {
@@ -42,6 +50,7 @@ export interface ExternalJobResult extends ExternalJobHandle {
 export interface ExternalJobProvider {
 	name: string;
 	start(input: ExternalJobStartInput): Promise<ExternalJobHandle> | ExternalJobHandle;
+	followUp?(input: ExternalJobFollowUpInput): Promise<ExternalJobHandle> | ExternalJobHandle;
 	status(providerJobId: string): Promise<ExternalJobHandle> | ExternalJobHandle;
 	result(providerJobId: string): Promise<ExternalJobResult> | ExternalJobResult;
 	reattach(providerJobId: string): Promise<ExternalJobHandle> | ExternalJobHandle;
@@ -146,8 +155,9 @@ export function validateExternalJobResult(provider: string, value: unknown, fiel
 function validateProvider(value: unknown): ExternalJobProvider {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("External-job provider must be an object.");
 	const provider = value as Record<string, unknown>;
-	const unknownFields = Object.keys(provider).filter((key) => !["name", "start", "status", "result", "reattach"].includes(key));
-	if (unknownFields.length > 0) throw new Error(`External-job provider has unknown fields: ${unknownFields.join(", ")}.`);
+	// Tolerate extra provider fields (for example kind, wakeChannels, or future
+	// operations) so one evolving provider cannot poison registry reads for all
+	// providers. Payload validation stays strict.
 	const name = validateString(provider.name, "External-job provider name", MAX_PROVIDER_NAME_LENGTH);
 	for (const op of ["start", "status", "result", "reattach"] as const) {
 		if (typeof provider[op] !== "function") throw new Error(`External-job provider '${name}' must expose ${op}().`);

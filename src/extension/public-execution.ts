@@ -13,9 +13,16 @@ export interface PublicSubagentExecutionParams {
 	workflowScript?: unknown;
 	isolation?: unknown;
 	worktree?: unknown;
+	async?: unknown;
 	output?: unknown;
 	resume?: unknown;
 	clarify?: unknown;
+	workflowParentRunId?: unknown;
+	workflowKey?: unknown;
+	workflowChildAsyncId?: unknown;
+	workflowAwaitAsync?: unknown;
+	workflowParentDeadlineAt?: unknown;
+	suppressRoutineResultIntercom?: unknown;
 	runFanoutBudget?: unknown;
 	runFanoutAdmitted?: unknown;
 }
@@ -30,7 +37,7 @@ export type PublicSubagentExecutionNormalization<T> =
  * Enforce the public execution cutover before requests reach the executor.
  * Internal runs.run children and structured owned delegation bypass this boundary.
  */
-export function normalizePublicSubagentExecution<T extends PublicSubagentExecutionParams>(params: T): PublicSubagentExecutionNormalization<T> {
+export function normalizePublicSubagentExecution<T extends PublicSubagentExecutionParams>(params: T, options: { asyncByDefault?: boolean } = {}): PublicSubagentExecutionNormalization<T> {
 	if (params.isolation !== undefined) {
 		if (params.isolation !== "none" && params.isolation !== "worktree") {
 			return { ok: false, error: "isolation must be 'none' or 'worktree'.", mode: params.workflowScript !== undefined ? "workflow" : "management" };
@@ -44,6 +51,9 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 	}
 	if (params.runFanoutBudget !== undefined || params.runFanoutAdmitted !== undefined) {
 		return { ok: false, error: "Public execution does not accept internal run fan-out fields.", mode: params.workflowScript !== undefined ? "workflow" : "management" };
+	}
+	if (params.workflowParentRunId !== undefined || params.workflowKey !== undefined || params.workflowChildAsyncId !== undefined || params.workflowAwaitAsync !== undefined || params.workflowParentDeadlineAt !== undefined || params.suppressRoutineResultIntercom !== undefined) {
+		return { ok: false, error: "Public execution does not accept internal workflow child fields.", mode: params.workflowScript !== undefined ? "workflow" : "management" };
 	}
 	const action = params.action;
 	if (action !== undefined && (typeof action !== "string" || !action.trim())) {
@@ -110,17 +120,12 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		if (params.task !== undefined && typeof params.task !== "string") {
 			return { ok: false, error: "Structured single-child task must be a string when provided.", mode: "workflow" };
 		}
-		const { agent: _agent, task: _task, output, ...workflowDefaults } = params;
-		const child = {
-			agent: params.agent.trim(),
-			...(params.task !== undefined ? { task: params.task } : {}),
-			output: output === undefined ? true : output,
-		};
 		return {
 			ok: true,
 			params: {
-				...workflowDefaults,
-				workflowScript: `console.info("Converted structured single-child request to workflow runs.run('main', ...)."); return runs.run("main", ${JSON.stringify(child)})`,
+				...params,
+				agent: params.agent.trim(),
+				output: params.output === undefined ? true : params.output,
 			} as T,
 		};
 	}

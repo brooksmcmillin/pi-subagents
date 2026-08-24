@@ -28,7 +28,7 @@ External CLI profiles are async-only and one-shot. They support lifecycle artifa
 
 ### External job profiles
 
-An agent may set `runner.type: external-job` with a non-empty `provider` and optional JSON `options`. The bundled `gpt-pro` agent uses provider `surf-oracle`. The provider must be registered in the host Pi process through `pi-subagents/external-job-provider`; the async runner talks to that parent-owned registry through a local operation bridge.
+An agent may set `runner.type: external-job` with a non-empty `provider` and optional JSON `options`. When `surf-cli` is installed and loaded, Surf can optionally expose a `gpt-pro` package agent through provider `surf-oracle`. Surf maps `model: pro` to ChatGPT GPT-5.6 Sol Pro web mode. pi-subagents does not own that package agent or model mapping. Remove any old `agentOverrides.gpt-pro.disabled` workaround before using Surf's package agent. The provider must be registered in the host Pi process through `pi-subagents/external-job-provider`; the async runner talks to that parent-owned registry through a local operation bridge.
 
 External job profiles are async-only. The provider owns the remote job and Pi owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
 
@@ -76,11 +76,24 @@ subagent({
 })
 ```
 
-Scripts run in a timed worker with only `runs.run`, `runs.all`, `runs.status`, `runs.ref/refs`, `emit`, captured `console`, and standard JavaScript. Pass explicit task text to `runs.run`. Mission-attached workflows also get `await state.get(key)` and `await state.set(key, value)` for durable JSON state shared across workflows on the same mission; `mission: false` workflows have no `state` global. Stable keys are required. Child launches follow ordinary single-agent execution controls. Give each child a distinct decision and output path when reports must outlive the workflow, then consume the aggregate workflow result before opening individual reports.
+Scripts run in a timed worker with only `runs.run`, `runs.all`, `runs.status`, `runs.ref/refs`, `emit`, captured `console`, and standard JavaScript. Pass explicit task text to `runs.run`. Mission-attached workflows also get `await state.get(key)` and `await state.set(key, value)` for durable JSON state shared across workflows on the same mission; `mission: false` workflows have no `state` global. Stable keys are required. Child launches follow ordinary single-agent execution controls. Give each child a distinct decision and output path when reports must outlive the workflow, then consume the aggregate workflow result before opening individual reports. Do not ask children to write `reports/...` or other repo-root scratch paths in task text.
+
+If `runs.all` is missing in a running session, reload or update `pi-subagents` before retrying. The current runtime supports `runs.all`; `await Promise.all([runs.run(...)])` is also supported for advanced dynamic fanout.
 
 For one host-run verification command, pass `gate: "npm test"` on a `runs.run`/`runs.all` item (or at the top level as a workflow default). It is shorthand for verified acceptance with that single command: the runtime executes it on the host, records the result as evidence, and memoizes it per tracked workspace state and effective environment. `gate` cannot be combined with `acceptance`; use explicit `acceptance.verify` for multiple commands or custom criteria.
 
 Completed workflow children from this parent session stay addressable as retained children. `subagent({ action: "children.list" })` lists up to the last 10 with run ids and reports each row as `resumable` or `not resumable` with a reason. Resume only rows reported `resumable`. For a retained-child challenge, use `resume` instead of `steer` when the child is complete. If no retained child is resumable, launch a same-role fallback challenge and label it as fallback. A later workflow continues a resumable child with `runs.run(key, { resume: "<run-id>", task: "follow-up" })`. Inside `workflowScript`, awaiting that call waits for the revived child to finish and returns its completed output and new `runId`; top-level `{ action: "resume" }` remains detached. Pass explicit follow-up task text. Assign each returned child result back to the loop variable because every resume can return a new retained `runId`; always resume the latest returned id. `resume` and `agent` are mutually exclusive, the revived child keeps its stored agent/model/tool contract, and `gate` is rejected on retained resume items.
+
+Terminal async workflows also persist `workflow-receipt.json` beside `status.json`. It maps each stable child key to its agent, requested and resolved context when known, latest run id, resumability, output reference, and continuation lineage. A later workflow can resume the latest retained child without copying its run id:
+
+```js
+return runs.run("cross-oracle", {
+  resume: { workflowRunId: "<pass-1-workflow-id>", key: "advisor-oracle", latest: true },
+  task: "Review the focused challenge packet."
+});
+```
+
+Keyed resume reads that one exact receipt and revalidates the retained run at launch. It fails when the workflow or key is missing, the receipt is stale, `latest` is not `true`, or the recorded child is no longer resumable. Foreground workflow results expose the same receipt in `details.workflow.receipt`, but cross-workflow keyed lookup requires the durable receipt from an async workflow.
 
 ### Async/background
 
@@ -103,7 +116,7 @@ subagent({
 })
 ```
 
-File-only output mode works for workflowScript child launches. Use distinct absolute or durable output paths when later script steps need stable references. For cross-codebase waves, include the repo slug or lane key in each output path so reports from different repositories cannot collide.
+File-only output mode works for workflowScript child launches. Use relative child output paths for scratch reports so the runtime stores them under the run artifact directory and age-based cleanup can remove them. Use absolute paths only for user-approved durable destinations, such as session memory, a docs folder outside the repo, or a known handoff path. For cross-codebase waves, include the repo slug or lane key in each output path so reports from different repositories cannot collide.
 
 For review fanout where the parent continues a local audit:
 
@@ -116,7 +129,7 @@ const run = subagent({
 // Continue local inspection, then later call status with the returned id.
 ```
 
-While children run, the persistent FleetView and the collapsed foreground tool-result card show live per-child detail: resolved model and thinking level, `[fresh]`/`[fork]` context, tool/token/elapsed counters, and current activity. The collapsed running card also prints the configured expand-key hint ("Press … for live detail"); expanding it shows nested children, recent tools, and recent output. Model badges appear once the child's model resolves at first attempt start. `/subagents-fleet` opens the live fleet inspector, which also has per-child controls (`s` steer, `D` stop with confirmation). When optional Herdr 0.7.5+ is available, `H` opens a raw inspector dashboard for the selected active async child; this mirrors artifacts rather than attaching to the headless child. Use it for confusing or long-running active async work when the human wants a dedicated visual pane or FleetView is insufficient, not for routine headless runs.
+While children run, the persistent FleetView and the collapsed foreground tool-result card show live per-child detail: resolved model and thinking level, `[fresh]`/`[fork]` context, tool/token/elapsed counters, and current activity. The collapsed running card also prints the configured expand-key hint ("Press … for live detail"); expanding it shows nested children, recent tools, and recent output. Model badges appear once the child's model resolves at first attempt start. `/subagents-fleet` opens the live fleet inspector, which also has per-child controls (`s` steer, `D` stop with confirmation). When optional Herdr 0.7.5+ is available, `H` opens a raw inspector dashboard for the selected active async child; this mirrors artifacts rather than attaching to the headless child. When optional Orca progress tabs are enabled, Pi creates one passive Orca observer tab for the top-level subagent call. Parallel and chain children share that tab and write child section headers into the mirrored log instead of opening one tab per child. Pi remains authoritative for lifecycle, status, control, artifacts, and results; the Orca tab is display-only. Pi also writes passive display metadata under `.pi/subagents/views/orca/` when possible, so other surfaces can discover the observer without treating it as an owned child run. Use visual panes for confusing or long-running active async work when the human wants a dedicated surface or FleetView is insufficient, not for routine headless runs.
 
 Inspect async runs with `subagent({ action: "status", id: "..." })` or `subagent({ action: "status" })` for active runs. Use `subagent({ action: "status", view: "fleet" })` when supervising several active foreground/background runs and `subagent({ action: "status", id: "...", view: "transcript", index: 0 })` when you need the latest child output without digging through artifacts. If a delegated fanout child launches nested runs, the parent status view shows them as a tree and you can target a nested run directly with its nested id.
 
@@ -124,7 +137,14 @@ Stop a current-session top-level async run with `stop` (or `/subagents-stop`). S
 
 ```typescript
 subagent({ action: "stop", id: "run-id" })
+subagent({ action: "stop", id: "run-id", childId: "child-id" })
 ```
+
+Use `childId` only for active async/workflow runs whose status snapshot shows a
+matching child. Observer hosts can listen for the advertised
+`subagent:child-status` event to update child-stop UI quickly, but status
+snapshots remain the source of truth after reconnects or duplicate event
+delivery.
 
 Use `steer` for top-level live async guidance and `resume` after a delegated run pauses or finishes. Routed nested runs retain their existing non-destructive live follow-up path:
 
@@ -301,7 +321,7 @@ Routing rule:
 - Several projects with independent work: one async `workflowScript` whose child keys include repo slugs and whose child calls set explicit `cwd`; keep publication and merge decisions serial per repo.
 - Different project, substantial or long-running work: open a project-owned Herdr pane rooted there when a separate visible project session is useful, then give that project Pi session a narrow mission/result contract. Do not model it as ordinary child nesting, and do not expect existing headless runs to move into the pane.
 
-Project panes run a separate Pi session from the target directory. Subagents launched inside that pane use that project's config, agents, skills, files, git state, and mission records. The pane binding lives under `<projectRoot>/.pi/subagents/project-panes/herdr.json`. For ordinary headless delegation to another repo, prefer explicit `cwd` first; reserve project panes for visible or persistent project ownership.
+Project panes run a separate Pi session from the target directory. Subagents launched inside that pane use that project's config, agents, skills, files, git state, and mission records. The pane binding lives under `<projectRoot>/.pi/subagents/project-panes/herdr.json`. When Pi runs inside Herdr, the owning pane reports compact active-work status and title suffixes, and the parent inline status counts opened project panes. Use Herdr itself or `project.status` / `project.close` for pane-level follow-up. For ordinary headless delegation to another repo, prefer explicit `cwd` first; reserve project panes for visible or persistent project ownership.
 
 ```typescript
 subagent({ action: "mission.create", mission: { title: "Ship auth refresh", objective: "Implement and validate refresh handling" } })
@@ -353,6 +373,17 @@ worktree, first confirm dependencies were linked, installed, or provisioned by
 `worktreeSetupHook` before treating it as a code failure.
 
 ## The Oracle Workflow
+
+### Oracle consultation loop
+
+For plan, design, or architecture advice that asks to ask, consult, discuss with, or come to agreement with `oracle`, start with one forked oracle run. Read its result. If it challenges the direction or leaves a material tradeoff, resume that same completed child once with a focused follow-up, then synthesize the parent decision. `resume` returns a new run id, but continues the same oracle session and inherited context. Do not force a second round for an explicit one-shot request, a trivial question, or a fully settled first answer.
+
+```typescript
+const first = await runs.run("oracle-consult", { agent: "oracle", task: "Review this plan and identify the strongest unresolved tradeoff." });
+const final = await runs.run("oracle-consult-follow-up", { resume: first.runId, task: "Address this focused question, then state the best recommendation: ..." });
+```
+
+The parent remains the final decision-maker. Oracle advice does not approve a direction or start implementation.
 
 The intended oracle loop is:
 1. the main agent forks to `oracle`

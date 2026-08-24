@@ -17,6 +17,7 @@ interface StartedRunMetadata {
 	runId: string;
 	pid?: number;
 	sessionId?: string;
+	completionOwnerId?: string;
 	mode?: SubagentRunMode;
 	agents?: string[];
 	chainStepCount?: number;
@@ -96,6 +97,7 @@ interface ResultChildOutcome {
 	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
+	contextOverflow?: boolean;
 }
 
 interface ResultRepairData {
@@ -162,6 +164,7 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			thinking,
 			attemptedModels: child?.attemptedModels ?? step.attemptedModels,
 			modelAttempts: child?.modelAttempts ?? step.modelAttempts,
+			contextOverflow: child?.contextOverflow ?? step.contextOverflow,
 		};
 	});
 	const terminalStatus: AsyncStatus = {
@@ -190,6 +193,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	return {
 		runId: startedRun.runId || path.basename(asyncDir),
 		...(startedRun.sessionId ? { sessionId: startedRun.sessionId } : {}),
+		...(startedRun.completionOwnerId ? { completionOwnerId: startedRun.completionOwnerId } : {}),
 		mode: startedRun.mode ?? "single",
 		state: "running",
 		pid: startedRun.pid,
@@ -244,6 +248,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			id: runId,
 			agent: resultAgent,
 			mode: status.mode,
+			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
 			success: false,
 			state: "failed",
 			summary: message,
@@ -255,6 +260,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 				model: step.model,
 				attemptedModels: step.attemptedModels,
 				modelAttempts: step.modelAttempts,
+				contextOverflow: step.contextOverflow,
 				sessionFile: step.sessionFile,
 			})),
 			exitCode: 1,

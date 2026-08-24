@@ -22,6 +22,7 @@ export interface ResolvedStepBehavior {
 	progress: boolean;
 	skills: string[] | false;
 	model?: string;
+	fast?: boolean;
 }
 
 export type OutputOverrideInput = string | boolean;
@@ -33,6 +34,7 @@ export interface StepOverrides {
 	progress?: boolean;
 	skills?: string[] | false;
 	model?: string;
+	fast?: boolean;
 }
 
 function normalizeOutputOverride(output: unknown): string | false | undefined {
@@ -60,6 +62,7 @@ export interface SequentialStep {
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fast?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
 	agentContract?: AgentContract;
@@ -84,6 +87,7 @@ export interface ParallelTaskItem {
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fast?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
 	agentContract?: AgentContract;
@@ -251,40 +255,41 @@ export function resolveStepBehavior(
 	// Output: step override > frontmatter > false (no output)
 	const stepOutput = normalizeOutputOverride(stepOverrides.output);
 	const output =
-		stepOutput !== undefined
-			? stepOutput
-			: normalizeOutputOverride(agentConfig.output) ?? false;
+		stepOutput === undefined
+			? normalizeOutputOverride(agentConfig.output) ?? false
+			: stepOutput;
 
 	// Reads: step override > frontmatter defaultReads > false (no reads)
 	const reads =
-		stepOverrides.reads !== undefined
-			? stepOverrides.reads
-			: agentConfig.defaultReads ?? false;
+		stepOverrides.reads === undefined
+			? agentConfig.defaultReads ?? false
+			: stepOverrides.reads;
 
 	// Progress: step override > frontmatter defaultProgress > false
 	const progress =
-		stepOverrides.progress !== undefined
-			? stepOverrides.progress
-			: agentConfig.defaultProgress ?? false;
+		stepOverrides.progress === undefined
+			? agentConfig.defaultProgress ?? false
+			: stepOverrides.progress;
 
 	let skills: string[] | false;
 	if (stepOverrides.skills === false) {
 		skills = false;
-	} else if (stepOverrides.skills !== undefined) {
-		skills = [...stepOverrides.skills];
+	} else if (stepOverrides.skills === undefined) {
+		skills = agentConfig.skills ? [...agentConfig.skills] : [];
 		if (chainSkills && chainSkills.length > 0) {
 			skills = [...new Set([...skills, ...chainSkills])];
 		}
 	} else {
-		skills = agentConfig.skills ? [...agentConfig.skills] : [];
+		skills = [...stepOverrides.skills];
 		if (chainSkills && chainSkills.length > 0) {
 			skills = [...new Set([...skills, ...chainSkills])];
 		}
 	}
 
-	const outputMode = stepOverrides.outputMode ?? "inline";
+	const outputMode = stepOverrides.outputMode ?? agentConfig.outputMode ?? "inline";
 	const model = stepOverrides.model ?? agentConfig.model;
-	return { output, outputMode, reads, progress, skills, model };
+	const fast = stepOverrides.fast ?? agentConfig.fast;
+	return { output, outputMode, reads, progress, skills, model, fast };
 }
 
 export function resolveTaskTextForFileUpdatePolicy(task: string | undefined, originalTask?: string): string | undefined {
@@ -441,31 +446,31 @@ export function resolveParallelBehaviors(
 
 		// Reads: task override > agent default > false
 		const reads =
-			task.reads !== undefined ? task.reads : config.defaultReads ?? false;
+			task.reads === undefined ? config.defaultReads ?? false : task.reads;
 
 		// Progress: task override > agent default > false
 		const progress =
-			task.progress !== undefined
-				? task.progress
-				: config.defaultProgress ?? false;
+			task.progress === undefined
+				? config.defaultProgress ?? false
+				: task.progress;
 
 		const taskSkillInput = normalizeSkillInput(task.skill);
 		let skills: string[] | false;
 		if (taskSkillInput === false) {
 			skills = false;
-		} else if (taskSkillInput !== undefined) {
-			skills = [...taskSkillInput];
+		} else if (taskSkillInput === undefined) {
+			skills = config.skills ? [...config.skills] : [];
 			if (chainSkills && chainSkills.length > 0) {
 				skills = [...new Set([...skills, ...chainSkills])];
 			}
 		} else {
-			skills = config.skills ? [...config.skills] : [];
+			skills = [...taskSkillInput];
 			if (chainSkills && chainSkills.length > 0) {
 				skills = [...new Set([...skills, ...chainSkills])];
 			}
 		}
 
-		const outputMode = task.outputMode ?? "inline";
+		const outputMode = task.outputMode ?? config.outputMode ?? "inline";
 		const model = task.model ?? config.model;
 		return { output, outputMode, reads, progress, skills, model };
 	});

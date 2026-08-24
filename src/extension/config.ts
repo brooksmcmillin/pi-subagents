@@ -6,6 +6,7 @@ import { FLEET_KEYBINDING_ACTIONS, type ArtifactDirPreference, type ExtensionCon
 import { validateMissionStoreConfig } from "../missions/store.ts";
 import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
+import { DEFAULT_MODEL_EXCLUSION_TTL_MS, MAX_MODEL_EXCLUSION_TTL_MS, setDefaultTTL } from "../runs/shared/model-exclusions.ts";
 import { validatePermissionConfig } from "../runs/shared/permissions.ts";
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
@@ -62,6 +63,17 @@ function validateArtifactConfig(value: unknown): void {
 	}
 }
 
+/** Validate the user-controlled TTL policy before it reaches the exclusion store. */
+// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
+function validateModelExclusionsConfig(value: unknown): void {
+	if (value === undefined) return;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.modelExclusions must be a JSON object");
+	const defaultTtlMs = (value as Record<string, unknown>).defaultTtlMs;
+	if (defaultTtlMs !== undefined && (typeof defaultTtlMs !== "number" || !Number.isFinite(defaultTtlMs) || defaultTtlMs <= 0 || defaultTtlMs > MAX_MODEL_EXCLUSION_TTL_MS)) {
+		throw new Error(`config.modelExclusions.defaultTtlMs must be a finite positive number no greater than ${MAX_MODEL_EXCLUSION_TTL_MS}`);
+	}
+}
+
 function validateOrcaProgressTabsConfig(value: unknown): void {
 	if (value === undefined) return;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.orcaProgressTabs must be a JSON object");
@@ -110,12 +122,16 @@ function validateConfig(config: Record<string, unknown>): void {
 			|| config.maxActiveAsyncRunsPerSession < 0)) {
 		throw new Error("config.maxActiveAsyncRunsPerSession must be a non-negative integer");
 	}
+	if (config.resultScanLogging !== undefined && config.resultScanLogging !== "all" && config.resultScanLogging !== "activity" && config.resultScanLogging !== "off") {
+		throw new Error('config.resultScanLogging must be "all", "activity", or "off"');
+	}
 	validateMissionStoreConfig(config.missions);
 	validateAuthorityPolicy(config.authorityPolicy);
 	validatePermissionConfig(config.permissions);
 	validateScheduledRunsConfig(config.scheduledRuns);
 	validateFleetKeybindingsConfig(config.fleetKeybindings);
 	validateArtifactConfig(config.artifactConfig);
+	validateModelExclusionsConfig(config.modelExclusions);
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
 }
@@ -126,7 +142,12 @@ export function getConfigPath(): string {
 
 function readConfigForUpdate(configPath = getConfigPath()): ExtensionConfig {
 	if (!fs.existsSync(configPath)) return {};
-	const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
+	} catch (error) {
+		throw new Error(`Failed to parse subagent config at '${configPath}': ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Subagent config at '${configPath}' must be a JSON object`);
 	}
@@ -145,6 +166,28 @@ export function updateConfig(updater: (config: ExtensionConfig) => ExtensionConf
 	validateConfig(next as Record<string, unknown>);
 	saveConfig(next, configPath);
 	return next;
+}
+
+/**
+ * Resolve the default TTL that the process-wide exclusion store should use.
+ *
+ * @param config Extension configuration after validation.
+ * @returns The configured TTL in milliseconds, or the built-in 24-hour default.
+ */
+// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
+export function resolveModelExclusionTTL(config: Pick<ExtensionConfig, "modelExclusions">): number {
+	return config.modelExclusions?.defaultTtlMs ?? DEFAULT_MODEL_EXCLUSION_TTL_MS;
+}
+
+/**
+ * Apply the configured exclusion policy to the process-wide model store.
+ *
+ * @param config Extension configuration after validation.
+ * @returns Nothing.
+ */
+// TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
+export function applyModelExclusionsConfig(config: Pick<ExtensionConfig, "modelExclusions">): void {
+	setDefaultTTL(resolveModelExclusionTTL(config), { shortenExisting: config.modelExclusions?.defaultTtlMs !== undefined });
 }
 
 export function resolveAsyncByDefault(config: Pick<ExtensionConfig, "asyncByDefault">): boolean {

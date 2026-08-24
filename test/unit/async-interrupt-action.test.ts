@@ -4,10 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { acquireActiveAsyncCapacity } from "../../src/runs/background/active-async-capacity.ts";
-import { consumeSteerRequests, consumeSteerRequestsFromDir, stepSteerInboxDir, writeSteerAck } from "../../src/runs/background/control-channel.ts";
+import { consumeSteerRequests, consumeSteerRequestsFromDir, consumeStopRequestPayload, stepSteerInboxDir, writeSteerAck } from "../../src/runs/background/control-channel.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
+import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import { steerWorkflowForegroundTarget, workflowForegroundSteeringDir } from "../../src/runs/foreground/workflow-foreground-steering.ts";
 import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
 import { ASYNC_DIR, RESULTS_DIR, type SubagentState } from "../../src/shared/types.ts";
@@ -260,6 +261,30 @@ describe("async interrupt action", () => {
 			controller.abort();
 			assert.equal((await action).state, "queued");
 			assert.equal(fs.existsSync(path.join(childDir, "control", "steer-recovery")), false);
+		} finally {
+			cleanup(workflowRunId, workflowDir);
+			cleanup(childRunId, childDir);
+		}
+	});
+
+	it("rejects workflow-key steering for a one-shot external CLI child", async () => {
+		const state = createState();
+		const workflowRunId = `workflow-key-external-${Date.now().toString(36)}`;
+		const childRunId = `${workflowRunId}-child`;
+		const workflowDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		const childDir = createRunningAsync(state, childRunId, { track: false });
+		const workflowStatus = JSON.parse(fs.readFileSync(path.join(workflowDir, "status.json"), "utf-8"));
+		workflowStatus.steps = [{ agent: "external", status: "running", workflowKey: "external", runId: childRunId, async: true }];
+		writeJson(path.join(workflowDir, "status.json"), workflowStatus);
+		const childStatus = JSON.parse(fs.readFileSync(path.join(childDir, "status.json"), "utf-8"));
+		childStatus.pid = process.pid;
+		childStatus.steps[0].runner = resolveExternalCliRunnerStatus({ command: "review-cli" });
+		writeJson(path.join(childDir, "status.json"), childStatus);
+		try {
+			const result = await steerWorkflowChildByKey({ state, workflowRunId, key: "external", message: "Do not deliver.", options: { ackTimeoutMs: 20 } });
+			assert.equal(result.state, "failed");
+			assert.match(result.error ?? "", /External adapter 'external-cli' does not support runs\.steer/);
+			assert.equal(consumeSteerRequests(childDir).length, 0);
 		} finally {
 			cleanup(workflowRunId, workflowDir);
 			cleanup(childRunId, childDir);
@@ -546,6 +571,44 @@ describe("async interrupt action", () => {
 		}
 	});
 
+	it("rejects runs.steer for the one-shot external CLI with its adapter reason", async () => {
+		const state = createState();
+		const runId = `steer-external-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false });
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { steps: Array<Record<string, unknown>> };
+		status.steps[0]!.runner = resolveExternalCliRunnerStatus({ command: "review-cli" });
+		writeJson(statusPath, status);
+		try {
+			const result = await executorWithKill(state, () => true)
+				.execute("steer", { action: "steer", id: runId, message: "Do not deliver" }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, true);
+			assert.match(text(result), /External adapter 'external-cli' does not support runs\.steer: The one-shot stdin adapter closes input/);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "steer-requests")), false);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("rejects runs.steer for an old persisted external CLI status shape", async () => {
+		const state = createState();
+		const runId = `steer-old-external-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false });
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { steps: Array<Record<string, unknown>> };
+		status.steps[0]!.runner = { type: "external-cli", command: "review-cli", args: [], promptDelivery: "stdin", capabilities: { stop: true, steer: false, resume: false, structuredOutput: false, toolEvents: false } };
+		writeJson(statusPath, status);
+		try {
+			const result = await executorWithKill(state, () => true)
+				.execute("steer", { action: "steer", id: runId, message: "Do not deliver" }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, true);
+			assert.match(text(result), /External adapter 'external-cli' does not support runs\.steer/);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "steer-requests")), false);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
 	it("requests an interrupt without signaling a running async runner", async () => {
 		const state = createState();
 		const runId = `interrupt-disk-${Date.now().toString(36)}`;
@@ -624,8 +687,39 @@ describe("async interrupt action", () => {
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), new RegExp(`Stop requested for async run ${runId}`));
-			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop.json")), true);
+			assert.equal(consumeStopRequestPayload(asyncDir)?.type, "stop");
 			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("writes child-scoped stop requests for a running async run", async () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-child-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false, sessionId: "session" });
+		try {
+			const statusPath = path.join(asyncDir, "status.json");
+			writeJson(statusPath, {
+				...JSON.parse(fs.readFileSync(statusPath, "utf-8")),
+				steps: [
+					{ agent: "first", status: "running", runId: "child-a", startedAt: 100 },
+					{ agent: "second", status: "running", workflowKey: "review", startedAt: 100 },
+				],
+			});
+
+			const result = await executorWithKill(state, () => true)
+				.execute("stop-child", { action: "stop", id: runId, childId: "review" }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, undefined);
+			assert.match(text(result), /Stop requested for child review/);
+			const request = consumeStopRequestPayload(asyncDir);
+			assert.equal(request?.type, "stop");
+			assert.equal(request?.source, "stop-action");
+			assert.equal(request?.targetIndex, 1);
+			assert.equal(request?.childId, "review");
+			assert.equal(typeof request?.ts, "number");
 		} finally {
 			cleanup(runId, asyncDir);
 		}
@@ -824,7 +918,7 @@ describe("async interrupt action", () => {
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), new RegExp(`Stop requested for async run ${runId}`));
-			assert.equal(fs.existsSync(path.join(asyncDir, "control", "stop.json")), true);
+			assert.equal(consumeStopRequestPayload(asyncDir)?.type, "stop");
 		} finally {
 			cleanup(runId, asyncDir);
 		}

@@ -4,7 +4,7 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 
 ## Execution examples
 
-Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for sequential steps and `runs.all(...)` for parallel fanout. Legacy top-level `chain`, `tasks`, and `parallel` inputs are not supported. Helper functions must be plain functions or explicit Promise chains. Nested `async function` helpers, async arrows, and async methods are rejected so child-launch tracking stays portable across Node and Bun.
+Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for sequential steps and `await runs.all([{ key, agent, task }, ...])` for ordinary parallel fanout. `runs.all` resolves to an ordered array, not a key map, so use indexes, destructuring, or `.map(...)`, not `results.<key>`. Do not read `.output` from an unawaited `runs.run` launch. Stored `runs.run` promises are only for the advanced rolling fanout pattern under [Workflow steering](#workflow-steering), where every promise is later observed with direct `await`, `Promise.race`, or `Promise.all`. Legacy top-level `chain`, `tasks`, and `parallel` inputs are not supported. Helper functions must be plain functions or explicit Promise chains. Nested `async function` helpers, async arrows, and async methods are rejected so child-launch tracking stays portable across Node and Bun.
 
 ```js
 // One child; return the child promise explicitly
@@ -31,19 +31,19 @@ Chaining is code-driven through `workflowScript`. Use `await runs.run(...)` for 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `agent` | string | - | Agent target for management actions. Workflow child agents are set inside `runs.run` or `runs.all`. |
-| `action` | string | - | Agent management (including `guide`, `children.list`, and `refine`/`refine.show`/`refine.rollback`), mission (`mission.create/list/show/update/resolve-decision/attach-run/close`), Herdr inspector (`inspector.open/status/close`), status/control, schedule, watchdog, or doctor action. |
+| `action` | string | - | Agent management (including `guide`, `children.list`, and `refine`/`refine.show`/`refine.rollback`), mission (`mission.create/list/show/update/resolve-decision/attach-run/close`), Herdr inspector (`inspector.open/status/close`), Herdr project pane (`project.open/status/close`), status/control, schedule, watchdog, or doctor action. |
 | `topic` | `overview \| workflows \| agents \| missions \| observability \| tool-reference \| configuration \| models \| watchdog \| extension-api` | `overview` | Packaged guide topic for `action: "guide"`. |
 | `config` | object/string | - | Agent config for management create/update. |
 | `context` | `fresh \| fork` | global or per-agent default, else `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, [`defaultSubagentContext`](configuration.md#defaultsubagentcontext) wins over each agent's `defaultContext`; `"fork"` creates a real branched session when the parent session file and current leaf exist, otherwise it falls back to `fresh`. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
 | `missionId` | string | - | Attach a workflow to an existing project mission instead of creating its default enclosing mission. |
 | `mission` | object/false | auto-create | Override the default enclosing mission with `{ title \| summary, objective?, goal?, budget?, labels? }`. Set exactly one non-empty `title` or `summary`; `objective` and `labels` are optional. `goal` may only be `true`, requires `budget.tokens`, and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
 | `handoffPath` | string | - | Aggregate handoff manifest required by `action: "worktree.discard"`. |
-| `focus` | boolean | true | Focus the newly split pane for `action: "inspector.open"` or `action: "project.open"`; not a standalone action. |
+| `focus` | boolean | false | Focus the newly split pane for `action: "inspector.open"` or `action: "project.open"`; not a standalone action. Panes open in the background unless you set `focus: true`. Existing saved project panes can be focused through the public project-pane API when Herdr reports a tab or workspace id. |
 | `view` | `fleet \| transcript` | - | Optional `status` view for the active fleet surface or transcript tail inspection. |
 | `lines` | number | `80` | Maximum transcript lines for `action: "status", view: "transcript"`; capped at 500. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
 | `async` | boolean | default-on | Background execution. Workflows default to background. `async:false` blocks the parent until completion. |
-| `chatProgress` | `auto \| off \| live-card` | `auto` | WorkflowScript chat projection. `auto` renders a live in-chat card only for watched foreground workflows in the same Git repository, including managed worktrees; it is off otherwise. Explicit `live-card` requires `async:false` and the same Git repository. |
+| `chatProgress` | `auto \| off \| live-card` | `auto` | WorkflowScript chat projection. `auto` renders a live in-chat card only for watched foreground workflows in the same Git repository, including managed worktrees; it is off otherwise. Explicit `live-card` requires `async:false` and the same Git repository. Async workflows have no inline live card, so omit `chatProgress` or use `auto`/`off`; use `async:false` only when the parent must block. |
 | `isolation` | `none \| worktree` | - | Workflow child isolation. `none` runs in the shared cwd and does not need Git. `worktree` requires a managed Git worktree. Do not combine it with a contradictory `worktree` value. |
 | `timeoutMs` / `maxRuntimeMs` | number | config `timeoutMs`, else 30 min foreground / single-agent async | Optional run-level max runtime in milliseconds. When omitted, the global [`timeoutMs`](configuration.md#timeoutms) config provides the default; absent that, foreground and plain single-agent async runs fall back to 30 minutes, while composite async runs (chains, parallel tasks, workflows) stay unbounded at the top level. |
 | `toolTimeoutMs` | number | fast-tool default | Optional positive hard per-tool-call deadline in milliseconds. Precedence: call value → agent frontmatter → config → `PI_SUBAGENT_TOOL_TIMEOUT_MS`. The timer starts on `tool_execution_start`, clears on the matching `tool_execution_end`, and terminates the run with `timedOut: true` if the tool remains open. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It never extends the run deadline; `contact_supervisor`, `intercom`, and `subagent_wait` are exempt. |
@@ -79,7 +79,7 @@ In workflow runs that omit `context`, each `runs.run` child follows the global `
 
 The workflow trace records the attempt and receipt. Always await, return, or include the promise in an awaited standard Promise combinator. Unawaited steering calls reject workflow completion after the side effect settles. `Promise.race` remains the rolling primitive. This slice reuses the foreground and async steering transports and disables steering recovery.
 
-For rolling fanout, keep the launched `runs.run` promises in ordinary JavaScript data. `Promise.race` gives the next completed child, `runs.steer` can challenge a still-running keyed sibling, and `Promise.all` collects the rest. No separate `runs.start`, `runs.next`, or `runs.collect` API is exposed.
+For advanced rolling fanout, keep the launched `runs.run` promises in ordinary JavaScript data only when every promise is later observed with direct `await`, `Promise.race`, or `Promise.all`. `Promise.race` gives the next completed child, `runs.steer` can challenge a still-running keyed sibling, and `Promise.all` collects the rest. No separate `runs.start`, `runs.next`, or `runs.collect` API is exposed.
 
 ```js
 { workflowScript: `
@@ -228,6 +228,7 @@ subagent({ action: "doctor" })
 
 - Multi-child async runs and remembered foreground single, parallel, or chain runs can be revived by passing `index` to choose the child.
 - Nested runs can be resumed by nested id when their live route or persisted nested session metadata is available.
+- Completed external-job runs can use the same `resume` action as a provider follow-up when the registered provider exposes `followUp(input)`. Running external-job parents fail closed with guidance to wait for completion. Unsupported providers fail with an update/reload message.
 - Revive starts a new child process from the old session context; it does not restart the same OS process, and it requires the chosen child to have a persisted `.jsonl` session file.
 - Direct revival takes an exclusive cross-process lease on the canonical session file until the new child finishes. A concurrent attempt fails before Pi is spawned and identifies the owning revived run; dead-owner leases are reclaimed only when staleness can be proved.
 
@@ -319,6 +320,20 @@ The parser canonicalizes known enum synonyms, snake_case report keys and wrapper
 
 Acceptance fences are removed from normal output artifacts, while the raw child transcript remains intact and per-child metadata stores the complete acceptance ledger and parsed report. Explicit failed gates fail the run. Inferred gates remain observable without failing the run.
 
+## Herdr project panes
+
+Herdr project panes are peer Pi sessions opened by this Pi session:
+
+```ts
+subagent({ action: "project.open", cwd: "/path/to/repo", message: "Start in this project." })
+subagent({ action: "project.status", cwd: "/path/to/repo" })
+subagent({ action: "project.close", cwd: "/path/to/repo" })
+```
+
+The saved pane binding is pane-level only. The parent can refresh status, focus the saved pane when Herdr reports a tab or workspace id, or close it after Herdr verifies ownership and `agent_status: "idle"`. It cannot inspect, steer, or stop subagents inside that peer session. Stale or opaque Herdr metadata stays unknown and fails closed.
+
+Inline status counts active current-session work and Herdr project panes. Use Herdr itself or the project-pane API to focus or close project panes.
+
 ## Orca progress tabs (experimental observer)
 
 Orca progress tabs are a global, opt-in observer, not an agent runner. Enable them in the extension config:
@@ -327,11 +342,11 @@ Orca progress tabs are a global, opt-in observer, not an agent runner. Enable th
 { "orcaProgressTabs": { "enabled": true } }
 ```
 
-Every foreground or background child keeps running through its normal native Pi or `external-cli` path. For each logical child, the observer asks Orca to create a background terminal tab in that child's current worktree and mirrors progress into it. Titles receive a persistent worktree-local sequence number, including across separate workflow calls. Creates for the same worktree are serialized in that sequence so tabs appear to the right in order (`1`, then `2`, then `3`) instead of racing. Model/startup retries reuse the same tab. Parallel and chain children each receive their own tab; attaching an already-running async root does not create a duplicate. Terminal control sequences are removed at the viewer sink across read boundaries. Each mirror is capped at 1 MiB and truncates when the cap or stream backpressure is reached. After the child finishes, its viewer returns to the terminal shell instead of ending the terminal session, so the tab and scrollback remain until the user closes them. Successful native Pi children with a known session append a safely quoted removal command for the exact verified session path; unsuccessful and sessionless children append only their terminal status.
+Foreground and background children keep running through their normal native Pi or `external-cli` path. For each top-level subagent call, the observer asks Orca to create one background terminal tab in the owning worktree and mirrors progress into it. Parallel and chain children share that tab and are separated by child headers. Titles receive a persistent worktree-local sequence number, including across separate workflow calls. Creates for the same worktree are serialized in that sequence so tabs appear to the right in order (`1`, then `2`, then `3`) instead of racing. Model/startup retries reuse the same observer. Attaching an already-running async root does not create a duplicate child tab. Terminal control sequences are removed at the viewer sink across read boundaries. Each mirror is capped at 1 MiB and truncates when the cap or stream backpressure is reached. After the run finishes, its viewer returns to the terminal shell instead of ending the terminal session, so the tab and scrollback remain until the user closes them. Successful native Pi runs with a known session append a safely quoted removal command for the exact verified session path; unsuccessful and sessionless runs append only their terminal status.
 
-The observer supports macOS and Linux and is disabled on Windows. It requires executable `orca` on `PATH` (or `PI_SUBAGENT_ORCA_BINARY`) and a running Orca runtime that recognizes the child cwd. Availability and tab creation are best-effort: failures never fail, stop, or delay the subagent. Set `orcaProgressTabs.enabled` to `false` to guarantee that no Orca command or tab is created.
+The observer supports macOS and Linux and is disabled on Windows. It requires executable `orca` on `PATH` (or `PI_SUBAGENT_ORCA_BINARY`) and a running Orca runtime that recognizes the cwd. Availability and tab creation are best-effort: failures never fail, stop, or delay the subagent. When possible, the observer writes a passive manifest under `<worktree>/.pi/subagents/views/orca/`; the manifest is display metadata only, not a lifecycle or control source. Set `orcaProgressTabs.enabled` to `false` to guarantee that no Orca command or tab is created.
 
-Agent profile `runner.type` supports native Pi (the default), `external-cli`, and `external-job`. Orca is intentionally not a profile runner and does not own subagent execution, completion, cancellation, artifacts, or result delivery.
+Agent profile `runner.type` supports native Pi (the default), `external-cli`, and `external-job`. Orca is intentionally not a profile runner and does not own subagent execution, completion, cancellation, artifacts, or result delivery. External-job providers can optionally expose `followUp(input)` so a completed provider job can continue its parent conversation through `subagent({ action: "resume", id: "<run>", message: "..." })`.
 
 ## External CLI agent profiles
 

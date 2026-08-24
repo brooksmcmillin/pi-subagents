@@ -140,10 +140,12 @@ function getPropertySchema(schema: JsonSchemaNode | undefined, path: string[]): 
 
 let schemas: Record<string, JsonSchemaNode> = {};
 let SubagentParams: SubagentParamsSchema | undefined;
+let SubagentWaitParams: JsonSchemaNode | undefined;
 let schemasAvailable = true;
 try {
 	schemas = await import("../../src/extension/schemas.ts") as Record<string, JsonSchemaNode>;
 	SubagentParams = schemas.SubagentParams as SubagentParamsSchema;
+	SubagentWaitParams = schemas.SubagentWaitParams as JsonSchemaNode;
 } catch (error) {
 	if (missingPackageName(error) !== "typebox") throw error;
 	schemasAvailable = false;
@@ -162,10 +164,12 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const contextSchema = SubagentParams?.properties?.context;
 		assert.ok(contextSchema, "context schema should exist");
 		assert.equal(contextSchema.type, "string");
-		assert.deepEqual(contextSchema.enum, ["fresh", "fork"]);
+		assert.deepEqual(contextSchema.enum, ["fresh", "fork", "profile"]);
 		const description = String(contextSchema.description ?? "");
 		assert.match(description, /fresh/);
 		assert.match(description, /fork/);
+		assert.match(description, /profile/);
+		assert.match(description, /declared defaultContext/);
 		assert.match(description, /defaultSubagentContext wins over each agent defaultContext/);
 		assert.match(description, /overrides every child/);
 		assert.match(description, /implicit fork/);
@@ -177,6 +181,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(workflowScript?.type, "string");
 		assert.equal(workflowScript?.minLength, 1);
 		assert.match(String(workflowScript?.description ?? ""), /runs\.run/);
+		assert.match(String(workflowScript?.description ?? ""), /await runs\.all\(\[\{key, agent, task\}, \.\.\.\]\)/);
+		assert.match(String(workflowScript?.description ?? ""), /do not read \.output from unawaited runs\.run launches/i);
+		assert.match(String(workflowScript?.description ?? ""), /advanced rolling fanout/);
 		assert.match(String(workflowScript?.description ?? ""), /sequential and parallel phases dynamically/i);
 		assert.match(String(workflowScript?.description ?? ""), /worktree:true/i);
 		assert.match(String(workflowScript?.description ?? ""), /no filesystem, shell, Pi tools, or host globals/i);
@@ -184,6 +191,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(chatProgress?.type, "string");
 		assert.deepEqual(chatProgress?.enum, ["auto", "off", "live-card"]);
 		assert.match(String(chatProgress?.description ?? ""), /same Git repository/i);
+		assert.match(String(chatProgress?.description ?? ""), /async:false/);
+		assert.match(String(chatProgress?.description ?? ""), /omit chatProgress or use auto\/off/);
 		const worktree = SubagentParams?.properties?.worktree;
 		assert.equal(worktree?.type, "boolean");
 		assert.match(String(worktree?.description ?? ""), /each workflow child/i);
@@ -314,6 +323,14 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(controlSchema.properties?.failedToolAttemptsBeforeAttention?.minimum, 1);
 		assert.deepEqual(controlSchema.properties?.notifyOn?.items?.enum, ["active_long_running", "needs_attention"]);
 		assert.deepEqual(controlSchema.properties?.notifyChannels?.items?.enum, ["event", "async", "intercom"]);
+	});
+
+	it("exposes tolerant wait mode on subagent_wait", () => {
+		const properties = SubagentWaitParams?.properties as Record<string, JsonSchemaNode> | undefined;
+		const stopOnAttention = properties?.stopOnAttention;
+		assert.ok(stopOnAttention, "stopOnAttention schema should exist");
+		assert.equal(stopOnAttention.type, "boolean");
+		assert.match(String(stopOnAttention.description ?? ""), /idle or long-thinking attention/);
 	});
 
 	it("does not emit description-only schema nodes", () => {

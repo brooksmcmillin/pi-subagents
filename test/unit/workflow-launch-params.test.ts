@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { compactSuccessfulFileOnlyWorkflowResult, prepareWorkflowLaunchParams, workflowChildResults } from "../../src/runs/foreground/subagent-executor.ts";
+import {
+	compactSuccessfulFileOnlyWorkflowResult,
+	prepareWorkflowLaunchParams,
+	sanitizeRunPathSegment,
+	workflowChildResults,
+} from "../../src/runs/foreground/subagent-executor.ts";
 import type { SingleResult } from "../../src/shared/types.ts";
 
 describe("workflow launch params", () => {
@@ -151,6 +156,58 @@ describe("workflow launch params", () => {
 		);
 	});
 
+	it("runs omitted external workflow children async while preserving awaited semantics", () => {
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{},
+				{ agent: "gpt-pro", task: "Check weather" },
+				"workflow-run",
+				"weather",
+				{ externalAsyncRequired: true },
+			),
+			{
+				agent: "gpt-pro",
+				task: "Check weather",
+				async: true,
+				workflowAwaitAsync: true,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "weather",
+			},
+		);
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{},
+				{ agent: "gpt-pro", task: "Check weather", async: true },
+				"workflow-run",
+				"weather",
+				{ externalAsyncRequired: true },
+			),
+			{
+				agent: "gpt-pro",
+				task: "Check weather",
+				async: true,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "weather",
+			},
+		);
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{},
+				{ agent: "gpt-pro", task: "Check weather", async: false },
+				"workflow-run",
+				"weather",
+				{ externalAsyncRequired: true },
+			),
+			{
+				agent: "gpt-pro",
+				task: "Check weather",
+				async: false,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "weather",
+			},
+		);
+	});
+
 	it("keeps a bridge override scoped to the target workflow child", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
@@ -169,6 +226,13 @@ describe("workflow launch params", () => {
 			},
 		);
 		assert.equal(prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "sibling").intercomBridge, undefined);
+	});
+
+	it("canonicalizes child extension bindings without leaking them to siblings", () => {
+		const bindings = { "shepherd.dispatch/1": { writeScope: ["src/a.ts"], role: "coder" } };
+		const child = prepareWorkflowLaunchParams({ extensionBindings: { "defaults.policy/1": true } }, { agent: "worker", task: "Run", extensionBindings: bindings }, "workflow-run", "bound");
+		assert.deepEqual(child.extensionBindings, bindings);
+		assert.equal(prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "plain").extensionBindings, undefined);
 	});
 
 	it("keeps managed worktree children on the single-run contract", () => {
@@ -269,6 +333,15 @@ describe("workflow launch params", () => {
 		);
 	});
 
+	it("rejects extension binding amendments on retained resume items", () => {
+		assert.throws(() => prepareWorkflowLaunchParams(
+			{ extensionBindings: { "defaults.policy/1": true } },
+			{ resume: "retained-run", task: "Continue" },
+			"workflow-run",
+			"continue",
+		), /original retained child binding/);
+	});
+
 	it("preserves execution limits and fan-out identity when routing retained resume items", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
@@ -297,5 +370,27 @@ describe("workflow launch params", () => {
 				toolBudget: { soft: 2, hard: 4, block: "*" },
 			},
 		);
+	});
+
+	describe("sanitizeRunPathSegment", () => {
+		it("replaces Windows-invalid characters and trims separators", () => {
+			assert.equal(sanitizeRunPathSegment("call_VfdHQygxGeL1L49ez04A4tf7|WtnJ9gVpB/jdQGWbnKhfMgDqPGUGmNw"), "call_VfdHQygxGeL1L49ez04A4tf7_WtnJ9gVpB_jdQGWbnKhfMgDqPGUGmNw");
+			assert.equal(sanitizeRunPathSegment(":::path//sub?*<file>|name:::"), "path_sub_file_name");
+			assert.equal(sanitizeRunPathSegment("   ___invalid___   "), "invalid");
+		});
+
+		it("falls back to unknown for empty or all-invalid strings", () => {
+			assert.equal(sanitizeRunPathSegment(""), "unknown");
+			assert.equal(sanitizeRunPathSegment("   "), "unknown");
+			assert.equal(sanitizeRunPathSegment("???///|||"), "unknown");
+		});
+
+		it("bounds oversized segments to the maximum byte length", () => {
+			const longId = "a".repeat(200);
+			const sanitized = sanitizeRunPathSegment(longId, 120);
+			assert.equal(sanitized.length, 120);
+			assert.equal(Buffer.byteLength(sanitized, "utf-8"), 120);
+			assert.equal(sanitized, "a".repeat(120));
+		});
 	});
 });

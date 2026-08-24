@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type EditorComponent, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { snapshotExternalRuns } from "../api/external-runs.ts";
 import { formatModelThinking } from "../shared/formatters.ts";
-import type { AsyncJobStep, FleetViewPlacement, NestedRunSummary, NestedStepSummary, SubagentState } from "../shared/types.ts";
+import type { AsyncJobState, AsyncJobStep, FleetViewPlacement, HerdrProjectPaneSnapshot, NestedRunSummary, NestedStepSummary, SubagentState } from "../shared/types.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 
 export const FLEET_STATUS_WIDGET_KEY = "subagent-fleet-status";
@@ -17,6 +17,7 @@ type FleetStatusTui = {
 };
 type FleetStatusEntry = {
 	key: string;
+	surface?: "project-pane";
 	parentKey?: string;
 	workflowWrapper?: boolean;
 	agent: string;
@@ -26,7 +27,19 @@ type FleetStatusEntry = {
 	tokens: number;
 	state: string;
 	external?: true;
+	projectPane?: HerdrProjectPaneSnapshot;
 	nestedChildren?: NestedRunSummary[];
+	workflowRows?: FleetWorkflowRow[];
+};
+
+type FleetWorkflowRow = {
+	name: string;
+	state: AsyncJobStep["status"];
+	modelThinking?: string;
+	activity?: string;
+	startedAt?: number;
+	tokens?: number;
+	overflow?: number;
 };
 
 type FleetNestedRow = {
@@ -42,6 +55,7 @@ type FleetNestedRow = {
 type FleetTreeRow =
 	| { kind: "owner"; entry: FleetStatusEntry }
 	| { kind: "child"; entry: FleetStatusEntry; last: boolean }
+	| { kind: "workflow"; ownerKey: string; row: FleetWorkflowRow; last: boolean }
 	| { kind: "nested"; ownerKey: string; row: FleetNestedRow; last: boolean };
 
 export interface FleetStatusOptions {
@@ -90,6 +104,51 @@ function nestedActivity(node: NestedRunSummary | NestedStepSummary): string | un
 	if (node.activityState === "needs_attention") return "needs attention";
 	if (node.activityState === "active_long_running") return "long-running";
 	return undefined;
+}
+
+function workflowStepActivity(step: AsyncJobStep): string | undefined {
+	if (step.currentTool) return `tool ${step.currentTool}`;
+	if (step.currentPath) return step.currentPath.split(/[\\/]/).at(-1);
+	if (step.activityState === "needs_attention") return "needs attention";
+	if (step.activityState === "active_long_running") return "long-running";
+	if (step.turnCount !== undefined) return `${step.turnCount} turns`;
+	if (step.toolCount !== undefined) return `${step.toolCount} tools`;
+	return undefined;
+}
+
+function workflowStepName(step: AsyncJobStep, index: number): string {
+	const key = step.workflowKey ?? `step ${index + 1}`;
+	const label = step.label && step.label !== key ? ` · ${step.label}` : "";
+	const phase = step.phase ? `${step.phase}: ` : "";
+	return `${phase}${key}${label} (${step.agent})`;
+}
+
+function workflowFleetRows(steps: AsyncJobStep[] | undefined): FleetWorkflowRow[] {
+	return (steps ?? []).map((step, index) => {
+		const modelThinking = formatModelThinking(step.model, step.thinking) || undefined;
+		const activity = workflowStepActivity(step);
+		return {
+			name: workflowStepName(step, index),
+			state: step.status,
+			...(modelThinking ? { modelThinking } : {}),
+			...(activity ? { activity } : {}),
+			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
+			...(step.tokens?.total !== undefined ? { tokens: step.tokens.total } : {}),
+		};
+	});
+}
+
+function visibleWorkflowRows(rows: FleetWorkflowRow[] | undefined, visibleLimit: number): FleetWorkflowRow[] {
+	if (!rows?.length) return [];
+	if (rows.length <= visibleLimit) return rows;
+	const selected = new Set<number>();
+	for (const [index, row] of rows.entries()) {
+		if (row.state !== "complete" && row.state !== "completed") selected.add(index);
+		if (selected.size >= visibleLimit) break;
+	}
+	for (let index = rows.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
+	const visible = [...selected].sort((left, right) => left - right).map((index) => rows[index]!);
+	return [{ name: `… +${rows.length - visible.length} hidden workflow steps`, state: "complete", overflow: rows.length - visible.length }, ...visible];
 }
 
 function nestedStatusGlyph(state: FleetNestedRow["state"], theme: Theme): string {
@@ -194,9 +253,10 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 		if (entry.parentKey && entryKeys.has(entry.parentKey)) continue;
 		rows.push({ kind: "owner", entry });
 		const attached = childrenByParent.get(entry.key) ?? [];
+		const workflowRows = visibleWorkflowRows(entry.workflowRows, attached.length > 0 ? 2 : 4);
 		for (const [index, child] of attached.entries()) {
 			const nested = nestedFleetRows(child.nestedChildren, 3);
-			const laterRows = index < attached.length - 1 || Boolean(entry.nestedChildren?.length);
+			const laterRows = index < attached.length - 1 || workflowRows.length > 0 || Boolean(entry.nestedChildren?.length);
 			rows.push({ kind: "child", entry: child, last: !laterRows && nested.length === 0 });
 			for (const [nestedIndex, row] of nested.entries()) rows.push({
 				kind: "nested",
@@ -205,6 +265,7 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 				last: nestedIndex === nested.length - 1 && !laterRows,
 			});
 		}
+		for (const [index, row] of workflowRows.entries()) rows.push({ kind: "workflow", ownerKey: entry.key, row, last: index === workflowRows.length - 1 && !entry.nestedChildren?.length });
 		const nested = nestedFleetRows(entry.nestedChildren, attached.length > 0 ? 3 : 4);
 		for (const [index, row] of nested.entries()) rows.push({ kind: "nested", ownerKey: entry.key, row, last: index === nested.length - 1 });
 	}
@@ -225,7 +286,32 @@ function foregroundDescription(control: { parentWorkflowRunId?: string; workflow
 }
 
 function activeLeafAgentCount(entries: FleetStatusEntry[]): number {
-	return entries.filter((entry) => !entry.workflowWrapper).length;
+	return entries.filter((entry) => !entry.workflowWrapper && !entry.surface).length;
+}
+
+function projectPaneNeedsAttention(pane: HerdrProjectPaneSnapshot): boolean {
+	return ["attention", "blocked", "paused", "failed", "error"].some((status) => pane.agentStatus.includes(status))
+		|| pane.summary?.includes("⚠") === true;
+}
+
+function projectName(projectRoot: string): string {
+	return projectRoot.split(/[\\/]/).filter(Boolean).at(-1) ?? projectRoot;
+}
+
+function projectPaneEntries(state: SubagentState): FleetStatusEntry[] {
+	return [...(state.herdrProjectPanes?.values() ?? [])]
+		.filter((pane) => pane.state === "open")
+		.sort((left, right) => left.openedAt.localeCompare(right.openedAt) || left.projectRoot.localeCompare(right.projectRoot))
+		.map((pane) => ({
+			key: `project-pane:${pane.projectRoot}`,
+			surface: "project-pane" as const,
+			agent: `${projectName(pane.projectRoot)} · ${pane.paneId}`,
+			description: pane.summary,
+			startedAt: Date.parse(pane.openedAt) || pane.refreshedAt,
+			tokens: 0,
+			state: pane.agentStatus || "unknown",
+			projectPane: pane,
+		}));
 }
 
 export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {
@@ -282,6 +368,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				startedAt,
 				tokens: job.totalTokens?.total ?? 0,
 				state: job.status,
+				...(job.steps?.length ? { workflowRows: workflowFleetRows(job.steps) } : {}),
 				...(job.nestedChildren?.length ? { nestedChildren: job.nestedChildren } : {}),
 			});
 			continue;
@@ -346,6 +433,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 		}
 	}
 
+	entries.push(...projectPaneEntries(state));
 	return entries.sort((left, right) => left.startedAt - right.startedAt || left.key.localeCompare(right.key));
 }
 
@@ -423,7 +511,7 @@ export class SubagentFleetStatus {
 			this.clearWidget();
 			return;
 		}
-		if (this.entries.length === 0 && !(this.state.activeAsyncCapacity?.used)) {
+		if (!this.hasInlineSurface()) {
 			this.active = false;
 			this.selectedKey = "main";
 			this.lastRenderKey = "";
@@ -518,26 +606,31 @@ export class SubagentFleetStatus {
 	}
 
 	render(width: number, theme: Theme): string[] {
-		if (this.entries.length === 0 && !(this.state.activeAsyncCapacity?.used)) return [];
+		if (!this.hasInlineSurface()) return [];
 		if (!this.active) {
-			const tokens = this.entries.reduce((total, entry) => total + entry.tokens, 0);
+			const workEntries = this.entries.filter((entry) => !entry.surface);
+			const projectEntries = this.entries.filter((entry) => entry.surface === "project-pane");
+			const tokens = workEntries.reduce((total, entry) => total + entry.tokens, 0);
 			const capacity = this.state.activeAsyncCapacity;
-			const hasNativeRows = this.entries.some((entry) => !entry.external);
+			const hasNativeRows = workEntries.some((entry) => !entry.external);
 			const showNativeSummary = hasNativeRows || Boolean(capacity?.used);
 			const asyncRuns = capacity && showNativeSummary ? `Async runs ${capacity.used}/${capacity.limit || "∞"}` : "";
-			const activeEntries = activeLeafAgentCount(this.entries);
-			const noun = this.entries.some((entry) => entry.external) ? "job" : "agent";
+			const activeEntries = activeLeafAgentCount(workEntries);
+			const noun = workEntries.some((entry) => entry.external) ? "job" : "agent";
 			const agents = activeEntries > 0 ? `${activeEntries} active ${noun}${activeEntries === 1 ? "" : "s"}` : "";
-			const label = [agents, asyncRuns].filter(Boolean).join(" · ");
+			const paneAttention = projectEntries.filter((entry) => entry.projectPane && projectPaneNeedsAttention(entry.projectPane)).length;
+			const panes = projectEntries.length > 0 ? `${projectEntries.length} pane${projectEntries.length === 1 ? "" : "s"}${paneAttention ? ` (${paneAttention} ⚠)` : ""}` : "";
+			const label = [agents, asyncRuns, panes].filter(Boolean).join(" · ");
 			const detail = [showNativeSummary ? formatFleetTokens(tokens) : undefined, "↓/← to inspect"].filter(Boolean).join(" · ");
-			return [truncateToWidth(`  ${theme.fg("muted", label)} · ${theme.fg("dim", detail)}`, width)];
+			return [truncateToWidth(`  ${theme.fg("muted", label)}${label && detail ? " · " : ""}${theme.fg("dim", detail)}`, width)];
 		}
 		const roster = this.rosterKeys();
 		const selectedIndex = Math.max(0, roster.indexOf(this.selectedKey));
 		const lines = [truncateToWidth(`  ${theme.fg("dim", "↑↓/jk select · enter inspect · esc back")}`, width), ""];
 		lines.push(truncateToWidth(`  ${this.bullet(0, selectedIndex, theme)} main`, width));
 
-		const tree = fleetTreeRows(this.entries);
+		const workEntries = this.entries.filter((entry) => !entry.surface);
+		const tree = fleetTreeRows(workEntries);
 		const selectedTreeIndex = Math.max(0, tree.findIndex((row) => (row.kind === "owner" || row.kind === "child") && row.entry.key === this.selectedKey));
 		const visibleCount = Math.min(this.maxAgentRows, tree.length);
 		const start = selectedTreeIndex < visibleCount ? 0 : selectedTreeIndex - visibleCount + 1;
@@ -548,20 +641,37 @@ export class SubagentFleetStatus {
 			if (row.kind === "owner" || row.kind === "child") {
 				const ownerIndex = this.entries.findIndex((entry) => entry.key === row.entry.key);
 				lines.push(this.renderEntry(ownerIndex + 1, selectedIndex, row.entry, width, theme, row.kind === "child" ? (row.last ? "└─" : "├─") : undefined));
+			} else if (row.kind === "workflow") {
+				lines.push(this.renderWorkflowRow(row.row, row.last, width, theme));
 			} else {
 				lines.push(this.renderNestedRow(row.row, row.last, width, theme));
 			}
 		}
 		if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
+		this.renderProjectPaneSection(lines, selectedIndex, width, theme);
 		return lines;
 	}
+
+	private renderProjectPaneSection(lines: string[], selectedIndex: number, width: number, theme: Theme): void {
+		const entries = this.entries.filter((entry) => entry.surface === "project-pane");
+		if (!entries.length) return;
+		lines.push("", truncateToWidth(`  ${theme.fg("dim", "project panes")}`, width));
+		for (const entry of entries) {
+			const rosterIndex = this.entries.findIndex((candidate) => candidate.key === entry.key) + 1;
+			lines.push(this.renderEntry(rosterIndex, selectedIndex, entry, width, theme));
+		}
+	}
+
 
 	private renderEntry(rosterIndex: number, selectedIndex: number, entry: FleetStatusEntry, width: number, theme: Theme, branch?: string): string {
 		const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;
 		const prefix = branch ? `    ${branch}` : " ";
 		const left = `${prefix} ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)} · ${entry.state}`;
 		const elapsed = Date.now() - entry.startedAt;
-		const right = theme.fg("dim", entry.external ? formatFleetElapsed(elapsed) : `${formatFleetElapsed(elapsed)} · ${formatFleetTokens(entry.tokens)}`);
+		const rightText = entry.projectPane
+			? `${entry.projectPane.summary ?? "—"} · ${formatFleetElapsed(Date.now() - entry.projectPane.refreshedAt)} ago`
+				: entry.external ? formatFleetElapsed(elapsed) : `${formatFleetElapsed(elapsed)} · ${formatFleetTokens(entry.tokens)}`;
+		const right = theme.fg("dim", rightText);
 		return rightAlign(left, right, width);
 	}
 
@@ -574,6 +684,20 @@ export class SubagentFleetStatus {
 		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme)} ${theme.fg("muted", `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
 		const elapsed = row.startedAt !== undefined ? ` · ${formatFleetElapsed(Date.now() - row.startedAt)}` : "";
 		return truncateToWidth(`${left}${theme.fg("dim", elapsed)}`, width);
+	}
+
+	private renderWorkflowRow(row: FleetWorkflowRow, last: boolean, width: number, theme: Theme): string {
+		const marker = last ? "└─" : "├─";
+		const indent = "    ";
+		if (row.overflow !== undefined) return truncateToWidth(`${indent}${marker} ${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
+		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
+		const activity = row.activity ? ` · ${row.activity}` : "";
+		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme)} ${theme.fg("muted", `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
+		const details = [
+			row.startedAt !== undefined ? formatFleetElapsed(Date.now() - row.startedAt) : undefined,
+			row.tokens !== undefined ? formatFleetTokens(row.tokens) : undefined,
+		].filter(Boolean).join(" · ");
+		return truncateToWidth(`${left}${details ? theme.fg("dim", ` · ${details}`) : ""}`, width);
 	}
 
 	private bullet(rosterIndex: number, selectedIndex: number, theme: Theme): string {
@@ -616,6 +740,7 @@ export class SubagentFleetStatus {
 			entries: this.entries.map((entry) => this.active
 				? [
 					entry.key,
+					entry.surface,
 					entry.parentKey,
 					entry.agent,
 					entry.state,
@@ -624,6 +749,15 @@ export class SubagentFleetStatus {
 					entry.external,
 					Math.round((now - entry.startedAt) / 1000),
 					entry.tokens,
+					visibleWorkflowRows(entry.workflowRows, entry.parentKey ? 2 : 4).map((row) => [
+						row.name,
+						row.state,
+						row.modelThinking,
+						row.activity,
+						row.startedAt,
+						row.tokens,
+						row.overflow,
+					]),
 					nestedFleetRows(entry.nestedChildren, entry.parentKey ? 3 : 4).map((row) => [
 						row.name,
 						row.state,
@@ -634,8 +768,12 @@ export class SubagentFleetStatus {
 						row.overflow,
 					]),
 				]
-				: [entry.key, entry.state, entry.external, entry.tokens]),
+				: [entry.key, entry.state, entry.external, entry.surface, entry.tokens, entry.projectPane?.refreshedAt, entry.projectPane?.summary]),
 		});
+	}
+
+	private hasInlineSurface(): boolean {
+		return this.entries.length > 0 || Boolean(this.state.activeAsyncCapacity?.used);
 	}
 
 	private getActiveUiContext(): ExtensionContext | undefined {

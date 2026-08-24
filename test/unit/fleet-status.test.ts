@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import { Editor, type EditorComponent, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -251,6 +252,62 @@ describe("below-editor subagent FleetView", () => {
 			assert.ok(lines[0]!.includes("1 active agent"));
 			assert.ok(lines[0]!.includes("↓ 42 tokens"));
 			assert.ok(visibleWidth(lines[0]!) <= 50);
+		} finally {
+			fleet.dispose();
+		}
+	});
+
+	it("counts project panes in compact status", () => {
+		const state = stateForTest();
+		const projectRoot = path.join("fixtures", "peer-project");
+		const asyncDir = path.join("fixtures", "async-run");
+		state.asyncJobs.set("run-view", {
+			asyncId: "run-view",
+			asyncDir,
+			status: "running",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: Date.now() - 12_000,
+			updatedAt: Date.now() - 1_000,
+		});
+		state.herdrProjectPanes = new Map([[projectRoot, {
+			projectRoot,
+			bindingPath: path.join(projectRoot, ".pi/subagents/project-panes/herdr.json"),
+			paneId: "w1:p50",
+			openedAt: "2026-01-01T00:00:00.000Z",
+			state: "open",
+			agentStatus: "needs_attention",
+			ownership: "verified",
+			safeToClose: false,
+			refreshedAt: Date.now() - 2_000,
+			summary: "worker needs attention",
+		}]]);
+
+		let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+				onTerminalInput() { return () => {}; },
+				getEditorText() { return ""; },
+				requestRender() {},
+				notify() {},
+				theme,
+			},
+		} as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
+			const compact = component.render(100)[0]!;
+			assert.match(compact, /1 active agent/);
+			assert.match(compact, /1 pane \(1 ⚠\)/);
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			const expanded = component.render(100).join("\n");
+			assert.match(expanded, /project panes/);
+			assert.match(expanded, /peer-project · w1:p50/);
+			assert.match(expanded, /worker needs attention/);
+			assert.doesNotMatch(expanded, /views/);
 		} finally {
 			fleet.dispose();
 		}
@@ -771,6 +828,55 @@ describe("below-editor subagent FleetView", () => {
 			assert.match(lines[nestedIndex]!, /├─.*nested-reviewer/);
 			assert.match(lines[secondNestedIndex]!, /├─.*nested-tester/);
 			assert.match(lines[ownerNestedIndex]!, /└─.*owner-nested/);
+		} finally {
+			fleet.dispose();
+		}
+	});
+
+	it("renders bounded workflow progress rows under the workflow parent", () => {
+		const state = stateForTest();
+		const workflowJob = {
+			asyncId: "workflow-1",
+			asyncDir: "/tmp/workflow-1",
+			sessionId: "session-current",
+			status: "running" as const,
+			mode: "workflow" as const,
+			startedAt: 10,
+			updatedAt: 20,
+			steps: [
+				{ agent: "scout", workflowKey: "scan", phase: "Plan", label: "Find seams", status: "complete" as const, index: 0, tokens: { input: 10, output: 5, total: 15 } },
+				{ agent: "reviewer", workflowKey: "review", phase: "Review", status: "running" as const, index: 1, currentTool: "grep", tokens: { input: 20, output: 5, total: 25 } },
+				{ agent: "tester", workflowKey: "test", phase: "Verify", status: "pending" as const, index: 2 },
+			],
+		};
+		state.asyncJobs.set("workflow-1", workflowJob);
+		state.fleetJobs!.set("workflow-1", workflowJob);
+
+		assert.deepEqual(collectFleetStatusEntries(state).map((entry) => entry.key), ["async:workflow-1"]);
+		assert.deepEqual(collectFleetSnapshot(state).items.map((item) => item.key), ["async:workflow-1"]);
+
+		let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+				onTerminalInput() { return () => {}; },
+				getEditorText() { return ""; },
+				requestRender() {},
+				notify() {},
+				theme,
+			},
+		} as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000, maxAgentRows: 8 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			const lines = component.render(140).join("\n");
+			assert.match(lines, /workflow · running/);
+			assert.match(lines, /Plan: scan · Find seams \(scout\) · complete/);
+			assert.match(lines, /Review: review \(reviewer\) · running · tool grep/);
+			assert.match(lines, /Verify: test \(tester\) · pending/);
 		} finally {
 			fleet.dispose();
 		}

@@ -1,14 +1,22 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	buildModelCandidates,
 	fuzzyResolveModel,
+	formatSubagentModelVerificationError,
+	isContextOverflow,
 	isRetryableModelFailure,
 	normalizeModelSegment,
+	recordRetryableModelFailure,
 	resolveEffectiveSubagentModel,
 	resolveModelCandidate,
 	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-fallback.ts";
+import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
+import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
+
+beforeEach(() => clearExclusions());
+afterEach(() => clearExclusions());
 
 describe("model fallback helpers", () => {
 	const availableModels = [
@@ -18,6 +26,67 @@ describe("model fallback helpers", () => {
 
 	it("keeps explicit provider/model ids unchanged", () => {
 		assert.equal(resolveModelCandidate("openai/gpt-5-mini", availableModels), "openai/gpt-5-mini");
+	});
+
+	it("fails verification when the child reports an unregistered different model", () => {
+		assert.match(
+			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "unknown-provider/wrong-model", availableModels) ?? "",
+			/model_verification_failed/,
+		);
+	});
+
+	it("accepts child-reported bare model ids for the expected registry entry", () => {
+		assert.equal(
+			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "gpt-5-mini", availableModels),
+			undefined,
+		);
+	});
+
+	it("preserves variant tags when verifying provider-qualified model ids", () => {
+		assert.equal(
+			formatSubagentModelVerificationError(
+				"ollama-cloud/deepseek-v4-flash:0731:high",
+				"deepseek-v4-flash:0731",
+				[{ provider: "ollama-cloud", id: "deepseek-v4-flash:0731", fullId: "ollama-cloud/deepseek-v4-flash:0731" }],
+			),
+			undefined,
+		);
+	});
+
+	it("resolves unique owner/name ids when the owner is not a registered provider", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "huggingface", id: "thinkingmachines/Inkling", fullId: "huggingface/thinkingmachines/Inkling" },
+		];
+		assert.equal(resolveModelCandidate("thinkingmachines/Inkling", registry), "huggingface/thinkingmachines/Inkling");
+		assert.equal(
+			resolveModelCandidate("huggingface/thinkingmachines/Inkling", registry),
+			"huggingface/thinkingmachines/Inkling",
+		);
+		assert.equal(
+			resolveModelCandidate("thinkingmachines/Inkling:high", registry),
+			"huggingface/thinkingmachines/Inkling:high",
+		);
+	});
+
+	it("prefers the current provider for an ambiguous owner/name id", () => {
+		const registry = [
+			{ provider: "huggingface", id: "thinkingmachines/Inkling", fullId: "huggingface/thinkingmachines/Inkling" },
+			{ provider: "together", id: "thinkingmachines/Inkling", fullId: "together/thinkingmachines/Inkling" },
+		];
+		assert.equal(resolveModelCandidate("thinkingmachines/Inkling", registry), "thinkingmachines/Inkling");
+		assert.equal(
+			resolveModelCandidate("thinkingmachines/Inkling", registry, "huggingface"),
+			"huggingface/thinkingmachines/Inkling",
+		);
+	});
+
+	it("treats a registered provider prefix as provider/id, not owner/name", () => {
+		const registry = [
+			{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+			{ provider: "huggingface", id: "openai/gpt-5-mini", fullId: "huggingface/openai/gpt-5-mini" },
+		];
+		assert.equal(resolveModelCandidate("openai/gpt-5-mini", registry), "openai/gpt-5-mini");
 	});
 
 	it("resolves a bare id when there is exactly one registry match", () => {
@@ -55,6 +124,33 @@ describe("model fallback helpers", () => {
 		);
 	});
 
+	it("excludes a candidate after a retryable model failure is recorded", () => {
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (message: unknown) => warnings.push(String(message));
+		try {
+			recordRetryableModelFailure("openai/gpt-5-mini", "rate limit exceeded for Bearer secret-token-value");
+			assert.deepEqual(
+				buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
+				["anthropic/claude-sonnet-4"],
+			);
+		} finally {
+			console.warn = originalWarn;
+		}
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0]!, /Skipping model 'openai\/gpt-5-mini'.*reason: rate limit exceeded for \[redacted\]; expires: \d{4}-\d{2}-\d{2}T/);
+		assert.doesNotMatch(warnings[0]!, /secret-token-value/);
+	});
+
+	it("does not exclude a candidate after a task or tool failure", () => {
+		recordRetryableModelFailure("openai/gpt-5-mini", "bash failed (exit 1): command not found");
+
+		assert.deepEqual(
+			buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
+			["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
+		);
+	});
+
 	it("applies the current provider preference to fallback candidates too", () => {
 		const ambiguous = [
 			...availableModels,
@@ -84,8 +180,20 @@ describe("model fallback helpers", () => {
 		]);
 	});
 
+	it("trusts an inherited parent model outside the registry", () => {
+		assert.deepEqual(
+			buildModelCandidates("gateway/parent-model", undefined, availableModels, undefined, { primaryModelFromParent: true }),
+			["gateway/parent-model"],
+		);
+		assert.throws(
+			() => buildModelCandidates("gateway/parent-model", undefined, availableModels),
+			/Unknown subagent model 'gateway\/parent-model'/,
+		);
+	});
+
 	it("detects retryable provider/model failures", () => {
 		assert.equal(isRetryableModelFailure("rate limit exceeded for provider"), true);
+		assert.equal(isRetryableModelFailure("The usage limit has been reached"), true);
 		assert.equal(isRetryableModelFailure("model unavailable"), true);
 		assert.equal(isRetryableModelFailure("authentication failed"), true);
 		assert.equal(isRetryableModelFailure("Subagent produced no output (possible model cold-start or empty response)."), true);
@@ -165,6 +273,17 @@ describe("resolveSubagentModelOverride (cross-session inherit, issue #266)", () 
 		);
 	});
 
+	it("resolves owner/name frontmatter models against the registry", () => {
+		const models = [
+			...availableModels,
+			{ provider: "huggingface", id: "thinkingmachines/Inkling", fullId: "huggingface/thinkingmachines/Inkling" },
+		];
+		assert.equal(
+			resolveSubagentModelOverride("thinkingmachines/Inkling", parentModel, models, "huggingface"),
+			"huggingface/thinkingmachines/Inkling",
+		);
+	});
+
 	it("rejects explicit models that the active registry cannot resolve", () => {
 		assert.throws(
 			() => resolveSubagentModelOverride("does-not-exist", parentModel, availableModels),
@@ -173,6 +292,28 @@ describe("resolveSubagentModelOverride (cross-session inherit, issue #266)", () 
 		assert.throws(
 			() => resolveSubagentModelOverride("does-not-exist:high", parentModel, availableModels),
 			/Unknown subagent model 'does-not-exist:high'/,
+		);
+	});
+
+	it("suggests a unique alternate provider without resolving across providers", () => {
+		assert.throws(
+			() => resolveSubagentModelOverride("openai/claude-sonnet-4:high", parentModel, availableModels),
+			/Unknown subagent model 'openai\/claude-sonnet-4:high'.*Did you mean 'anthropic\/claude-sonnet-4:high'\?/,
+		);
+	});
+
+	it("does not suggest an alternate provider when the bare id is ambiguous or absent", () => {
+		const ambiguous = [
+			...availableModels,
+			{ provider: "github-copilot", id: "claude-sonnet-4", fullId: "github-copilot/claude-sonnet-4" },
+		];
+		assert.throws(
+			() => resolveSubagentModelOverride("openai/claude-sonnet-4", parentModel, ambiguous),
+			(error: unknown) => !String(error).includes("Did you mean"),
+		);
+		assert.throws(
+			() => resolveSubagentModelOverride("openai/does-not-exist", parentModel, availableModels),
+			(error: unknown) => !String(error).includes("Did you mean"),
 		);
 	});
 
@@ -213,6 +354,18 @@ describe("resolveEffectiveSubagentModel", () => {
 			"openai/gpt-5-mini",
 		);
 		assert.equal(warnings.length, 1);
+	});
+
+	it("uses the preferred provider for an ambiguous agent model", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "gpu-b", id: "gpt-5-mini", fullId: "gpu-b/gpt-5-mini" },
+		];
+
+		assert.equal(
+			resolveEffectiveSubagentModel(undefined, "gpt-5-mini", undefined, registry, "gpu-b"),
+			"gpu-b/gpt-5-mini",
+		);
 	});
 });
 
@@ -258,6 +411,18 @@ describe("fuzzyResolveModel / normalizeModelSegment", () => {
 		assert.equal(fuzzyResolveModel("Anthropic:Claude-Sonnet-4", registry), "anthropic/claude-sonnet-4");
 		assert.equal(fuzzyResolveModel("anthropic.claude.haiku.4.5", registry), "anthropic/claude-haiku-4-5");
 		assert.equal(fuzzyResolveModel("anthropic/claude.haiku.4.5", registry), "anthropic/claude-haiku-4-5");
+	});
+
+	it("fuzzy-matches owner/name ids when the owner is not a registered provider", () => {
+		const hfRegistry = [
+			...registry,
+			{ provider: "huggingface", id: "thinkingmachines/Inkling", fullId: "huggingface/thinkingmachines/Inkling" },
+		];
+		assert.equal(fuzzyResolveModel("ThinkingMachines/Inkling", hfRegistry), "huggingface/thinkingmachines/Inkling");
+		assert.equal(
+			fuzzyResolveModel("huggingface/ThinkingMachines/Inkling", hfRegistry),
+			"huggingface/thinkingmachines/Inkling",
+		);
 	});
 
 	it("does not switch providers for a qualified query", () => {
@@ -339,6 +504,116 @@ describe("resolveSubagentModelOverride scope enforcement", () => {
 			() => resolveSubagentModelOverride("deepseek/deepseek-v4", parentModel, availableModels, undefined, { scope, source: "explicit" }),
 			/outside the configured subagent model scope/,
 		);
+	});
+
+	it("identifies the per-agent scope that rejects an explicit model", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, allow: ["openai/*", "deepseek/*"], agents: { worker: { allow: ["openai/gpt-5-mini"] } } },
+			"worker",
+			parentModel,
+		);
+		assert.throws(
+			() => resolveEffectiveSubagentModel("deepseek/deepseek-v4", undefined, parentModel, availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker/,
+		);
+	});
+
+	it("allows an inherited parent model through an inherit agent scope", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { reviewer: { allow: ["inherit"] } } },
+			"reviewer",
+			parentModel,
+		);
+		assert.equal(resolveEffectiveSubagentModel(undefined, undefined, parentModel, availableModels, undefined, { scope: scopes }), "deepseek/deepseek-v4");
+	});
+
+	it("fails closed when enforced inherit cannot resolve a parent model", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { reviewer: { allow: ["inherit"] } } },
+			"reviewer",
+			undefined,
+		);
+		assert.throws(
+			() => resolveEffectiveSubagentModel(undefined, undefined, undefined, availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.reviewer.*requires a current parent session model/,
+		);
+	});
+
+	it("fails closed before using an agent fallback when enforced inherit has no parent model", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { reviewer: { allow: ["inherit"] } } },
+			"reviewer",
+			undefined,
+		);
+		for (const explicitModel of [undefined, "inherit"] as const) {
+			assert.throws(
+				() => resolveEffectiveSubagentModel(explicitModel, "openai/gpt-5-mini", undefined, availableModels, undefined, { scope: scopes }),
+				/modelScope\.agents\.reviewer.*requires a current parent session model/,
+			);
+		}
+	});
+
+	it("fails closed before using fallback candidates when enforced inherit has no parent model", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { worker: { allow: ["inherit"] } } },
+			"worker",
+			undefined,
+		);
+		assert.throws(
+			() => buildModelCandidates(undefined, ["openai/gpt-5-mini"], availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker.*requires a current parent session model/,
+		);
+	});
+
+	it("fails closed for mixed inherit scopes before omitting the model", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { worker: { allow: ["inherit", "openai/gpt-5-*"] } } },
+			"worker",
+			undefined,
+		);
+		assert.throws(
+			() => resolveEffectiveSubagentModel(undefined, undefined, undefined, availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker.*requires a current parent session model/,
+		);
+		assert.throws(
+			() => buildModelCandidates(undefined, ["openai/gpt-5-mini"], availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker.*requires a current parent session model/,
+		);
+	});
+
+	it("allows an explicit model through a mixed inherit scope without a parent", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { worker: { allow: ["inherit", "openai/gpt-5-*"] } } },
+			"worker",
+			undefined,
+		);
+		assert.equal(resolveEffectiveSubagentModel("openai/gpt-5-mini", undefined, undefined, availableModels, undefined, { scope: scopes }), "openai/gpt-5-mini");
+	});
+
+	it("fails closed before using an agent model through a mixed inherit scope without a parent", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, agents: { worker: { allow: ["inherit", "openai/gpt-5-*"] } } },
+			"worker",
+			undefined,
+		);
+		assert.throws(
+			() => resolveEffectiveSubagentModel(undefined, "openai/gpt-5-mini", undefined, availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker.*requires a current parent session model/,
+		);
+	});
+
+	it("throws the strict agent violation before emitting a global warning", () => {
+		const warnings: string[] = [];
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, allow: ["openai/*"], agents: { worker: { strict: true, allow: ["anthropic/*"] } } },
+			"worker",
+			parentModel,
+		);
+		assert.throws(
+			() => resolveEffectiveSubagentModel(undefined, undefined, parentModel, availableModels, undefined, { scope: scopes, onWarn: (violation) => warnings.push(violation.message) }),
+			/modelScope\.agents\.worker/,
+		);
+		assert.deepEqual(warnings, []);
 	});
 
 	it("warns (and still returns the model) for an inherited out-of-scope model", () => {
@@ -434,5 +709,43 @@ describe("resolveSubagentModelOverride scope enforcement", () => {
 			}),
 			/deepseek\/deepseek-v4.*outside the configured subagent model scope/,
 		);
+	});
+
+	it("applies a strict per-agent scope to fallback candidates", () => {
+		const scopes = resolveModelScopesForAgent(
+			{ enforce: true, strict: true, agents: { worker: { allow: ["openai/*"] } } },
+			"worker",
+			parentModel,
+		);
+		assert.throws(
+			() => buildModelCandidates("openai/gpt-5-mini", ["deepseek/deepseek-v4"], availableModels, undefined, { scope: scopes }),
+			/modelScope\.agents\.worker/,
+		);
+	});
+});
+
+describe("isContextOverflow", () => {
+	it("detects common context-overflow error shapes", () => {
+		assert.equal(isContextOverflow("This model's maximum context length is 8192 tokens"), true);
+		assert.equal(isContextOverflow("context length exceeded for the requested prompt"), true);
+		assert.equal(isContextOverflow("too many tokens in the request"), true);
+		assert.equal(isContextOverflow("context_length_exceeded"), true);
+		assert.equal(isContextOverflow("prompt is too long for this model"), true);
+		assert.equal(isContextOverflow("input too long: 40000 tokens"), true);
+	});
+
+	it("does not flag unrelated retryable failures as overflow", () => {
+		assert.equal(isContextOverflow("rate limit exceeded for provider"), false);
+		assert.equal(isContextOverflow("503 service unavailable"), false);
+		assert.equal(isContextOverflow("connection refused"), false);
+	});
+
+	it("does not flag tool failures as overflow", () => {
+		assert.equal(isContextOverflow("bash failed (exit 1): context length exceeded in output"), false);
+	});
+
+	it("returns false for empty or undefined input", () => {
+		assert.equal(isContextOverflow(undefined), false);
+		assert.equal(isContextOverflow(""), false);
 	});
 });

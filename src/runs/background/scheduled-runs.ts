@@ -346,6 +346,8 @@ function executionParams(schedule: ScheduleRecord): SubagentParamsLike {
 		context: "fresh",
 		cwd: schedule.cwd,
 		mission: false,
+		// Scheduled fires have no operator watching, so completions must name the origin.
+		scheduleOrigin: { id: schedule.id, ...(schedule.name ? { name: schedule.name } : {}) },
 		...(schedule.timeoutMs === undefined ? {} : { timeoutMs: schedule.timeoutMs }),
 	};
 }

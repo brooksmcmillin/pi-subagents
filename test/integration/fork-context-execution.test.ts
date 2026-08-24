@@ -6,6 +6,7 @@ import type { MockPi } from "../support/helpers.ts";
 import { createEventBus, createMockPi, createTempDir, events, removeTempDir, tryImport } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
+import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
 import { DEFAULT_FORK_PREAMBLE, INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 
 interface ExecutorModule {
@@ -106,9 +107,11 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		tempDir = createTempDir("pi-subagent-fork-test-");
 		mockPi.reset();
 		mockPi.onCall({ output: "ok" });
+		clearExclusions();
 	});
 
 	afterEach(() => {
+		clearExclusions();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -416,6 +419,49 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(result.details?.context, "fresh");
 		assert.equal(result.details?.results?.[0]?.context, "fresh");
 		assert.deepEqual(openedPaths, []);
+	});
+
+	it("uses profile context over global defaultSubagentContext", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fresh" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test", context: "profile" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fork");
+		assert.equal(result.details?.results?.[0]?.context, "fork");
+		assert.deepEqual(openedPaths, [parentSessionFile]);
+		assert.deepEqual(branchedLeafIds, ["leaf-current"]);
+	});
+
+	it("fails profile context when the selected agent has no defaultContext", async () => {
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [{ name: "worker", description: "Worker" }],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fork" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test", context: "profile" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(makeSessionManagerRecorder().manager),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /context: "profile" requires agent 'worker' to declare defaultContext/);
 	});
 
 	it("sanitizes inherited signed thinking and forces child thinking off", async () => {
@@ -727,6 +773,43 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
 		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+	});
+
+	it("keeps inherited parent models outside the registry during foreground fork preparation", async () => {
+		const { manager } = makeForkingSessionManagerRecorder({
+			sessionFile: path.join(tempDir, "parent.jsonl"),
+			leafId: "leaf-123",
+		});
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [{ name: "worker", description: "Worker", defaultContext: "fork" }],
+			projectAgentsDir: null,
+		}));
+		const ctx = {
+			...makeCtx(manager),
+			model: { provider: "gateway", id: "parent-model" },
+			modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] },
+		};
+
+		const inherited = await executor.execute(
+			"inherited-parent-model",
+			{ agent: "worker", task: "test", context: "fork" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(inherited.isError, undefined);
+		const args = readCallArgs();
+		assert.equal(args[args.indexOf("--model") + 1], "gateway/parent-model");
+
+		const explicit = await executor.execute(
+			"explicit-unknown-model",
+			{ agent: "worker", task: "test", context: "fork", model: "gateway/unknown" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(explicit.isError, true);
+		assert.match(explicit.content[0]?.text ?? "", /Unknown subagent model 'gateway\/unknown'/);
 	});
 
 

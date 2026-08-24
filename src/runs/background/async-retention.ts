@@ -330,13 +330,11 @@ function processStartIdentity(pid: number): string | undefined {
 		}
 	}
 	if (process.platform === "win32") {
-		const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8" });
+		const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8", windowsHide: true });
 		const started = result.status === 0 ? result.stdout.trim() : "";
 		return started ? `win:${started}` : undefined;
 	}
-	const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8" });
-	const started = result.status === 0 ? result.stdout.trim() : "";
-	return started ? `${process.platform}:${started}` : undefined;
+	return undefined;
 }
 
 function processIsAlive(pid: number): boolean | undefined {
@@ -602,7 +600,7 @@ function runRetentionDiscovery(input: {
 		};
 		const onAbort = (): void => fail(new RetentionCancelledError("Retention discovery was cancelled."));
 		input.signal?.addEventListener("abort", onAbort, { once: true });
-		worker.once("error", (error) => fail(error));
+		worker.once("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
 		worker.once("exit", (code) => {
 			if (!settled) fail(new Error(`Retention discovery worker exited before replying (${code}).`));
 		});

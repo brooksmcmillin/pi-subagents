@@ -40,7 +40,7 @@ To inspect one background child in text, use `subagent({ action: "status", id: "
 In the TUI, a persistent FleetView below the editor keeps active work visible as a compact summary. Set `fleetViewPlacement` to `"aboveEditor"` to move it above the editor.
 
 ```text
-2 active agents · ↓ 4.2k tokens · ↓/← to inspect
+2 active agents · 1 pane · ↓ 4.2k tokens · ↓/← to inspect
 ```
 
 After you expand it:
@@ -53,7 +53,7 @@ After you expand it:
     reviewer · running                 38s · ↓ 1.4k tokens
 ```
 
-When the focused editor is empty, press `↓` or `←` to expand the summary into `main` plus active children with agent name, state, elapsed time, and token totals. Then use `↑`/`↓` or `j`/`k` to select a child and `Enter` to inspect it. Printable navigation keys are never intercepted before activation.
+When the focused editor is empty, press `↓` or `←` to expand the summary into `main` plus active children with agent name, state, elapsed time, and token totals. The compact line counts active current-session work and Herdr project panes. Then use `↑`/`↓` or `j`/`k` to select a child and `Enter` to inspect it. Printable navigation keys are never intercepted before activation.
 
 FleetView replaces the legacy above-editor async widget by default. Successful background completions stay quiet so inactive Pi tabs are not marked unread, while failed or paused completions still notify the originating session. Parallel runs show every active child independently. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child process.
 
@@ -99,6 +99,42 @@ Pi binds `Ctrl+B` to editor cursor-left by default. The extension shortcut takes
 
 If something feels misconfigured, run `/subagents-doctor` or ask: "Check whether subagents and intercom are set up correctly."
 
+## Host inspection protocol (RPC)
+
+RPC hosts receive live async status through the bounded `subagent-async` widget
+(`PI_SUBAGENT_ASYNC_JSON:` payload). For on-demand detail — a child's delegated
+task, transcript window, or final output — hosts can invoke the extension
+command:
+
+```text
+/subagents-inspect-rpc <requestId> <asyncId> [childId] [--lines N]
+```
+
+Extension commands execute inline over Pi RPC without a model turn. The reply
+arrives as a single emit-then-retract update on the dedicated `subagent-inspect`
+widget key: the first (and only) line is `PI_SUBAGENT_INSPECT_JSON:<JSON>` with a
+versioned `pi-subagents.inspect-reply` payload correlated by `requestId`. Hosts
+must not render this widget; they should buffer the payload by `requestId` and
+drop unmatched replies.
+
+Inspection properties:
+
+- Read-only and on demand: nothing is persisted, broadcast, or added to
+  notification details; every request re-reads canonical run artifacts after
+  the same reconciliation the status action performs.
+- Session-scoped: runs owned by another session fail with `foreign_session`;
+  unknown ids fail with `not_found`; cleaned-up artifacts fail with `stale`.
+- Bounded: per-field string caps, a message-count cap (`--lines`, max 200), and
+  a hard 64 KB serialized budget with explicit `truncated` markers.
+- No filesystem paths appear in the reply.
+- `task` is the child session's first user message and is only populated when
+  it is genuinely attributable (fresh-context child whose session file fits the
+  read window); forked children omit it.
+- `childId` is exactly the node id the host received in the status snapshot
+  (step `workflowKey`/`runId`/`step:<index>`, or a nested run id).
+
+In TUI mode the command only points at the interactive `/subagents` inspector.
+
 ## Async run artifacts
 
 Async runs write machine-readable lifecycle artifacts for observability and workflow gates:
@@ -122,11 +158,22 @@ The result file is consumed and deleted once its completion notice is delivered.
 
 `subagent_wait` surfaces a slim projection of each terminal payload it covered in its own tool-result `details.completions` — run identity, per-child agent/`runId`/success, artifact paths, and the bounded `archivePath`, without duplicating output text. It reads the replay when watcher delivery or a watcher restart has removed the one-shot result file and in-memory completion state is unavailable. Durable non-blocking wait subscriptions use the same replay in their delivered details. Workflow result files record each child's `runId` explicitly, since a workflow child's `artifactPaths` entry points at its saved output rather than the artifact files keyed by the id. Extensions observing `tool_result` events can read run and artifact identity from there instead of parsing the text summary.
 
-Output archives reference an existing child output artifact or session file when one is available. For children without either file, the archive stores only the tail of result text, bounded to 64 KiB per run, and records whether it was truncated. Replay and archive JSON use `version: 1`; consumers must ignore unknown fields.
+Output archives reference an existing child output artifact or session file when one is available. For children without either file, the archive stores a per-child `result-tail` entry with `resultIndex`, bounded to 64 KiB per child, and records whether it was truncated. Replay and archive JSON use `version: 1`; consumers must ignore unknown fields.
 
 Nested fanout status is stored as compact sidecar event/registry metadata and merged into parent status views and result/intercom payloads; full recursive status snapshots are not embedded in parent result files.
 
 Consumers should read these JSON files instead of scraping terminal output. Unknown fields and event types should be ignored for forward compatibility.
+
+RPC hosts that need low-latency child-stop UI hints can subscribe to the
+`subagent:child-status` event advertised by RPC `ping` as `events.childStatus`.
+The payload uses `type: "subagent.child-status"`, `version: 1`, `runId`,
+`childId`, `status` (`"stopping"` or `"stopped"`), `ts`, and optional child
+metadata such as `stepIndex`, `agent`, `childRunId`, `workflowKey`, `phase`, and
+`label`. These events are observer hints only. They can duplicate across RPC and
+async replay paths, and they are not replayed after a host restart. Status
+snapshots remain authoritative for recovery and final state. Child stop control
+still uses the normal `stop` request with `childId`; there is no separate child
+stop API.
 
 ### Status and result fields
 
@@ -174,7 +221,7 @@ Each scripted workflow stores runtime artifacts under a workflow artifact direct
 
 A run directory may contain files such as `context.md`, `plan.md`, `progress.md`, and `parallel-{stepIndex}/.../output.md`. User-scoped temp workflow artifact directories older than 24 hours are cleaned up on extension startup; project-local and explicit persistent roots are not age-scanned.
 
-Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi/subagents/artifacts/` for project-scoped runs, or a user-scoped temp artifact directory. Single-run relative `output` files are saved under `{artifactsDir}/outputs/{runId}/` unless `singleRunOutputBaseDir` is configured. Per task you may see:
+Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi/subagents/artifacts/` for project-scoped runs, or a user-scoped temp artifact directory. Single-run relative `output` files are saved under `{artifactsDir}/outputs/{runId}/` unless `singleRunOutputBaseDir` is configured. For lane, review, council, and gate reports, prefer these managed artifacts or the aggregate workflow result instead of repo-root `reports/` files. Copy only final durable evidence to session memory, a mission artifact, a PR/comment, or an approved docs path. Per task you may see:
 
 - `{runId}_{agent}_input.md`
 - `{runId}_{agent}_output.md`

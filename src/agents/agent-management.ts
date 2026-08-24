@@ -27,19 +27,22 @@ import { discoverAvailableSkills, resolveSkills } from "./skills.ts";
 import {
 	buildProactiveSkillSubagentRecommendationLines,
 } from "./proactive-skills.ts";
-import { parseFrontmatter } from "./frontmatter.ts";
+import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
+import { validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import type { AcceptanceInput, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
 import { getProjectConfigDir } from "../shared/utils.ts";
 import { capabilityCeilingAgentRestrictionSources, isAgentAllowedByCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
+import { listRuntimeAgentConfigs, mergeRuntimeAgents, type RuntimeAgentOwner } from "./runtime-agent-registry.ts";
+import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner };
 
 interface ManagementParams {
 	action?: string;
@@ -56,18 +59,23 @@ function parseCsv(value: string): string[] {
 	return [...new Set(value.split(",").map((v) => v.trim()).filter(Boolean))];
 }
 
-function configObject(config: unknown): { value?: Record<string, unknown>; error?: string } {
+type ConfigObjectResult =
+	| { status: "ok"; value: Record<string, unknown> }
+	| { status: "missing" }
+	| { status: "error"; message: string };
+
+function configObject(config: unknown): ConfigObjectResult {
 	let val = config;
 	if (typeof val === "string") {
 		try {
 			val = JSON.parse(val);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			return { error: `config must be valid JSON: ${message}` };
+			return { status: "error", message: `config must be valid JSON: ${message}` };
 		}
 	}
-	if (!val || typeof val !== "object" || Array.isArray(val)) return {};
-	return { value: val as Record<string, unknown> };
+	if (!val || typeof val !== "object" || Array.isArray(val)) return { status: "missing" };
+	return { status: "ok", value: val as Record<string, unknown> };
 }
 
 function hasKey(obj: Record<string, unknown>, key: string): boolean {
@@ -142,7 +150,7 @@ function diagnosticsForScope(diagnostics: AgentDiscoveryDiagnostic[] | undefined
 	return diagnostics?.filter((diagnostic) => diagnostic.source !== excludedSource);
 }
 
-const AGENT_SOURCE_PRECEDENCE: Record<AgentSource, number> = { builtin: 0, package: 1, user: 2, project: 3 };
+const AGENT_SOURCE_PRECEDENCE: Record<AgentSource, number> = { builtin: 0, package: 1, user: 2, project: 3, runtime: 4 };
 
 // Returns the highest-precedence definition for a resolved canonical name (project > user > package > builtin),
 // matching mergeAgentsForScope for "both", including disabled agents so disable/enable can locate hidden targets.
@@ -175,7 +183,8 @@ function isMutableSource(source: AgentSource): source is ManagementScope {
 function modelWarning(ctx: ManagementContext, model: string | undefined): string | undefined {
 	if (!model) return undefined;
 	const found = ctx.modelRegistry.getAvailable().some((m) => `${m.provider}/${m.id}` === model || m.id === model);
-	return found ? undefined : `Warning: model '${model}' is not in the current model registry.`;
+	if (found) return undefined;
+	return `Warning: model '${model}' is not in the current model registry. Run subagent({ action: "models" }) to list valid provider/id selectors, then use the exact provider/id form (bare ids resolve only when unique).`;
 }
 
 function fallbackModelsWarning(ctx: ManagementContext, fallbackModels: string[] | undefined): string | undefined {
@@ -196,11 +205,26 @@ function skillsWarning(cwd: string, agent: Pick<AgentConfig, "skills" | "skillPa
 	return missing.length ? `Warning: skills not found: ${missing.join(", ")}.` : undefined;
 }
 
+function withDeclaredExtensionPaths(config: AgentConfig, filePath: string): AgentConfig {
+	const { frontmatter } = parseFrontmatter(fs.readFileSync(filePath, "utf-8"));
+	const { extensions: _extensions, subagentOnlyExtensions: _subagentOnlyExtensions, ...withoutResolvedExtensions } = config;
+	return {
+		...withoutResolvedExtensions,
+		...(frontmatter.extensions !== undefined ? { extensions: parseFrontmatterList(frontmatter.extensions) } : {}),
+		...(frontmatter.subagentOnlyExtensions !== undefined
+			? { subagentOnlyExtensions: parseFrontmatterList(frontmatter.subagentOnlyExtensions) }
+			: {}),
+	};
+}
+
 export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 	const { extensions: _extensions, ...withoutExtensions } = agent;
 	const base = agent.override?.base;
 	const {
 		override: _override,
+		output: _output,
+		outputMode: _outputMode,
+		defaultReads: _defaultReads,
 		model: _model,
 		fallbackModels: _fallbackModels,
 		thinking: _thinking,
@@ -220,14 +244,17 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...editable
 	} = withoutExtensions;
 	if (!base) {
-		return {
+		return withDeclaredExtensionPaths({
 			...withoutExtensions,
 			...(agent.extensionsFromDefault ? {} : agent.extensions !== undefined ? { extensions: [...agent.extensions] } : {}),
-		};
+		}, agent.filePath);
 	}
 
-	return {
+	return withDeclaredExtensionPaths({
 		...editable,
+		...(base.output !== undefined ? { output: base.output } : {}),
+		...(base.outputMode !== undefined ? { outputMode: base.outputMode } : {}),
+		...(base.defaultReads !== undefined ? { defaultReads: [...base.defaultReads] } : {}),
 		...(base.model !== undefined ? { model: base.model } : {}),
 		...(base.fallbackModels !== undefined ? { fallbackModels: [...base.fallbackModels] } : {}),
 		...(base.thinking !== undefined ? { thinking: base.thinking } : {}),
@@ -245,7 +272,7 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...(base.extensions !== undefined ? { extensions: [...base.extensions] } : {}),
 		...(base.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...base.subagentOnlyExtensions] } : {}),
 		...(base.completionGuard !== undefined ? { completionGuard: base.completionGuard } : {}),
-	};
+	}, agent.filePath);
 }
 
 function readAgentFrontmatterFields(filePath: string): Set<string> {
@@ -299,6 +326,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "acceptance")) changed("acceptance");
 	if (hasKey(cfg, "acceptanceRole")) changed("acceptanceRole");
 	if (hasKey(cfg, "output")) changed("output");
+	if (hasKey(cfg, "outputMode")) changed("outputMode");
 	if (hasKey(cfg, "reads")) changed("defaultReads");
 	if (hasKey(cfg, "progress")) changed("defaultProgress");
 	if (hasKey(cfg, "maxSubagentDepth")) changed("maxSubagentDepth");
@@ -351,15 +379,17 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			if (runner.type === "pi" && Object.keys(runner).every((key) => key === "type")) target.runner = { type: "pi" };
 			else if (runner.type === "external-cli" && typeof runner.command === "string" && runner.command.trim()
 				&& (runner.args === undefined || (Array.isArray(runner.args) && runner.args.every((arg) => typeof arg === "string")))
+				&& (runner.adapter === undefined || runner.adapter === "codex-exec" || runner.adapter === "codex-exec-writer" || runner.adapter === "claude-code" || runner.adapter === "claude-code-writer" || runner.adapter === "cursor-agent" || runner.adapter === "cursor-agent-writer")
+				&& (runner.adapter === undefined || runner.args === undefined || runner.args.length === 0)
 				&& (runner.promptDelivery === undefined || runner.promptDelivery === "stdin")
-				&& Object.keys(runner).every((key) => ["type", "command", "args", "promptDelivery"].includes(key))) {
+				&& Object.keys(runner).every((key) => ["type", "adapter", "command", "args", "promptDelivery"].includes(key))) {
 				const runnerArgs = Array.isArray(runner.args) ? runner.args.filter((arg): arg is string => typeof arg === "string") : undefined;
-				target.runner = { type: "external-cli", command: runner.command.trim(), ...(runnerArgs?.length ? { args: runnerArgs } : {}), ...(runner.promptDelivery ? { promptDelivery: "stdin" } : {}) };
+				target.runner = { type: "external-cli", ...(runner.adapter === "codex-exec" || runner.adapter === "codex-exec-writer" || runner.adapter === "claude-code" || runner.adapter === "claude-code-writer" || runner.adapter === "cursor-agent" || runner.adapter === "cursor-agent-writer" ? { adapter: runner.adapter } : {}), command: runner.command.trim(), ...(runnerArgs?.length ? { args: runnerArgs } : {}), ...(runner.promptDelivery ? { promptDelivery: "stdin" } : {}) };
 			} else if (runner.type === "external-job" && typeof runner.provider === "string" && runner.provider.trim() === runner.provider && runner.provider
 				&& (runner.options === undefined || (runner.options && typeof runner.options === "object" && !Array.isArray(runner.options) && isJsonSerializable(runner.options)))
 				&& Object.keys(runner).every((key) => ["type", "provider", "options"].includes(key))) {
 				target.runner = { type: "external-job", provider: runner.provider, ...(runner.options ? { options: runner.options as Record<string, unknown> } : {}) };
-			} else return "config.runner must be { type: 'pi' }, { type: 'external-cli', command: string, args?: string[], promptDelivery?: 'stdin' }, or { type: 'external-job', provider: string, options?: object }.";
+			} else return "config.runner must be { type: 'pi' }, { type: 'external-cli', adapter?: 'codex-exec' | 'codex-exec-writer' | 'claude-code' | 'claude-code-writer' | 'cursor-agent' | 'cursor-agent-writer', command: string, args?: string[], promptDelivery?: 'stdin' }, or { type: 'external-job', provider: string, options?: object }.";
 		} else return "config.runner must be an object, false, or empty string when provided.";
 	}
 	if (hasKey(cfg, "model")) {
@@ -489,6 +519,10 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else if (typeof cfg.output === "string") target.output = cfg.output;
 		else return "config.output must be a string or false when provided.";
 	}
+	if (hasKey(cfg, "outputMode")) {
+		if (cfg.outputMode === "inline" || cfg.outputMode === "file-only") target.outputMode = cfg.outputMode;
+		else return "config.outputMode must be 'inline' or 'file-only' when provided.";
+	}
 	if (hasKey(cfg, "reads")) {
 		if (cfg.reads === false || cfg.reads === "") delete target.defaultReads;
 		else if (typeof cfg.reads === "string") {
@@ -570,9 +604,83 @@ function renamePath(currentPath: string, newName: string, scope: ManagementScope
 	return { filePath };
 }
 
+function packageSourceLabel(agent: AgentConfig): string {
+	if (!agent.packageSourceName) return agent.source;
+	return agent.packageSourceVersion ? `${agent.packageSourceName}@${agent.packageSourceVersion}` : agent.packageSourceName;
+}
+
+type ExternalJobProviderStatus =
+	| { ok: true; names: Set<string> }
+	| { ok: false; error: string };
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function registeredExternalJobProviderStatus(): ExternalJobProviderStatus {
+	try {
+		return { ok: true, names: new Set(listExternalJobProviders().map((provider) => provider.name)) };
+	} catch (error) {
+		return { ok: false, error: errorMessage(error) };
+	}
+}
+
+function externalJobProviderSuffix(provider: string, names: Set<string> | undefined): string {
+	if (!names) return "?";
+	return names.has(provider) ? "✓" : "missing";
+}
+
+function runnerListBadge(agent: AgentConfig, providerNames: Set<string> | undefined): string | undefined {
+	if (agent.runner?.type === "external-job") return `external-job:${agent.runner.provider} ${externalJobProviderSuffix(agent.runner.provider, providerNames)}`;
+	if (agent.runner?.type === "external-cli") return "external-cli";
+	return undefined;
+}
+
+function formatAgentListLine(agent: AgentConfig, providerNames: Set<string> | undefined): string {
+	const source = agent.source === "package" ? packageSourceLabel(agent) : agent.source;
+	const parts = [
+		source,
+		runnerListBadge(agent, providerNames),
+		agent.defaultContext ? `context: ${agent.defaultContext}` : undefined,
+		agent.aliases?.length ? `aliases: ${agent.aliases.join(", ")}` : undefined,
+	].filter((part): part is string => Boolean(part));
+	return `- ${agent.name} (${parts.join(", ")}): ${agent.description}`;
+}
+
+function formatAgentListSections(agents: AgentConfig[], providerNames: Set<string> | undefined): string[] {
+	if (agents.length === 0) return ["- (none)"];
+	const sections: Array<[AgentSource, string]> = [
+		["package", "Package agents"],
+		["user", "User agents"],
+		["project", "Project agents"],
+		["runtime", "Runtime agents"],
+		["builtin", "Builtin agents"],
+	];
+	const lines: string[] = [];
+	for (const [source, label] of sections) {
+		const matches = agents.filter((agent) => agent.source === source);
+		if (matches.length === 0) continue;
+		if (lines.length > 0) lines.push("");
+		lines.push(label, ...matches.map((agent) => formatAgentListLine(agent, providerNames)));
+	}
+	return lines;
+}
+
+function formatRunnerDetail(agent: AgentConfig, providerNames: Set<string> | undefined): string | undefined {
+	if (!agent.runner) return undefined;
+	if (agent.runner.type === "external-job") return `Runner: external-job via ${agent.runner.provider} ${externalJobProviderSuffix(agent.runner.provider, providerNames)}`;
+	if (agent.runner.type === "external-cli") return `Runner: external-cli ${agent.runner.command}`;
+	return `Runner: ${JSON.stringify(agent.runner)}`;
+}
+
 function formatAgentDetail(agent: AgentConfig): string {
 	const tools = [...(agent.tools ?? []), ...(agent.mcpDirectTools ?? []).map((t) => `mcp:${t}`)];
+	const providerStatus = registeredExternalJobProviderStatus();
 	const lines: string[] = [`Agent: ${agent.name} (${agent.source})`, `Path: ${agent.filePath}`, `Description: ${agent.description}`];
+	if (agent.source === "package" && agent.packageSourceName) {
+		lines.push(`Source package: ${packageSourceLabel(agent)}`);
+		if (agent.packageSourceRoot) lines.push(`Package root: ${agent.packageSourceRoot}`);
+	}
 	if (agent.packageName) {
 		lines.push(`Local name: ${frontmatterNameForConfig(agent)}`);
 		lines.push(`Package: ${agent.packageName}`);
@@ -584,7 +692,12 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.skills?.length) lines.push(`Skills: ${agent.skills.join(", ")}`);
 	if (agent.skillPath?.length) lines.push(`Skill paths: ${agent.skillPath.join(", ")}`);
 	lines.push(`System prompt mode: ${agent.systemPromptMode}`);
-	if (agent.runner) lines.push(`Runner: ${JSON.stringify(agent.runner)}`);
+	const runnerDetail = formatRunnerDetail(agent, providerStatus.ok ? providerStatus.names : undefined);
+	if (runnerDetail) {
+		lines.push(runnerDetail);
+		if (agent.runner?.type === "external-job" && !providerStatus.ok) lines.push(`External-job provider registry unavailable: ${providerStatus.error}`);
+		if (agent.runner?.type === "external-job" && agent.runner.options) lines.push(`Runner options: ${JSON.stringify(agent.runner.options)}`);
+	}
 	lines.push(`Inherit project context: ${agent.inheritProjectContext ? "true" : "false"}`);
 	lines.push(`Inherit skills: ${agent.inheritSkills ? "true" : "false"}`);
 	if (agent.defaultContext) lines.push(`Default context: ${agent.defaultContext}`);
@@ -598,6 +711,7 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.subagentOnlyExtensions !== undefined) lines.push(`Subagent-only extensions: ${agent.subagentOnlyExtensions.length ? agent.subagentOnlyExtensions.join(", ") : "(none)"}`);
 	if (agent.thinking) lines.push(`Thinking: ${agent.thinking}`);
 	if (agent.output) lines.push(`Output: ${agent.output}`);
+	if (agent.outputMode) lines.push(`Output mode: ${agent.outputMode}`);
 	if (agent.defaultReads?.length) lines.push(`Reads: ${agent.defaultReads.join(", ")}`);
 	if (agent.defaultProgress) lines.push("Progress: true");
 	if (agent.maxSubagentDepth !== undefined) lines.push(`Max subagent depth: ${agent.maxSubagentDepth}`);
@@ -611,7 +725,17 @@ function formatAgentDetail(agent: AgentConfig): string {
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
 	const d = discoverAgentsAll(ctx.cwd);
-	const scopedAgents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package)
+	let scopedAgents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
+	if (ctx.runtimeAgentOwner && listRuntimeAgentConfigs(ctx.runtimeAgentOwner).length > 0) {
+		const configuredAgents: AgentConfig[] = [
+			...d.builtin,
+			...d.package,
+			...d.user,
+			...d.project,
+		];
+		scopedAgents = mergeRuntimeAgents(ctx.runtimeAgentOwner, { agents: scopedAgents }, configuredAgents).agents;
+	}
+	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
 	const visibleAgents = scopedAgents.filter((a) => !a.disabled);
@@ -623,16 +747,16 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 		...(ctx.config?.proactiveSkillSubagents !== undefined ? { config: ctx.config.proactiveSkillSubagents } : {}),
 		discoverAvailableSkills: () => discoverAvailableSkills(ctx.cwd),
 	});
+	const providerStatus = registeredExternalJobProviderStatus();
 	const lines = [
 		"Executable agents:",
-		...(agents.length
-			? agents.map((a) => `- ${a.name} (${a.source}${a.defaultContext ? `, context: ${a.defaultContext}` : ""}${a.aliases?.length ? `, aliases: ${a.aliases.join(", ")}` : ""}): ${a.description}`)
-			: ["- (none)"]),
+		...formatAgentListSections(agents, providerStatus.ok ? providerStatus.names : undefined),
 		...(restrictedAgents.length ? [
 			"",
 			`Restricted agents (not executable in this session${restrictedSources?.length ? `; capability ceiling: ${restrictedSources.join(", ")}` : ""}):`,
-			...restrictedAgents.map((a) => `- ${a.name} (${a.source}${a.aliases?.length ? `, aliases: ${a.aliases.join(", ")}` : ""}): ${a.description}`),
+			...restrictedAgents.map((a) => formatAgentListLine(a, providerStatus.ok ? providerStatus.names : undefined)),
 		] : []),
+		...(!providerStatus.ok && [...agents, ...restrictedAgents].some((agent) => agent.runner?.type === "external-job") ? ["", `External-job provider registry unavailable: ${providerStatus.error}`] : []),
 		...(d.agentDiagnostics?.length ? [
 			"",
 			"Invalid agent definitions:",
@@ -721,6 +845,17 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		lines.push("");
 	}
 
+	const availableFullIds = availableModels.map((m) => m.fullId).sort();
+	if (availableFullIds.length > 0) {
+		lines.push("Available models in this session's registry (copy an exact provider/id when passing model):");
+		lines.push("");
+		const shown = availableFullIds.slice(0, 80);
+		for (const fullId of shown) lines.push(`  ${fullId}`);
+		if (availableFullIds.length > shown.length) lines.push(`  ... and ${availableFullIds.length - shown.length} more`);
+		lines.push("");
+		lines.push("Use an exact provider/id from this list when you pass model; bare ids resolve only when unique in the registry.");
+	}
+
 	return result(lines.join("\n"));
 }
 
@@ -746,9 +881,9 @@ function handleGet(params: ManagementParams, ctx: ManagementContext): AgentToolR
 
 export function handleCreate(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const parsedConfig = configObject(params.config);
-	if (parsedConfig.error) return result(parsedConfig.error, true);
+	if (parsedConfig.status === "error") return result(parsedConfig.message, true);
+	if (parsedConfig.status === "missing") return result("config required for create.", true);
 	const cfg = parsedConfig.value;
-	if (!cfg) return result("config required for create.", true);
 	if (typeof cfg.name !== "string" || !cfg.name.trim()) return result("config.name is required and must be a non-empty string.", true);
 	if (typeof cfg.description !== "string" || !cfg.description.trim()) return result("config.description is required and must be a non-empty string.", true);
 	const name = sanitizeName(cfg.name);
@@ -783,6 +918,8 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 	};
 	const applyError = applyAgentConfig(agent, cfg);
 	if (applyError) return result(applyError, true);
+	const profileError = validateCodeOwnedProfileRunner(agent);
+	if (profileError) return result(profileError, true);
 	const mw = modelWarning(ctx, agent.model);
 	if (mw) warnings.push(mw);
 	const fmw = fallbackModelsWarning(ctx, agent.fallbackModels);
@@ -796,9 +933,9 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 export function handleUpdate(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	if (!params.agent) return result("Specify 'agent' for update.", true);
 	const parsedConfig = configObject(params.config);
-	if (parsedConfig.error) return result(parsedConfig.error, true);
+	if (parsedConfig.status === "error") return result(parsedConfig.message, true);
+	if (parsedConfig.status === "missing") return result("config required for update.", true);
 	const cfg = parsedConfig.value;
-	if (!cfg) return result("config required for update.", true);
 	if (hasKey(cfg, "steps")) return result("Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", true);
 	const warnings: string[] = [];
 	const scopeHint = asDisambiguationScope(params.agentScope);
@@ -806,7 +943,13 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 	if ("content" in targetOrError) return targetOrError;
 	const target = targetOrError;
 	if (target.source !== "user" && target.source !== "project") return result(`Cannot update ${target.source} agent '${target.name}'. Eject it to user or project scope first.`, true);
-	const updated = editableAgentConfig(target);
+	let updated: AgentConfig;
+	try {
+		updated = editableAgentConfig(target);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return result(`Could not reread agent definition ${target.filePath} before updating '${target.name}': ${message}`, true);
+	}
 	const oldName = target.name;
 	if (hasKey(cfg, "name") && (typeof cfg.name !== "string" || !cfg.name.trim())) return result("config.name must be a non-empty string when provided.", true);
 	if (hasKey(cfg, "description") && (typeof cfg.description !== "string" || !cfg.description.trim())) return result("config.description must be a non-empty string when provided.", true);
@@ -828,6 +971,8 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 	if (newPackageName !== undefined) updated.packageName = newPackageName;
 	else delete updated.packageName;
 	updated.name = buildRuntimeName(newLocalName, newPackageName);
+	const profileError = validateCodeOwnedProfileRunner(updated);
+	if (profileError) return result(profileError, true);
 	if (hasKey(cfg, "description")) updated.description = (cfg.description as string).trim();
 	if (hasKey(cfg, "model")) {
 		const mw = modelWarning(ctx, updated.model);

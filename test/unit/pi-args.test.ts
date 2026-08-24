@@ -155,6 +155,68 @@ afterEach(() => {
 });
 
 describe("buildPiArgs session wiring", () => {
+	it("keeps empty-extension warnings in the resolved plan without logging", () => {
+		const originalWarn = console.warn;
+		const warnCalls: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			warnCalls.push(args.map(String).join(" "));
+		};
+		try {
+			const plan = resolvePiLaunchToolPlan({
+				extensions: [],
+				agentName: "quota-reviewer",
+			});
+			assert.equal(plan.disableAmbientExtensions, true);
+			assert.equal(plan.warnings.length, 1);
+			assert.match(plan.warnings[0]!, /extensions: \[\] override for agent 'quota-reviewer'/);
+			assert.match(plan.warnings[0]!, /disables ALL ambient extensions/);
+			assert.deepEqual(warnCalls, []);
+		} finally {
+			console.warn = originalWarn;
+		}
+	});
+
+	it("keeps empty-extension warnings quiet across repeated argument builds", () => {
+		const originalWarn = console.warn;
+		const warnCalls: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			warnCalls.push(args.map(String).join(" "));
+		};
+		try {
+			buildPiArgs({
+				baseArgs: [],
+				task: "Test warning output.",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				extensions: [],
+				childAgentName: "quota-reviewer",
+			});
+			buildPiArgs({
+				baseArgs: [],
+				task: "Retry warning output.",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				extensions: [],
+				childAgentName: "quota-reviewer",
+			});
+			assert.deepEqual(warnCalls, []);
+		} finally {
+			console.warn = originalWarn;
+		}
+	});
+
+	it("does not warn when extensions are omitted (ambient extensions inherited normally)", () => {
+		const plan = resolvePiLaunchToolPlan({});
+		assert.equal(plan.disableAmbientExtensions, false);
+		assert.deepEqual(plan.warnings, []);
+	});
+
+	it("does not warn when extensions is a non-empty explicit list", () => {
+		const plan = resolvePiLaunchToolPlan({ extensions: ["./tools/provider-ext.ts"] });
+		assert.equal(plan.disableAmbientExtensions, true);
+		assert.deepEqual(plan.warnings, []);
+	});
+
 	it("projects launch-resolved extension identifiers without raw paths", () => {
 		const privateExt = path.join(
 			os.tmpdir(),
@@ -806,11 +868,53 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			toolsArg,
 			"read,grep,find,ls,bash,edit,write,contact_supervisor",
 		);
+		// Supervisor-coordination names are runtime-registered in children, so
+		// they are never strict requirements even when named explicitly (#1207).
 		assert.deepEqual(
 			JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"),
-			toolsArg.split(","),
+			["read", "grep", "find", "ls", "bash", "edit", "write"],
 		);
 		assert.equal(env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV], toolDiagnosticPath);
+	});
+
+	it("strips the legacy supervisor pairing from requirements", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read", "intercom", "contact_supervisor"],
+		});
+
+		assert.equal(
+			args[args.indexOf("--tools") + 1],
+			"read,intercom,contact_supervisor",
+		);
+		assert.deepEqual(
+			JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"),
+			["read"],
+		);
+	});
+
+	it("keeps a lone explicit intercom tool strict", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read", "intercom"],
+		});
+
+		assert.equal(
+			args[args.indexOf("--tools") + 1],
+			"read,intercom",
+		);
+		assert.deepEqual(
+			JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"),
+			["read", "intercom"],
+		);
 	});
 
 	it("launches the bundled reviewer without mutation-capable tools", () => {

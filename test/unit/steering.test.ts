@@ -9,11 +9,11 @@ import type { AgentConfig } from "../../src/agents/agents.ts";
 
 describe("steering lifecycle ledger", () => {
 	it("redacts and bounds steering message previews", () => {
-		const secret = "ghp_1234567890abcdef";
-		const preview = steeringMessagePreview(`Use ${secret}\n${"x".repeat(200)}`);
+		const tokenFixture = `${String.fromCharCode(103, 104, 112, 95)}${"1".repeat(16)}`;
+		const preview = steeringMessagePreview(`Use ${tokenFixture}\n${"x".repeat(200)}`);
 		assert.ok(preview.length <= 160);
 		assert.match(preview, /\[redacted\]/);
-		assert.doesNotMatch(preview, new RegExp(secret));
+		assert.doesNotMatch(preview, new RegExp(tokenFixture));
 	});
 
 	it("retains 20 recent requests while aggregate totals remain monotonic", () => {
@@ -149,6 +149,7 @@ describe("steering lifecycle ledger", () => {
 		const recovered = applySteeringRecoveryAgentConfig(current, {
 			version: 1,
 			sourceRunId: "source",
+			runFanoutBudget: { version: 1, rootRunId: "source", directory: "/tmp/fanout", limit: 64, parentPath: "source" },
 			agent: "worker",
 			cwd: "/original",
 			model: "original/model",
@@ -171,6 +172,38 @@ describe("steering lifecycle ledger", () => {
 		for (const field of ["fallbackModels", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "completionGuard", "memory", "output"] as const) {
 			assert.equal(recovered[field], undefined, `${field} leaked from current config`);
 		}
+	});
+
+	it("intersects persisted thinking ceilings with the current agent ceiling", () => {
+		const current = {
+			name: "worker",
+			description: "current",
+			thinking: "high",
+			maxThinking: "low",
+			systemPrompt: "current prompt",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/current/agent.md",
+		} as AgentConfig;
+		const recovered = applySteeringRecoveryAgentConfig(current, {
+			version: 1,
+			sourceRunId: "source",
+			runFanoutBudget: { version: 1, rootRunId: "source", directory: "/tmp/fanout", limit: 64, parentPath: "source" },
+			agent: "worker",
+			cwd: "/original",
+			thinking: "xhigh",
+			thinkingCeiling: "xhigh",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			outputMode: "inline",
+			maxSubagentDepth: 2,
+			share: false,
+		});
+		assert.equal(recovered.thinking, "xhigh");
+		assert.equal(recovered.maxThinking, "low");
 	});
 
 	it("rejects recovery when any configured hard budget is exhausted", () => {
