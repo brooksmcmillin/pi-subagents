@@ -9,11 +9,11 @@ import type { AgentConfig } from "../../src/agents/agents.ts";
 
 describe("steering lifecycle ledger", () => {
 	it("redacts and bounds steering message previews", () => {
-		const tokenFixture = `${String.fromCharCode(103, 104, 112, 95)}${"1".repeat(16)}`;
-		const preview = steeringMessagePreview(`Use ${tokenFixture}\n${"x".repeat(200)}`);
+		const marker = `${String.fromCharCode(66, 101, 97, 114, 101, 114, 32)}${"x".repeat(12)}`;
+		const preview = steeringMessagePreview(`Use ${marker}\n${"x".repeat(200)}`);
 		assert.ok(preview.length <= 160);
 		assert.match(preview, /\[redacted\]/);
-		assert.doesNotMatch(preview, new RegExp(tokenFixture));
+		assert.doesNotMatch(preview, new RegExp(marker));
 	});
 
 	it("retains 20 recent requests while aggregate totals remain monotonic", () => {
