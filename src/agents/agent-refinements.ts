@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { discoverAgents, resolveAgentName, type AgentConfig } from "./agents.ts";
+import { discoverAgents, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig } from "./agents.ts";
 import { getProjectSubagentsDir } from "../shared/artifacts.ts";
 import type { Details, JsonSchemaObject, SingleResult, SubagentState } from "../shared/types.ts";
 
@@ -177,7 +177,12 @@ function extractFence(markdown: string, fence: string): string | null {
 export function parseRefinementFile(markdown: string, label = "refinement file"): ParsedRefinementFile {
 	const metadataMatch = markdown.match(/^<!-- pi-subagents-refinement:v1\n([\s\S]*?)\n-->\n/);
 	if (!metadataMatch?.[1]) throw new Error(`${label} is missing refinement metadata.`);
-	const metadataValue = JSON.parse(metadataMatch[1]) as unknown;
+	let metadataValue: unknown;
+	try {
+		metadataValue = JSON.parse(metadataMatch[1]);
+	} catch (error) {
+		throw new Error(`${label} contains invalid refinement metadata JSON.`, { cause: error });
+	}
 	const metadataRecord = record(metadataValue);
 	if (!metadataRecord) throw new Error(`${label} metadata must be an object.`);
 	const agent = text(metadataRecord.agent);
@@ -196,7 +201,12 @@ export function parseRefinementFile(markdown: string, label = "refinement file")
 	const current = extractFence(markdown, CURRENT_FENCE);
 	if (current === null) throw new Error(`${label} is missing current refinement block.`);
 	const snapshotsRaw = extractFence(markdown, SNAPSHOTS_FENCE) ?? "[]";
-	const snapshotsValue = JSON.parse(snapshotsRaw) as unknown;
+	let snapshotsValue: unknown;
+	try {
+		snapshotsValue = JSON.parse(snapshotsRaw);
+	} catch (error) {
+		throw new Error(`${label} contains invalid refinement snapshots JSON.`, { cause: error });
+	}
 	if (!Array.isArray(snapshotsValue)) throw new Error(`${label} snapshots must be an array.`);
 	const snapshots = snapshotsValue.map((entry, index): RefinementSnapshot => {
 		const item = record(entry);
@@ -369,7 +379,7 @@ export function collectBoundedRefinementEvidence(cwd: string, agentName: string,
 			continue;
 		}
 		for (const [index, step] of matchingSteps.entries()) {
-			const stepRecord = step as unknown as Record<string, unknown>;
+			const stepRecord = record(step) ?? {};
 			pushCapped(items, {
 				id: `live:${job.asyncId}:${index}`,
 				source: "live-state",
@@ -499,16 +509,21 @@ function proposalSchema(): JsonSchemaObject {
 	};
 }
 
-function proposalFromChild(child: ProposalChildResult): unknown {
+function proposalFromChild(child: ProposalChildResult): Record<string, unknown> | string | null {
 	for (const entry of child.details?.results ?? []) {
-		if (entry.structuredOutput !== undefined) return entry.structuredOutput;
+		const structuredProposal = record(entry.structuredOutput);
+		if (structuredProposal) return structuredProposal;
 	}
 	const output = child.details?.results?.map((entry) => entry.finalOutput ?? "").find((entry) => entry.trim().length > 0)
 		?? child.content?.map((entry) => entry.text ?? "").find((entry) => entry.trim().length > 0)
 		?? "";
 	const jsonMatch = output.match(/```(?:json)?\n([\s\S]*?)\n```/) ?? output.match(/({[\s\S]*})/);
 	if (!jsonMatch?.[1]) return null;
-	try { return JSON.parse(jsonMatch[1]) as unknown; } catch { return null; }
+	try {
+		return record(JSON.parse(jsonMatch[1]));
+	} catch {
+		return null;
+	}
 }
 
 function proposalTask(agent: AgentConfig, current: string, evidence: RefinementEvidenceItem[]): string {
@@ -536,10 +551,10 @@ function guidanceFromProposal(proposal: RefinementProposal): string {
 }
 
 function resolveOneAgent(cwd: string, agentName: string): { ok: true; agent: AgentConfig } | { ok: false; error: string } {
-	const agents = discoverAgents(cwd, "both").agents;
-	const resolved = resolveAgentName(agentName, agents);
+	const discovered = discoverAgents(cwd, "both");
+	const resolved = resolveAgentName(agentName, discovered.agents);
 	if (resolved.error) return { ok: false, error: resolved.error };
-	if (!resolved.agent) return { ok: false, error: `Unknown agent: ${agentName}` };
+	if (!resolved.agent) return { ok: false, error: formatUnknownAgentError(agentName, unknownAgentDiagnosticContext(discovered)) };
 	return { ok: true, agent: resolved.agent };
 }
 

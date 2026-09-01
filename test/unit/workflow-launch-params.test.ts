@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	compactSuccessfulFileOnlyWorkflowResult,
 	prepareWorkflowLaunchParams,
+	promptAuditRedoParams,
 	sanitizeRunPathSegment,
 	workflowChildResults,
 } from "../../src/runs/foreground/subagent-executor.ts";
@@ -102,6 +103,53 @@ describe("workflow launch params", () => {
 				workflowKey: "run",
 			},
 		);
+	});
+
+	it("does not forward workflow capacity overrides to children", () => {
+		const params = prepareWorkflowLaunchParams(
+			{ globalConcurrencyLimit: 2, maxSubagentSpawnsPerRun: 3 },
+			{ agent: "worker", task: "Run", globalConcurrencyLimit: 4, maxSubagentSpawnsPerRun: 5 },
+			"workflow-run",
+			"run",
+		);
+		assert.equal(params.globalConcurrencyLimit, undefined);
+		assert.equal(params.maxSubagentSpawnsPerRun, undefined);
+	});
+
+	it("marks only new async workflow children to preserve live supervisor-detach awaits", () => {
+		// Retained workflow children already use the async result-file await path.
+		assert.equal(prepareWorkflowLaunchParams(
+			{},
+			{ agent: "worker", task: "Run" },
+			"workflow-run",
+			"run",
+			{ awaitDetachedChild: true },
+		).workflowAwaitDetached, true);
+		assert.equal(prepareWorkflowLaunchParams(
+			{},
+			{ resume: "retained-run", task: "Continue" },
+			"workflow-run",
+			"resume",
+			{ awaitDetachedChild: true },
+		).workflowAwaitDetached, undefined);
+	});
+
+	it("scrubs the live workflow detach bridge from prompt-audit redo params", () => {
+		const workflowChild = prepareWorkflowLaunchParams(
+			{},
+			{ agent: "worker", task: "Run" },
+			"workflow-run",
+			"run",
+			{ awaitDetachedChild: true },
+		);
+		assert.equal(workflowChild.workflowAwaitDetached, true);
+
+		const redo = promptAuditRedoParams(workflowChild, "Run with narrower guidance");
+		assert.equal(redo.workflowAwaitDetached, undefined);
+		assert.equal(redo.workflowParentRunId, undefined);
+		assert.equal(redo.workflowKey, undefined);
+		assert.equal(redo.async, false);
+		assert.equal(redo.task, "Run with narrower guidance");
 	});
 
 	it("passes an omitted child timeout parent deadline for default resolution", () => {
@@ -345,12 +393,11 @@ describe("workflow launch params", () => {
 	it("preserves execution limits and fan-out identity when routing retained resume items", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
-				{ turnBudget: { maxTurns: 8 }, toolBudget: { hard: 12, block: ["read"] } },
+				{ toolBudget: { hard: 12, block: ["read"] } },
 				{
 					resume: " retained-run ",
 					task: "Continue carefully",
 					maxRuntimeMs: 5_000,
-					turnBudget: { maxTurns: 3, graceTurns: 1 },
 					toolBudget: { soft: 2, hard: 4, block: "*" },
 				},
 				"workflow-run",
@@ -366,7 +413,6 @@ describe("workflow launch params", () => {
 				runFanoutBudget: { version: 1, rootRunId: "root-run", directory: "/tmp/fanout", limit: 64, parentPath: "parent/workflow[continue]" },
 				mission: false,
 				timeoutMs: 5_000,
-				turnBudget: { maxTurns: 3, graceTurns: 1 },
 				toolBudget: { soft: 2, hard: 4, block: "*" },
 			},
 		);

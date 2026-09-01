@@ -1,12 +1,6 @@
-# Pi Subagents: Constraints
+# Pi Subagents: Constraints And Recipes
 
 This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
-Read it after the parent has decided to delegate and wants to confirm the
-always-on safety rules before launching or reviewing child work. Orchestration
-recipes (Fable mode, Recon → Plan → Implement, review loop, parallel review,
-parallel cleanup, staged fix orchestration, etc.) live in
-`references/orchestration-recipes.md`; this file only covers constraints, best
-practices, and error handling.
 
 ## Important Constraints
 
@@ -27,7 +21,7 @@ practices, and error handling.
   become second decision-makers.
 - **Respect the fixed authority policy.** `authorityPolicy` is a small `auto` / `confirm` / `forbid` map for supported operational actions. Worktree discard, destructive cleanup, and spawn-budget grants default to confirmation; stop, steer, and schedule creation remain automatic. Use `worktree.discard` with the durable `handoffPath`; confirm-required actions refuse safely without an interactive UI and retained paths include manual Git recovery commands.
 
-Runtime config can change orchestration behavior. `intercomBridge.resultDelivery: false` disables only external acknowledged grouped-result delivery when native parent notifications own completion; supervisor asks/progress stay active, and enabled transport failures are still reported. `asyncByDefault` and `forceTopLevelAsync` affect whether launches detach; `waitTool` can make direct `subagent_wait()` calls return immediately while headless auto-drain remains active, and its effective value is propagated to child runtimes; `globalConcurrencyLimit` bounds concurrent fanout, while a positive `maxSubagentSpawnsPerSession` optionally caps cumulative launches (`0` or unset is unlimited). Status and doctor report the budget; static work preflights declared capacity; only the settled root interactive parent can use `grant-spawn-budget` after native confirmation, with total grants bounded by the original cap. Compaction does not reset usage or grants; `singleRunOutputBaseDir` and `worktreeBaseDir` route outputs and worktrees; `completionBatch` groups async notifications. `artifactDir` is `session` (default), `project`, or `temp` and chooses where subagent artifacts are stored. Set `asyncWidget: false` to hide the above-editor background-run widget when a companion footer or dashboard owns that space (fleet inspector remains available). Per-run `artifacts: false` disables artifact capture for that launch. Async status and result artifacts include `lifecycleArtifactVersion` and fields such as `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `turnCount`, `toolCount`, and nested `children`. Child protocol failures expose a structured `protocolError`; `protocol_output_limit` means a child emitted a JSONL line above the 16 MiB live-parser cap. Prefer these artifacts and `status` views over scraping terminal output.
+Runtime config can change orchestration behavior. `intercomBridge.resultDelivery: false` disables only external acknowledged grouped-result delivery when native parent notifications own completion; supervisor asks/progress stay active, and enabled transport failures are still reported. `asyncByDefault` and `forceTopLevelAsync` affect whether launches detach; `waitTool` can make direct `bg_wait()` calls return immediately while headless auto-drain remains active, and its effective value is propagated to child runtimes; `globalConcurrencyLimit` bounds concurrent fanout, while a positive `maxSubagentSpawnsPerSession` optionally caps cumulative launches (`0` or unset is unlimited). Status and doctor report the budget; static work preflights declared capacity; only the settled root interactive parent can use `grant-spawn-budget` after native confirmation, with total grants bounded by the original cap. Compaction does not reset usage or grants; `singleRunOutputBaseDir` and `worktreeBaseDir` route outputs and worktrees; `completionBatch` groups async notifications. `artifactDir` is `session` (default), `project`, or `temp` and chooses where subagent artifacts are stored. Set `asyncWidget: false` to hide the above-editor background-run widget when a companion footer or dashboard owns that space (fleet inspector remains available). Per-run `artifacts: false` disables artifact capture for that launch. Async status and result artifacts include `lifecycleArtifactVersion` and fields such as `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `turnCount`, `toolCount`, and nested `children`. Child protocol failures expose a structured `protocolError`; `protocol_output_limit` means a child emitted a JSONL line above the 16 MiB live-parser cap. Prefer these artifacts and `status` views over scraping terminal output.
 
 ### Keep report artifacts out of the repository root
 
@@ -37,109 +31,40 @@ For durable evidence, copy only the final summary to session memory, a PR body/c
 
 ## Best Practices
 
-### Prefer async orchestration
+- Run subagents asynchronously by default; direct one-child execution is enough for one bounded task, while `workflowScript` is the composition surface for JavaScript control flow and data-dependent branching. Use `async: false` only when the parent must block. See `references/execution-controls.md` → Async/background for wait semantics.
+- For a predeclared broad plan split into visible narrow stages, use `runs.lanes([...])` inside `workflowScript`; use raw `runs.run(...)`/`runs.all(...)` for conditional or rolling flows. See [`execution-controls.md`](execution-controls.md#parallel-sequential-lanes).
+- Keep one writer per cwd/worktree. Parallelize reading, review, and validation; concurrent writers need isolated worktrees. Give every child a cold-start packet with its goal, target/ref, authority, context, success criteria, validation, output, and stop rules.
+- Keep tasks narrow and standalone; do not rely on issue numbers, broad globs, or supervisor round-trips to supply missing context.
+- Keep authority with the parent. Escalate unapproved product, scope, architecture, merge, credential, or release decisions; checks, receipts, and review bots are evidence, not authority.
+- Use `fresh` context for adversarial review. `fork` is a persisted, history-inheriting branch; see `references/execution-controls.md` for its preconditions.
+- Use a same-session oracle follow-up only when its first answer leaves a material tradeoff. Treat `needs_attention` as a control signal, not failure, and do not interrupt a child merely because it is quiet during tools, tests, or reasoning.
+- Use `/name` when intercom targeting needs a stable session name.
 
-Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and scripted workflows unless you intentionally need a foreground/blocking run. Launch all execution through `workflowScript`; use `return runs.run("main", { agent, task })` for one isolated child and `runs.all([...])` when two or more child lanes, monitors, or dependent steps should move together. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
+## Workflow selection
 
-### Use subagent_wait() to block until async runs finish
+This reference keeps cross-cutting policy and failure handling. Load the matching domain reference for detail:
 
-In an interactive chat, do not call `subagent_wait()` merely to wait after launching background work; return control to the user and Pi will wake the session on completion. Override that default when the current request is run-to-completion — for example, the user asked you to stay with the task and report results back this turn or a skill must finish in one turn. In a headless run, Pi auto-drains exact current-session work at `agent_end`; call `subagent_wait()` when this turn must receive results before it ends. In either case, `subagent_wait()` blocks the current turn until the next run completes or needs attention, keeps the turn alive for normal notification delivery, then returns.
+| Need | Read |
+| --- | --- |
+| Execution syntax, lifecycle, async/wait, missions, controls, watchdog, or worktrees | [`references/execution-controls.md`](execution-controls.md) |
+| Role choice, prompt contracts, review/research/cleanup techniques, or model tiering | [`references/prompting-and-roles.md`](prompting-and-roles.md) |
+| Fresh review, validation, gate failures, finding disposition, and final delivery checks | [`references/review-and-validation.md`](review-and-validation.md) |
+| Independent lanes, repositories, worktrees, and handoffs | [`references/multi-lane-orchestration.md`](multi-lane-orchestration.md) |
+| Agent management, file authoring, prompt integration, or RPC | [`references/management-authoring-rpc.md`](management-authoring-rpc.md) |
 
-- `subagent_wait()` — return when the next initially active async run or registered provider item finishes, or a subagent needs attention.
-- `subagent_wait({ all: true })` — block until every async run and provider item active at call time finishes, or a subagent needs attention.
-- `subagent_wait({ id: "..." })` — block on one async or remembered detached foreground run (id or prefix). Provider items are not selected through this parameter.
-- `subagent_wait({ stopOnAttention: false })` — for blocking waits only, keep waiting through idle or long-thinking attention; supervisor/contact requests still stop the wait.
-- `subagent_wait({ timeoutMs })` — cap the block; active work keeps running if it elapses.
+Choose the smallest recipe that fits:
 
-Providers are discovered through the `pi-subagents/background-work` registry and must return stable item IDs with exact owning session IDs. Child agents receive no provider automatically: keep `subagent_wait` in the child `tools` allowlist and load provider extensions through `extensions` or `subagentOnlyExtensions`.
-
-For non-interactive fleet orchestration, `subagent_wait()` can keep N workers in flight: launch N, wait for the next completion, react to the result, launch a replacement if needed, then wait again. Use `subagent_wait({ all: true })` only when you intentionally want to drain the fleet to zero. If the turn ends first, headless `agent_end` auto-drain still waits for exact current-session work. In an interactive session, return to the user instead of holding the turn open just to await completion.
-
-If config or `PI_SUBAGENT_WAIT_TOOL_ENABLED` disables blocking behavior, direct `subagent_wait` calls return immediately. Headless `agent_end` auto-drain remains active as a lifecycle safeguard and surfaces provider, reconciliation, or timeout failures.
-
-### Keep writes single-threaded by default
-
-A strong pattern is one main decision-maker plus advisory/research/review/validation subagents around it. Use `oracle` for advice and `worker` for the actual write path. Parallelize reading, review, validation, and synthesis support, not normal writes, unless you deliberately isolate writers with worktrees. Across repositories, each repo/worktree still gets at most one writer, with explicit `cwd` and authority in the child prompt. A child that writes should report what changed, what was left undone, commands run with exit codes, validation evidence, surprises, and any decisions that need parent approval.
-
-### Use fork for branched advisory or execution threads
-
-Forked runs are useful when the child should reason in a separate thread while
-still inheriting the parent's accumulated context. They are especially useful for
-`oracle`, which audits inherited decisions and drift. For adversarial code review,
-prefer fresh-context reviewers that inspect the repo and diff directly unless the
-user explicitly requests forked context.
-
-### Prefer narrow tasks
-
-Give subagents specific tasks rather than vague mandates.
-`Review auth.ts for null-check gaps` works better than `Review everything`.
-
-Before fanout, assign each child a lightweight task profile in the parent prompt:
-work kind, required input, expected output, acceptance check, and context mode.
-Keep the profile prose-only; do not invent runtime fields. Use coarse kinds such
-as `code-write`, `code-read`, `transform`, `summarize`, and `search` only to
-shape the task and choose an existing agent/model setting. If a child task is not
-standalone enough for fresh context, add the missing facts to the prompt, switch
-to forked context, or ask the user. Do not launch vague tasks and rely on
-supervisor round-trips to recover missing context.
-
-### Escalate decisions upward
-
-If a subagent encounters an unapproved product, architecture, scope, merge, release, credential, or authority choice, it should use `contact_supervisor` and wait for the reply instead of deciding alone. Generic `intercom` is external or provider-supplied only. Use it only when external bridge instructions provide an explicit safe target. External checks, receipts, and review bots provide evidence only; they do not grant authority.
-
-### Use a short oracle consultation for material advice
-
-When a user asks to ask, consult, discuss with, or come to agreement with `oracle` about a plan, design, or architecture decision, do not treat the first advisory report as final when it raises a material challenge or tradeoff. Read it, resume the same oracle session once with a targeted question, then make the parent decision. An explicit one-shot request, a trivial question, or a fully settled first answer does not need a follow-up.
-
-### Intervene only on clear control signals
-
-Use subagent control proactively when a delegated run emits `needs_attention`, or when a human asks you to regain control. Do not interrupt just because a child has briefly produced no output. Silence can be normal during long tool calls, test runs, or model reasoning.
-
-### Name sessions meaningfully
-
-Use `/name` so intercom targeting stays stable.
+- **Recon → plan → implement:** run one focused `scout`, then one `worker` that consumes its findings.
+- **Non-trivial implementation:** clarify scope and acceptance, record user-owned decisions and seam/validation contracts, scout load-bearing code, plan when useful, use one writer, run fresh review/validation, apply only accepted fixes with one writer, then inspect direct evidence and the final diff before parent acceptance. Split large work into serial milestones instead of a writer swarm; do not stop at review without disposition.
+- **Parallel analysis:** fan out only independent read/review/validation work, or isolate each writer in its own worktree. Never run concurrent writers in one checkout.
 
 ## Error Handling
 
-**"Unknown agent"**
-```typescript
-subagent({ action: "list" })
-// Check available agents, then confirm scope/precedence. Saved chains are not a
-// public execution surface; author orchestration with workflowScript.
-```
-
-**Setup, discovery, or intercom confusion**
-```typescript
-subagent({ action: "doctor" })
-// Check runtime paths, async support, discovery counts, current session, and intercom bridge state.
-```
-
-**"Max subagent depth exceeded"**
-```typescript
-// Flatten the workflow or raise maxSubagentDepth in config.
-```
-
-**"Session manager did not return a session file"**
-```typescript
-// Persist the current session before using context: "fork".
-```
-
-**Intercom "Already waiting for a reply"**
-```typescript
-// Resolve the current outbound ask before starting another one.
-```
-
-**Parallel output-path conflict**
-```typescript
-// Give each parallel task a distinct output path, or disable output for tasks that do not need it.
-```
-
-**Worktree launch fails**
-```typescript
-// Ensure the git working tree is clean and task cwd overrides match the shared cwd.
-```
-
-**Child fails before starting**
-```typescript
-// Inspect `subagent({ action: "status", id: "..." })`, artifact metadata/output logs, and run doctor. Extension loader errors usually appear in child output logs.
-```
+- **Unknown agent:** run `subagent({ action: "list" })`; check scope/precedence and author new orchestration with `workflowScript`, not legacy chains.
+- **Setup, discovery, or intercom confusion:** run `subagent({ action: "doctor" })`.
+- **Max subagent depth exceeded:** flatten the workflow or raise `maxSubagentDepth` in config.
+- **Missing session file for a fork:** persist the parent session before using `context: "fork"`.
+- **Intercom already waiting for a reply:** resolve the pending ask before starting another.
+- **Parallel output-path conflict:** give each task a distinct output path, or disable output where no artifact is needed.
+- **Worktree launch failure:** ensure the git tree is clean and task cwd overrides match the shared cwd.
+- **Child fails before starting:** inspect `subagent({ action: "status", id: "..." })`, artifact metadata, output logs, and `doctor`; loader errors usually appear in child logs.

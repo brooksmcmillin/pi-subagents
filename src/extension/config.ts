@@ -8,6 +8,8 @@ import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import { DEFAULT_MODEL_EXCLUSION_TTL_MS, MAX_MODEL_EXCLUSION_TTL_MS, setDefaultTTL } from "../runs/shared/model-exclusions.ts";
 import { validatePermissionConfig } from "../runs/shared/permissions.ts";
+import { MAX_ABANDONED_SLOT_RELEASE_AFTER_MS, MIN_ABANDONED_SLOT_RELEASE_AFTER_MS } from "../runs/background/active-async-capacity.ts";
+import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
 const FLEET_KEYBINDING_ACTION_SET = new Set<string>(FLEET_KEYBINDING_ACTIONS);
@@ -16,6 +18,23 @@ const BASE_KEY_IDS = new Set([
 	..."abcdefghijklmnopqrstuvwxyz0123456789",
 	...Object.values(Key).flatMap((value) => typeof value === "string" ? [value.toLowerCase()] : []),
 ]);
+
+class PrunedForkConfigError extends Error {}
+
+function validateForkContextConfig(value: unknown): void {
+	if (value === undefined) return;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.forkContext must be a JSON object");
+	const config = value as Record<string, unknown>;
+	if (config.mode !== undefined && config.mode !== "full" && config.mode !== "pruned") {
+		throw new Error('config.forkContext.mode must be "full" or "pruned"');
+	}
+	if (config.model !== undefined && (typeof config.model !== "string" || !config.model.trim())) {
+		throw new PrunedForkConfigError("config.forkContext.model must be a non-empty string");
+	}
+	if (config.mode === "pruned" && config.model === undefined) {
+		throw new PrunedForkConfigError('config.forkContext.model is required when config.forkContext.mode is "pruned"');
+	}
+}
 
 function isValidKeyId(value: string): boolean {
 	if (value !== value.trim()) return false;
@@ -63,6 +82,20 @@ function validateArtifactConfig(value: unknown): void {
 	}
 }
 
+function validateCapacityConfig(value: unknown): void {
+	if (value === undefined) return;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.capacity must be a JSON object");
+	const abandonedSlotReleaseAfterMs = (value as Record<string, unknown>).abandonedSlotReleaseAfterMs;
+	if (abandonedSlotReleaseAfterMs !== undefined
+		&& abandonedSlotReleaseAfterMs !== false
+		&& (typeof abandonedSlotReleaseAfterMs !== "number"
+			|| !Number.isInteger(abandonedSlotReleaseAfterMs)
+			|| abandonedSlotReleaseAfterMs < MIN_ABANDONED_SLOT_RELEASE_AFTER_MS
+			|| abandonedSlotReleaseAfterMs > MAX_ABANDONED_SLOT_RELEASE_AFTER_MS)) {
+		throw new Error(`config.capacity.abandonedSlotReleaseAfterMs must be false or an integer from ${MIN_ABANDONED_SLOT_RELEASE_AFTER_MS} to ${MAX_ABANDONED_SLOT_RELEASE_AFTER_MS}`);
+	}
+}
+
 /** Validate the user-controlled TTL policy before it reaches the exclusion store. */
 // TEST:test/unit/pi-coding-agent-dir.test.ts[loads and applies model exclusion TTL config]
 function validateModelExclusionsConfig(value: unknown): void {
@@ -106,9 +139,20 @@ function validateMainWindowRendererConfig(value: unknown): void {
 }
 
 function validateConfig(config: Record<string, unknown>): void {
+	if (config.worktree !== undefined && typeof config.worktree !== "boolean") {
+		throw new Error("config.worktree must be a boolean");
+	}
+	if (config.worktreeProvider !== undefined && config.worktreeProvider !== "auto" && config.worktreeProvider !== "native" && config.worktreeProvider !== "worktrunk") {
+		throw new Error('config.worktreeProvider must be "auto", "native", or "worktrunk"');
+	}
+	if (config.worktreeBranchPrefix !== undefined) {
+		if (typeof config.worktreeBranchPrefix !== "string") throw new Error("config.worktreeBranchPrefix must be a string");
+		normalizeWorktreeBranchPrefix(config.worktreeBranchPrefix);
+	}
 	if (config.defaultSubagentContext !== undefined && config.defaultSubagentContext !== "fresh" && config.defaultSubagentContext !== "fork") {
 		throw new Error('config.defaultSubagentContext must be "fresh" or "fork"');
 	}
+	validateForkContextConfig(config.forkContext);
 	if (config.foregroundDetachShortcut !== undefined
 		&& (typeof config.foregroundDetachShortcut !== "string" || !isValidKeyId(config.foregroundDetachShortcut))) {
 		throw new Error("config.foregroundDetachShortcut must be a valid keybinding string such as \"ctrl+b\"");
@@ -131,6 +175,7 @@ function validateConfig(config: Record<string, unknown>): void {
 	validateScheduledRunsConfig(config.scheduledRuns);
 	validateFleetKeybindingsConfig(config.fleetKeybindings);
 	validateArtifactConfig(config.artifactConfig);
+	validateCapacityConfig(config.capacity);
 	validateModelExclusionsConfig(config.modelExclusions);
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
@@ -199,6 +244,16 @@ export function loadConfig(): ExtensionConfig {
 	try {
 		return readConfigForUpdate(configPath);
 	} catch (error) {
+		if (error instanceof PrunedForkConfigError) throw error;
+		// An explicitly requested worktree provider/prefix must not be silently
+		// discarded and replaced by the built-in defaults after validation fails.
+		try {
+			const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
+			if (raw && typeof raw === "object" && !Array.isArray(raw)
+				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix"))) throw error;
+		} catch (readError) {
+			if (readError === error) throw error;
+		}
 		console.error(`Failed to load subagent config from '${configPath}':`, error);
 	}
 	return {};
