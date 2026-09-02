@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { safeTerminalText } from "../../shared/display-text.ts";
-import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
+import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
@@ -39,6 +39,65 @@ interface RunStatusParams {
 	index?: number;
 	view?: "fleet" | "transcript";
 	lines?: number;
+}
+
+const ACTIVE_STATUS_RECHECK_INTERVAL_MS = 30_000;
+const ACTIVE_STATUS_CHECK_RETENTION_MS = 10 * 60_000;
+const ACTIVE_STATUS_DELIVERY_GUIDANCE = "Wait: completion delivery or headless draining is already handled by Pi. This is a one-shot snapshot; return control now and do not call status again to wait. Every retry starts another parent-model turn and can reprocess uncached context.";
+
+function suppressRapidStatusCheck(
+	state: SubagentState | undefined,
+	key: string,
+	now: number,
+	heading: readonly string[],
+): string | undefined {
+	if (!state) return undefined;
+	const checks = state.activeStatusChecks ??= new Map<string, number>();
+	for (const [recordKey, checkedAt] of checks) {
+		if (now - checkedAt >= ACTIVE_STATUS_CHECK_RETENTION_MS) checks.delete(recordKey);
+	}
+	const previous = checks.get(key);
+	if (previous !== undefined && now - previous < ACTIVE_STATUS_RECHECK_INTERVAL_MS) {
+		const elapsedSeconds = Math.max(0, Math.floor((now - previous) / 1_000));
+		return [
+			...heading,
+			`Status polling suppressed: the last one-shot snapshot was ${elapsedSeconds}s ago.`,
+			"Do not retry this status call. Pi will deliver completion or attention automatically; return control now. Repeated checks create full parent-model turns and risk expensive prompt-cache misses.",
+			"For a deliberate investigation rather than waiting, use view=\"transcript\" or FleetView.",
+		].join("\n");
+	}
+	checks.set(key, now);
+	return undefined;
+}
+
+function suppressRapidActiveStatusCheck(
+	params: RunStatusParams,
+	status: AsyncStatus,
+	state: SubagentState | undefined,
+	now: number,
+): string | undefined {
+	if (!state) return undefined;
+	const key = `run:${status.sessionId ?? state.currentSessionId ?? "unknown"}:${status.runId}`;
+	if (status.state !== "queued" && status.state !== "running") {
+		state.activeStatusChecks?.delete(key);
+		return undefined;
+	}
+	if (params.view !== undefined) return undefined;
+	return suppressRapidStatusCheck(state, key, now, [`Run: ${status.runId}`, `State: ${status.state}`]);
+}
+
+function suppressRapidActiveStatusList(
+	runs: readonly AsyncRunSummary[],
+	state: SubagentState | undefined,
+	now: number,
+): string | undefined {
+	if (!state) return undefined;
+	const key = `list:${state.currentSessionId ?? "unknown"}`;
+	if (runs.length === 0) {
+		state.activeStatusChecks?.delete(key);
+		return undefined;
+	}
+	return suppressRapidStatusCheck(state, key, now, [`Active async runs: ${runs.length}`]);
 }
 
 function formatProcessTerminal(value: AsyncStatus["processTerminal"] | undefined): string {
@@ -330,9 +389,18 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					details: { mode: "single", results: [] },
 				};
 			}
+			const pollSuppression = suppressRapidActiveStatusList(runs, deps.state, deps.now?.() ?? Date.now());
+			if (pollSuppression) {
+				return {
+					content: [{ type: "text", text: pollSuppression }],
+					isError: true,
+					details: { mode: "single", results: [] },
+				};
+			}
 			const waitSubscriptions = deps.state ? formatWaitSubscriptions(deps.state, deps.now?.() ?? Date.now()) : undefined;
+			const deliveryGuidance = deps.state && runs.length > 0 ? ACTIVE_STATUS_DELIVERY_GUIDANCE : undefined;
 			return {
-				content: [{ type: "text", text: [formatAsyncRunList(runs), waitSubscriptions].filter(Boolean).join("\n\n") }],
+				content: [{ type: "text", text: [formatAsyncRunList(runs), waitSubscriptions, deliveryGuidance].filter(Boolean).join("\n\n") }],
 				details: { mode: "single", results: [] },
 			};
 		} catch (error) {
@@ -467,6 +535,14 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					const message = error instanceof Error ? error.message : String(error);
 					return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", results: [] } };
 				}
+			}
+			const pollSuppression = suppressRapidActiveStatusCheck(params, status, deps.state, deps.now?.() ?? Date.now());
+			if (pollSuppression) {
+				return {
+					content: [{ type: "text", text: pollSuppression }],
+					isError: true,
+					details: { mode: "single", results: [] },
+				};
 			}
 			let nestedChildren: NestedRunSummary[] = [];
 			let nestedWarning: string | undefined;
@@ -637,6 +713,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
+			if (deps.state && (status.state === "queued" || status.state === "running")) lines.push(ACTIVE_STATUS_DELIVERY_GUIDANCE);
 
 			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");

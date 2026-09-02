@@ -245,6 +245,179 @@ describe("async run status inspection", () => {
 		}
 	});
 
+	it("suppresses rapid model-driven polling of an active async run", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-poll-guard-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-poll-guard");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-poll-guard",
+				sessionId: "session-current",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				currentStep: 0,
+				steps: [{ agent: "reviewer", status: "running", startedAt: 100 }],
+			}, null, 2), "utf-8");
+			const state: SubagentState = {
+				baseCwd: root,
+				currentSessionId: "session-current",
+				asyncJobs: new Map(),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+			let now = 1_000;
+			const deps = {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => now,
+				state,
+			};
+
+			const first = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(first.isError, undefined);
+			assert.match(textContent(first), /one-shot snapshot; return control now/);
+			assert.match(textContent(first), /can reprocess uncached context/);
+
+			now = 6_000;
+			const repeated = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(repeated.isError, true);
+			assert.match(textContent(repeated), /Status polling suppressed: the last one-shot snapshot was 5s ago/);
+			assert.match(textContent(repeated), /risk expensive prompt-cache misses/);
+			assert.doesNotMatch(textContent(repeated), /Progress:/);
+
+			const transcript = inspectSubagentStatus({ id: "run-poll-guard", view: "transcript" }, deps);
+			assert.equal(transcript.isError, undefined);
+			assert.doesNotMatch(textContent(transcript), /Status polling suppressed/);
+
+			now = 31_001;
+			const later = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(later.isError, undefined);
+			assert.match(textContent(later), /Progress:/);
+
+			const statusPath = path.join(asyncDir, "status.json");
+			const persisted = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			persisted.state = "queued";
+			persisted.steps[0].status = "pending";
+			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			now = 32_001;
+			const queued = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(queued.isError, true);
+			assert.match(textContent(queued), /State: queued/);
+
+			now = 62_002;
+			const queuedLater = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(queuedLater.isError, undefined);
+			persisted.state = "paused";
+			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			now = 63_000;
+			const terminal = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(terminal.isError, undefined);
+
+			persisted.state = "running";
+			persisted.steps[0].status = "running";
+			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			now = 63_001;
+			const afterTerminal = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(afterTerminal.isError, undefined);
+
+			persisted.sessionId = "session-other";
+			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			now = 63_002;
+			const otherSession = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(otherSession.isError, undefined);
+
+			const fleet = inspectSubagentStatus({ view: "fleet" }, deps);
+			assert.doesNotMatch(textContent(fleet), /Status polling suppressed/);
+
+			state.activeStatusChecks!.set("stale-record", 0);
+			now = 700_000;
+			inspectSubagentStatus({ id: "run-poll-guard" }, deps);
+			assert.equal(state.activeStatusChecks!.has("stale-record"), false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("suppresses rapid no-id active status listing", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-list-poll-guard-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-list-poll-guard");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const statusPath = path.join(asyncDir, "status.json");
+			const status = {
+				runId: "run-list-poll-guard",
+				sessionId: "session-current",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				currentStep: 0,
+				steps: [{ agent: "reviewer", status: "running", startedAt: 100 }],
+			};
+			fs.writeFileSync(statusPath, JSON.stringify(status, null, 2), "utf-8");
+			updateActiveRunIndex(asyncDir, "running");
+			const state: SubagentState = {
+				baseCwd: root,
+				currentSessionId: "session-current",
+				asyncJobs: new Map(),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+			let now = 1_000;
+			const deps = { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results"), kill: () => true, now: () => now, state };
+
+			const first = inspectSubagentStatus({}, deps);
+			assert.equal(first.isError, undefined);
+			assert.match(textContent(first), /one-shot snapshot; return control now/);
+			now = 2_000;
+			const repeated = inspectSubagentStatus({}, deps);
+			assert.equal(repeated.isError, true);
+			assert.match(textContent(repeated), /Active async runs: 1/);
+			assert.match(textContent(repeated), /Status polling suppressed/);
+
+			status.state = "paused";
+			status.steps[0]!.status = "pending";
+			fs.writeFileSync(statusPath, JSON.stringify(status, null, 2), "utf-8");
+			updateActiveRunIndex(asyncDir, "paused");
+			now = 3_000;
+			const empty = inspectSubagentStatus({}, deps);
+			assert.equal(empty.isError, undefined);
+			assert.match(textContent(empty), /No active async runs/);
+
+			status.state = "running";
+			status.steps[0]!.status = "running";
+			fs.writeFileSync(statusPath, JSON.stringify(status, null, 2), "utf-8");
+			updateActiveRunIndex(asyncDir, "running");
+			now = 3_001;
+			const afterEmpty = inspectSubagentStatus({}, deps);
+			assert.equal(afterEmpty.isError, undefined);
+			assert.doesNotMatch(textContent(afterEmpty), /Status polling suppressed/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("tails a readable transcript from async output artifacts", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-transcript-"));
 		try {

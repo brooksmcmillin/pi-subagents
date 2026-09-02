@@ -2230,6 +2230,8 @@ export interface SubagentState {
 	};
 	/** Current-session durable non-blocking wait registrations. */
 	waitSubscriptions?: Map<string, WaitSubscriptionRecord>;
+	/** Last one-shot status inspection for each active async run, used to suppress rapid model-driven polling. */
+	activeStatusChecks?: Map<string, number>;
 	/** Live in-process workflow controllers. Durable status remains on disk after settlement. */
 	workflowControllers?: Map<string, AbortController>;
 	/** Live in-process workflow child stoppers keyed by parent workflow run id. */
