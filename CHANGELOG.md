@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Suppress rapid repeated status checks for active async runs so model-driven polling cannot create a stream of full-context parent turns and magnify prompt-cache misses.
+
 ## [0.63.0] - 2026-09-01
 
 ### Highlights
