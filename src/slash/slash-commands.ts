@@ -16,7 +16,7 @@ import {
 	refreshProviderModelCatalog,
 } from "../profiles/profiles.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
-import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
+import { findModelInfo, toModelInfos } from "../shared/model-info.ts";
 import { formatTokens, shortenPath } from "../shared/formatters.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
@@ -1197,7 +1197,7 @@ export function registerSlashCommands(
 							`Profile loaded. Also switch this session to the profile worker model?\n\n${workerModel}`,
 						);
 						if (shouldSwitch) {
-							const modelInfo = findModelInfo(workerModel, ctx.modelRegistry.getAvailable().map(toModelInfo));
+							const modelInfo = findModelInfo(workerModel, toModelInfos(ctx.modelRegistry.getAvailable()));
 							const model = modelInfo ? ctx.modelRegistry.find(modelInfo.provider, modelInfo.id) : undefined;
 							if (!modelInfo || !model) {
 								lines.push(`Could not switch current session model: '${workerModel}' is not available in the current model registry.`);

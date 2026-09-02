@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, toModelInfos, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -100,6 +100,16 @@ describe("model info helpers", () => {
 });
 
 describe("toModelInfo registry fields", () => {
+	it("skips unavailable registry entries", () => {
+		const infos = toModelInfos([
+			undefined,
+			{ provider: "openai", id: "gpt-5-mini" },
+			null,
+		]);
+		assert.equal(infos.length, 1);
+		assert.equal(infos[0]?.fullId, "openai/gpt-5-mini");
+	});
+
 	it("carries contextWindow, maxTokens, input, and cost from the registry", () => {
 		const info = toModelInfo({
 			provider: "openai",
