@@ -1652,6 +1652,7 @@ async function runSingleStepInner(
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunPiStreamingResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
+	let structuredOutputSaveError: string | undefined;
 	let structuredAcceptanceReport: unknown;
 	let structuredAcceptanceReportError: string | undefined;
 	let completionGuardTriggeredFinal = false;
@@ -1688,6 +1689,7 @@ async function runSingleStepInner(
 			contextLimit: findModelInfo(candidate, step.modelVerificationRegistry)?.contextWindow,
 		}));
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
+		structuredOutputSaveError = undefined;
 		if (effectiveStructuredOutput) {
 			const cleanupError = clearStructuredOutputCaptures(effectiveStructuredOutput);
 			if (cleanupError) {
@@ -1887,6 +1889,18 @@ async function runSingleStepInner(
 					structuredAcceptanceReportError = acceptanceReport.error;
 					validatedStructuredOutput = true;
 				}
+			}
+		}
+		if (validatedStructuredOutput && step.outputPath) {
+			const persistedStructuredOutput = resolveSingleOutput(
+				step.outputPath,
+				serializeStructuredOutput(structuredOutput),
+				outputSnapshot,
+				{ authoritative: true, expectedClaimPath: step.outputClaimPath },
+			);
+			if (!persistedStructuredOutput.savedPath || persistedStructuredOutput.saveError) {
+				structuredOutputSaveError = persistedStructuredOutput.saveError;
+				structuredError = `Failed to persist schema-validated output artifact: ${persistedStructuredOutput.saveError ?? "output path was not saved"}`;
 			}
 		}
 		const errorMessages = validatedStructuredOutput
@@ -2107,7 +2121,7 @@ async function runSingleStepInner(
 			expectedClaimPath: step.outputClaimPath,
 		})
 		: { fullOutput: outputForPersistence };
-	if (validatedStructuredOutput && step.outputPath && (!resolvedOutput.savedPath || resolvedOutput.saveError) && finalResult) {
+	if (validatedStructuredOutput && step.outputPath && finalResult?.exitCode === 0 && (!resolvedOutput.savedPath || resolvedOutput.saveError) && finalResult) {
 		finalResult.exitCode = 1;
 		finalResult.error = `Failed to persist schema-validated output artifact: ${resolvedOutput.saveError ?? "output path was not saved"}`;
 	} else if (resolvedOutput.fatalError && finalResult) {
@@ -2264,7 +2278,7 @@ async function runSingleStepInner(
 		usage,
 		artifactPaths,
 		savedOutputPath: resolvedOutput.savedPath,
-		outputSaveError: [resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
+		outputSaveError: [structuredOutputSaveError, resolvedOutput.saveError, artifactErrors.outputSaveError].filter(Boolean).join("\n") || undefined,
 		metadataSaveError: artifactErrors.metadataSaveError,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),

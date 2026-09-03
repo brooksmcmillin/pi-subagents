@@ -4634,6 +4634,33 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true, note: "async" });
 	});
 
+	it("background file-only outputSchema runs persist their validated artifact before completion checks", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ structuredOutput: { ok: true, note: "file-only" } });
+		const id = `async-single-schema-file-only-${Date.now().toString(36)}`;
+		const outputPath = path.join(tempDir, "async-schema-report.json");
+
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Return structured data",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			output: outputPath,
+			outputMode: "file-only",
+			structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } },
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.state, "complete");
+		assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true, note: "file-only" });
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), '{\n  "ok": true,\n  "note": "file-only"\n}\n');
+	});
+
 	it("background outputSchema runs fail closed when required acceptanceReport is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "structured", structuredOutput: { ok: true } });
 		const id = `async-schema-missing-acceptance-${Date.now().toString(36)}`;
