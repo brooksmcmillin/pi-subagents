@@ -14,6 +14,11 @@ function resultWithUsage(usage: Usage): SingleResult {
 	};
 }
 
+function resultWithoutUsage(): SingleResult {
+	const { usage: _usage, ...result } = resultWithUsage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+	return result as SingleResult;
+}
+
 describe("sumResultsUsage", () => {
 	it("aggregates full child usage", () => {
 		const total = sumResultsUsage([
@@ -22,6 +27,12 @@ describe("sumResultsUsage", () => {
 		]);
 
 		assert.deepEqual(total, { input: 30, output: 12, cacheRead: 4, cacheWrite: 6, cost: 0.04, turns: 3 });
+	});
+
+	it("ignores a child that failed before reporting usage", () => {
+		const results = [resultWithUsage({ input: 10, output: 5, cacheRead: 1, cacheWrite: 2, cost: 0.01, turns: 1 }), resultWithoutUsage()];
+		assert.deepEqual(sumResultsUsage(results), { input: 10, output: 5, cacheRead: 1, cacheWrite: 2, cost: 0.01, turns: 1 });
+		assert.deepEqual(sumResultsCost(results), { inputTokens: 10, outputTokens: 5, costUsd: 0.01 });
 	});
 });
 

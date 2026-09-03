@@ -27,7 +27,7 @@ import {
 	buildProactiveSkillSubagentRecommendationLines,
 } from "./proactive-skills.ts";
 import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
-import { resolveEffectiveThinking, toModelInfo } from "../shared/model-info.ts";
+import { resolveEffectiveThinking, toModelInfos } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
@@ -974,7 +974,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	const effectiveAgents = effectiveAgentsForScope(scope, discovered, ctx.runtimeAgentOwner)
 		.sort((a, b) => a.name.localeCompare(b.name));
-	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels = toModelInfos(ctx.modelRegistry.getAvailable());
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
 	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);

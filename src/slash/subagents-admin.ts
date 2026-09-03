@@ -12,7 +12,7 @@ import {
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
 import { editableAgentConfig, preservedAgentFrontmatterFields } from "../agents/agent-management.ts";
-import { findModelInfo, getSupportedThinkingLevels, toModelInfo } from "../shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, toModelInfos } from "../shared/model-info.ts";
 import { SelectorComponent, type SelectorItem, type SelectorResult } from "./selector.ts";
 
 const ADMIN_MESSAGE_TYPE = "subagents-admin";
@@ -217,7 +217,7 @@ async function selectFromList(ctx: ExtensionContext, title: string, subtitle: st
 }
 
 async function chooseModel(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
-	const models = liveAvailableModels(ctx);
+	const models = toModelInfos(liveAvailableModels(ctx));
 	const current = agent.model ?? INHERIT_MODEL_CHOICE;
 	const items: SelectorItem[] = [{ value: INHERIT_MODEL_CHOICE, label: INHERIT_MODEL_CHOICE, current: !agent.model }];
 	if (agent.model && !models.some((model) => modelFullId(model) === agent.model)) {
@@ -233,7 +233,7 @@ async function chooseModel(ctx: ExtensionContext, agent: AgentConfig): Promise<s
 }
 
 async function chooseThinking(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
-	const availableModels = liveAvailableModels(ctx).map(toModelInfo);
+	const availableModels = toModelInfos(liveAvailableModels(ctx));
 	const effectiveModel = agent.model ?? (ctx.model ? modelFullId(ctx.model) : undefined);
 	const modelInfo = findModelInfo(effectiveModel, availableModels, ctx.model?.provider);
 	const levels = getSupportedThinkingLevels(modelInfo);

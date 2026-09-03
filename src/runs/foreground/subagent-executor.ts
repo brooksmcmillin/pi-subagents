@@ -8,7 +8,7 @@ import { getArtifactsDir, getProjectArtifactPackagingWarning, getProjectSubagent
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilient-json.ts";
 import { isStorageCapacityError } from "../../shared/file-system-retry.ts";
-import { resolveEffectiveThinking, toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import { resolveEffectiveThinking, toModelInfos, type ModelInfo } from "../../shared/model-info.ts";
 import {
 	beginForegroundChild,
 	finishForegroundChild,
@@ -1305,7 +1305,7 @@ function appendStepToAsyncChain(input: {
 		resultMode: "chain",
 		agents,
 		ctx: asyncCtx,
-		availableModels: input.ctx.modelRegistry.getAvailable().map(toModelInfo),
+		availableModels: toModelInfos(input.ctx.modelRegistry.getAvailable()),
 		unknownAgentDiagnosticContext: diagnosticContextFromDiscovery(discoveredForAppend, input.requestCwd, scope),
 		cwd: status.cwd ?? input.requestCwd,
 		chainSkills,
@@ -1695,7 +1695,7 @@ async function resumeExternalJobFollowUp(input: {
 		controlConfig: resolveControlConfig(input.deps.config.control, undefined),
 		controlIntercomTarget: input.intercomBridge.active ? input.intercomBridge.orchestratorTarget : undefined,
 		childIntercomTarget: input.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(runId, agent, index) : undefined,
-		availableModels: input.ctx.modelRegistry.getAvailable().map(toModelInfo),
+		availableModels: toModelInfos(input.ctx.modelRegistry.getAvailable()),
 		outputBaseDir: resolveSingleRunOutputBaseDir(input.deps, artifactsDir, runId),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
 		capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(currentSessionId),
@@ -1899,7 +1899,7 @@ async function resumeAsyncRun(input: {
 			throw error;
 		}
 		const artifactConfig: ArtifactConfig = omitUndefinedProperties({ ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false, dir: input.deps.config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir });
-		const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
+		const availableModels = toModelInfos(input.ctx.modelRegistry.getAvailable());
 		const contextPolicy = resolveExplicitContextPolicy(input.params);
 		const workflowTask = (input.params.task ?? followUp) || undefined;
 		const goal = resolveAsyncEventGoal(workflowTask, attachChain);
@@ -2014,7 +2014,7 @@ async function resumeAsyncRun(input: {
 	const agentContract = input.params.agentContract ?? foregroundContract?.agentContract ?? recoveryDescriptor?.agentContract;
 	const artifactConfig: ArtifactConfig = recoveryDescriptor?.artifactConfig ?? omitUndefinedProperties({ ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false, dir: input.deps.config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir });
 	const artifactsDir = recoveryDescriptor?.artifactsDir ?? getArtifactsDir(parentSessionFile, effectiveCwd, artifactConfig.dir);
-	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels = toModelInfos(input.ctx.modelRegistry.getAvailable());
 	const parentModel = input.parentModel;
 	const revivalAsyncDir = path.join(DIRS.async, runId);
 	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
@@ -3187,7 +3187,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		interactive: ctx.hasUI,
 		permissions: deps.config.permissions,
 	});
-	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels: ModelInfo[] = toModelInfos(ctx.modelRegistry.getAvailable());
 	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
 	const currentProvider = parentModel?.provider;
 	const controlIntercomTarget = resolveRunLevelIntercomTarget(intercomBridge, contextPolicy);
@@ -3643,7 +3643,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 
 	const parentModel = data.parentModel;
 	const currentProvider = parentModel?.provider;
-	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels: ModelInfo[] = toModelInfos(ctx.modelRegistry.getAvailable());
 	const modelScopes = resolveModelScopesForAgent(data.modelScope, agentConfig.name, parentModel);
 	let task = typeof params.task === "string" ? params.task : "";
 	const modelOrigin = resolveModelOrigin({
@@ -6400,7 +6400,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const forkThinkingRequirements = new Map<number, boolean>();
 		const forkThinkingDowngrades = new Map<number, string>();
 		try {
-			const forkAvailableModels = contextPolicy.usesFork ? ctx.modelRegistry.getAvailable().map(toModelInfo) : [];
+			const forkAvailableModels = contextPolicy.usesFork ? toModelInfos(ctx.modelRegistry.getAvailable()) : [];
 			const parentModel = requestParentModel;
 			prepareForkThinking = (agentName, index, modelOverride, modelOverrideFromParent, storedOrigin) => {
 				const agentConfig = agents.find((agent) => agent.name === agentName);
@@ -6781,7 +6781,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					params: effectiveParams,
 					agents,
 					parentModel: requestParentModel,
-					availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
+					availableModels: toModelInfos(ctx.modelRegistry.getAvailable()),
 					currentProvider: requestParentModel?.provider,
 					modelScope,
 					thinkingOverrideForTask: forkThinkingOverrideForTask,

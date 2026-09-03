@@ -340,12 +340,14 @@ function extractToolCallSummaries(messages: Message[] | undefined): ToolCallSumm
 export function sumResultsUsage(results: SingleResult[]): Usage {
 	const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 	for (const result of results) {
-		usage.input += result.usage.input;
-		usage.output += result.usage.output;
-		usage.cacheRead += result.usage.cacheRead;
-		usage.cacheWrite += result.usage.cacheWrite;
-		usage.cost += result.usage.cost;
-		usage.turns += result.usage.turns;
+		const resultUsage = result.usage;
+		if (!resultUsage) continue;
+		usage.input += resultUsage.input;
+		usage.output += resultUsage.output;
+		usage.cacheRead += resultUsage.cacheRead;
+		usage.cacheWrite += resultUsage.cacheWrite;
+		usage.cost += resultUsage.cost;
+		usage.turns += resultUsage.turns;
 	}
 	return usage;
 }
@@ -378,9 +380,12 @@ function addNestedCost(total: NonNullable<Details["totalCost"]>, children: Neste
 export function sumResultsCost(results: SingleResult[]): NonNullable<Details["totalCost"]> {
 	const total = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
 	for (const result of results) {
-		total.inputTokens += result.usage.input;
-		total.outputTokens += result.usage.output;
-		total.costUsd += result.usage.cost;
+		const resultUsage = result.usage;
+		if (resultUsage) {
+			total.inputTokens += resultUsage.input;
+			total.outputTokens += resultUsage.output;
+			total.costUsd += resultUsage.cost;
+		}
 		addNestedCost(total, result.children);
 	}
 	return total;

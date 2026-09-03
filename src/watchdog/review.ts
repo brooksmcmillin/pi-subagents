@@ -5,7 +5,7 @@ import type { Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { resolveModelCandidate } from "../runs/shared/model-fallback.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
-import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
+import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, toModelInfos } from "../shared/model-info.ts";
 import type { WatchdogReviewFunction, WatchdogReviewRequest } from "./runtime.ts";
 import {
 	WATCHDOG_WARNING_CATEGORIES,
@@ -91,7 +91,7 @@ function resolveReviewThinking(input: {
 }
 
 function resolveConfiguredModel(ctx: ExtensionContext, rawModel: string): { model: RegistryModel; modelString: string } {
-	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels = toModelInfos(ctx.modelRegistry.getAvailable());
 	const preferredProvider = typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined;
 	const resolved = resolveModelCandidate(rawModel, availableModels, preferredProvider);
 	if (!resolved) {

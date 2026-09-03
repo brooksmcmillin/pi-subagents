@@ -6,7 +6,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveModelCandidate } from "../runs/shared/model-fallback.ts";
-import { splitKnownThinkingSuffix, toModelInfo } from "./model-info.ts";
+import { splitKnownThinkingSuffix, toModelInfos } from "./model-info.ts";
 import type { ForkContextConfig } from "./types.ts";
 
 const MAX_INHERITED_SESSION_BYTES = 64 * 1024;
@@ -409,8 +409,8 @@ export async function createPrunedForkSessionWriter(
 ): Promise<(sessionFile: string) => Promise<void>> {
 	if (config?.mode !== "pruned") return async () => {};
 	if (!config.model?.trim()) throw new Error("Pruned fork context requires config.forkContext.model.");
-	const available = ctx.modelRegistry.getAvailable();
-	const resolved = resolveModelCandidate(config.model.trim(), available.map(toModelInfo), ctx.model?.provider);
+	const available = toModelInfos(ctx.modelRegistry.getAvailable());
+	const resolved = resolveModelCandidate(config.model.trim(), available, ctx.model?.provider);
 	if (!resolved) throw new Error(`Pruned fork model '${config.model}' did not match exactly one available model.`);
 	const { baseModel } = splitKnownThinkingSuffix(resolved);
 	const named = splitProviderModel(baseModel);

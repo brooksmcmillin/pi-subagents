@@ -50,6 +50,13 @@ export function toModelInfo(model: RegistryModelLike): ModelInfo {
 	};
 }
 
+/** Convert host registry entries while ignoring unavailable slots from third-party providers. */
+export function toModelInfos(models: readonly (RegistryModelLike | null | undefined)[]): ModelInfo[] {
+	return models
+		.filter((model): model is RegistryModelLike => model !== null && model !== undefined)
+		.map(toModelInfo);
+}
+
 /** Resolve the effective thinking level from a model string (which may contain a known suffix like `:high`)
  * and an explicit thinking config value. Returns `undefined` when no thinking is applicable
  * (e.g. no model was specified, or the model has no suffix and no config was provided). */

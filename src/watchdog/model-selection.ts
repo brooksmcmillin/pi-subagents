@@ -5,6 +5,7 @@ import {
 	splitKnownThinkingSuffix,
 	THINKING_LEVELS,
 	toModelInfo,
+	toModelInfos,
 	type ModelInfo,
 	type ThinkingLevel,
 } from "../shared/model-info.ts";
@@ -55,7 +56,7 @@ function fullModelId(model: Pick<ModelInfo, "provider" | "id">): string {
 }
 
 function modelRegistryEntries(ctx: ExtensionContext): ModelInfo[] {
-	return ctx.modelRegistry.getAvailable().map(toModelInfo);
+	return toModelInfos(ctx.modelRegistry.getAvailable());
 }
 
 function splitProviderModel(value: string): { provider: string; id: string } | undefined {

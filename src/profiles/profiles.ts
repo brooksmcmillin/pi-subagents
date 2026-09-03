@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
-import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, toModelInfos } from "../shared/model-info.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
 export const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS = 7;
@@ -636,7 +636,7 @@ export async function checkSubagentProfile(
 	name: string,
 ): Promise<ProfileCheckResult> {
 	const { filePath, profile } = readSubagentProfile(name);
-	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels = toModelInfos(ctx.modelRegistry.getAvailable());
 	const entries = Object.entries(profile.subagents.agentOverrides)
 		.filter(([, value]) => typeof value?.model === "string" && value.model.trim())
 		.map(([agent, value]) => ({ agent, model: value.model!.trim() }));
