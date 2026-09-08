@@ -178,6 +178,16 @@ describe("below-editor subagent FleetView", () => {
 			assert.ok(compactLines[0]!.includes("↓/← to inspect"));
 			assert.ok(visibleWidth(compactLines[0]!) <= 80);
 
+			state.activeAsyncCapacity = { used: 0, limit: 0 };
+			const unlimitedIdleSummary = component.render(80)[0]!;
+			assert.match(unlimitedIdleSummary, /7 active agents/);
+			assert.doesNotMatch(unlimitedIdleSummary, /Async runs 0\/∞/);
+			state.activeAsyncCapacity = { used: 2, limit: 0 };
+			assert.match(component.render(80)[0]!, /Async runs 2\/∞/);
+			state.activeAsyncCapacity = { used: 0, limit: 4 };
+			assert.match(component.render(80)[0]!, /Async runs 0\/4/);
+			state.activeAsyncCapacity = { used: 2, limit: 4 };
+
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const expandedLines = component.render(80);
 			assert.ok(expandedLines.some((line) => line.includes("> main")));
@@ -1004,6 +1014,27 @@ describe("below-editor subagent FleetView", () => {
 
 		const workflow = collectFleetStatusEntries(state).find((entry) => entry.key === "async:workflow-1");
 		assert.deepEqual(workflow?.workflowRows?.map((row) => row.name), ["review (reviewer)"]);
+	});
+
+	it("keeps advisory preflight declarations out of Fleet runtime rows and counts", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("workflow-preflight", {
+			asyncId: "workflow-preflight",
+			asyncDir: "/tmp/workflow-preflight",
+			status: "running",
+			mode: "workflow",
+			startedAt: 10,
+			updatedAt: 20,
+			preflight: { version: 1, coverage: "partial", lanes: [{ key: "pr14", mode: "review" }] },
+			steps: [{ agent: "reviewer", workflowKey: "pr14-quality", status: "running" }],
+		});
+
+		const workflow = collectFleetStatusEntries(state).find((entry) => entry.key === "async:workflow-preflight");
+		assert.deepEqual(workflow?.workflowRows?.map((row) => [row.name, row.state]), [["pr14-quality (reviewer)", "running"]]);
+		assert.deepEqual(
+			workflow?.workflowChecklist && { total: workflow.workflowChecklist.total, running: workflow.workflowChecklist.running, queued: workflow.workflowChecklist.queued },
+			{ total: 1, running: 1, queued: 0 },
+		);
 	});
 
 	it("renders bounded workflow progress rows under the workflow parent", () => {

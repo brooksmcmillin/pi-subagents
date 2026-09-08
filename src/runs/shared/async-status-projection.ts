@@ -1,7 +1,8 @@
 import { sanitizeDisplayText, truncateDisplayText } from "../../shared/display-text.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
-import type { AsyncJobState, AsyncJobStep, HostStepFreshnessV1, HostStepMonitorKind, HostStepNodeV1, HostStepState, HostStepVerdict, NestedRunSummary, NestedStepSummary, SubagentRunMode, WorkflowGraphSnapshot, WorkflowPreflightLaneV1, WorkflowPreflightV1 } from "../../shared/types.ts";
+import type { AsyncJobState, AsyncJobStep, HostStepFreshness, HostStepMonitorKind, HostStepNode, HostStepState, HostStepVerdict, NestedRunSummary, NestedStepSummary, SubagentRunMode, WorkflowGraphSnapshot, WorkflowPreflightLane, WorkflowPreflight } from "../../shared/types.ts";
 import { HOST_STEP_MAX_COUNT, HOST_STEP_MAX_DETAIL_CHARS, HOST_STEP_MAX_LABEL_CHARS, HOST_STEP_MAX_PROVIDER_CHARS, HOST_STEP_MAX_REASON_CHARS, HOST_STEP_MAX_REF_CHARS, HOST_STEP_MAX_ROLE_CHARS, HOST_STEP_MAX_TARGET_CHARS, hostStepReportName, parseHostStepNode, validHostStepNodes } from "./host-step-status.ts";
+import { workflowPreflightLaneForRuntimeKey } from "../../workflows/workflow-preflight.ts";
 import { workflowGraphStageNodes } from "./workflow-graph.ts";
 
 export const ASYNC_STATUS_SNAPSHOT_KIND = "pi-subagents.async-status-snapshot";
@@ -31,7 +32,7 @@ function isAsyncStatusSnapshotState(value: string): value is AsyncStatusSnapshot
 	return Object.hasOwn(ASYNC_STATUS_SNAPSHOT_STATES, value);
 }
 
-export interface AsyncStatusSnapshotActivityV1 {
+export interface AsyncStatusSnapshotActivity {
 	state?: string;
 	currentTool?: string;
 	lastActivityAt?: number;
@@ -40,7 +41,7 @@ export interface AsyncStatusSnapshotActivityV1 {
 	toolCount?: number;
 }
 
-export interface AsyncStatusSnapshotHostStepV1 {
+export interface AsyncStatusSnapshotHostStep {
 	kind: HostStepMonitorKind;
 	provider?: string;
 	role?: string;
@@ -53,7 +54,7 @@ export interface AsyncStatusSnapshotHostStepV1 {
 	report?: string;
 }
 
-export interface AsyncStatusSnapshotNodeV1 {
+export interface AsyncStatusSnapshotNode {
 	id: string;
 	kind: AsyncStatusSnapshotKind | "host-step";
 	label: string;
@@ -61,12 +62,12 @@ export interface AsyncStatusSnapshotNodeV1 {
 	startedAt?: number;
 	updatedAt?: number;
 	endedAt?: number;
-	activity?: AsyncStatusSnapshotActivityV1;
-	hostStep?: AsyncStatusSnapshotHostStepV1;
-	children?: AsyncStatusSnapshotNodeV1[];
+	activity?: AsyncStatusSnapshotActivity;
+	hostStep?: AsyncStatusSnapshotHostStep;
+	children?: AsyncStatusSnapshotNode[];
 }
 
-export interface AsyncStatusSnapshotCapsV1 {
+export interface AsyncStatusSnapshotCaps {
 	maxRuns: number;
 	maxChildrenPerNode: number;
 	maxDepth: number;
@@ -74,19 +75,19 @@ export interface AsyncStatusSnapshotCapsV1 {
 	maxSerializedBytes: number;
 }
 
-export interface AsyncStatusSnapshotOmittedV1 {
+export interface AsyncStatusSnapshotOmitted {
 	runs: number;
 	children: number;
 	byteLimitExceeded: boolean;
 }
 
-export interface AsyncStatusSnapshotV1 {
+export interface AsyncStatusSnapshot {
 	kind: typeof ASYNC_STATUS_SNAPSHOT_KIND;
 	version: typeof ASYNC_STATUS_SNAPSHOT_VERSION;
 	generatedAt: number;
-	caps: AsyncStatusSnapshotCapsV1;
-	omitted: AsyncStatusSnapshotOmittedV1;
-	runs: AsyncStatusSnapshotNodeV1[];
+	caps: AsyncStatusSnapshotCaps;
+	omitted: AsyncStatusSnapshotOmitted;
+	runs: AsyncStatusSnapshotNode[];
 }
 
 export interface AsyncStatusSnapshotOptions {
@@ -116,19 +117,19 @@ export interface AsyncStatusWorkflowRow {
 	reasonCode?: string;
 	detail?: string;
 	target?: string;
-	freshness?: HostStepFreshnessV1;
+	freshness?: HostStepFreshness;
 	reportPath?: string;
-	preflight?: WorkflowPreflightLaneV1;
+	preflight?: WorkflowPreflightLane;
 }
 
 interface ProjectionContext {
-	caps: AsyncStatusSnapshotCapsV1;
-	omitted: AsyncStatusSnapshotOmittedV1;
+	caps: AsyncStatusSnapshotCaps;
+	omitted: AsyncStatusSnapshotOmitted;
 }
 
-function validHostStepList(source: readonly HostStepNodeV1[] | WorkflowGraphSnapshot | undefined): HostStepNodeV1[] {
+function validHostStepList(source: readonly HostStepNode[] | WorkflowGraphSnapshot | undefined): HostStepNode[] {
 	if (source && "nodes" in source) return validHostStepNodes(source);
-	const hostSteps: HostStepNodeV1[] = [];
+	const hostSteps: HostStepNode[] = [];
 	for (const [index, value] of (source ?? []).slice(0, HOST_STEP_MAX_COUNT).entries()) {
 		try {
 			hostSteps.push(parseHostStepNode(value, `hostSteps[${index}]`));
@@ -139,7 +140,7 @@ function validHostStepList(source: readonly HostStepNodeV1[] | WorkflowGraphSnap
 	return hostSteps;
 }
 
-function resolveCaps(options: AsyncStatusSnapshotOptions): AsyncStatusSnapshotCapsV1 {
+function resolveCaps(options: AsyncStatusSnapshotOptions): AsyncStatusSnapshotCaps {
 	return {
 		maxRuns: Math.max(0, Math.floor(options.maxRuns ?? DEFAULT_MAX_RUNS)),
 		maxChildrenPerNode: Math.max(0, Math.floor(options.maxChildrenPerNode ?? DEFAULT_MAX_CHILDREN_PER_NODE)),
@@ -198,13 +199,13 @@ function activityFor(source: {
 	currentToolStartedAt?: unknown;
 	turnCount?: unknown;
 	toolCount?: unknown;
-}, ctx: ProjectionContext): AsyncStatusSnapshotActivityV1 | undefined {
+}, ctx: ProjectionContext): AsyncStatusSnapshotActivity | undefined {
 	const currentTool = publicOptionalText(source.currentTool, ctx.caps.maxStringLength);
 	const lastActivityAt = publicTime(source.lastActivityAt);
 	const currentToolStartedAt = publicTime(source.currentToolStartedAt);
 	const turnCount = publicCount(source.turnCount);
 	const toolCount = publicCount(source.toolCount);
-	const activity: AsyncStatusSnapshotActivityV1 = {
+	const activity: AsyncStatusSnapshotActivity = {
 		...(typeof source.activityState === "string" ? { state: publicText(source.activityState, "unknown", ctx.caps.maxStringLength) } : {}),
 		...(currentTool ? { currentTool } : {}),
 		...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
@@ -215,19 +216,19 @@ function activityFor(source: {
 	return Object.keys(activity).length ? activity : undefined;
 }
 
-function appendBoundedChildren(children: AsyncStatusSnapshotNodeV1[], source: readonly AsyncStatusSnapshotNodeV1[], ctx: ProjectionContext): void {
+function appendBoundedChildren(children: AsyncStatusSnapshotNode[], source: readonly AsyncStatusSnapshotNode[], ctx: ProjectionContext): void {
 	const remaining = Math.max(0, ctx.caps.maxChildrenPerNode - children.length);
 	children.push(...source.slice(0, remaining));
 	ctx.omitted.children += Math.max(0, source.length - remaining);
 }
 
-function projectStep(step: AsyncJobStep | NestedStepSummary, index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
+function projectStep(step: AsyncJobStep | NestedStepSummary, index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNode {
 	const state = normalizeState(step.status);
 	const startedAt = publicTime(step.startedAt);
 	const endedAt = publicTime(step.endedAt);
 	const updatedAt = endedAt ?? publicTime(step.lastActivityAt) ?? startedAt;
 	const activity = activityFor(step, ctx);
-	const node: AsyncStatusSnapshotNodeV1 = {
+	const node: AsyncStatusSnapshotNode = {
 		id: publicText("workflowKey" in step && step.workflowKey ? step.workflowKey : "runId" in step && step.runId ? step.runId : `step:${index}`, `step:${index}`, ctx.caps.maxStringLength),
 		kind: "step",
 		label: publicText("label" in step && step.label ? step.label : step.agent, "step", ctx.caps.maxStringLength),
@@ -239,7 +240,7 @@ function projectStep(step: AsyncJobStep | NestedStepSummary, index: number, dept
 	};
 	if (depth < ctx.caps.maxDepth && step.children?.length) {
 		const nested = step.children.map((child, childIndex) => projectNestedRun(child, childIndex, depth + 1, ctx));
-		const bounded: AsyncStatusSnapshotNodeV1[] = [];
+		const bounded: AsyncStatusSnapshotNode[] = [];
 		appendBoundedChildren(bounded, nested, ctx);
 		if (bounded.length) node.children = bounded;
 	} else if (step.children?.length) {
@@ -248,7 +249,7 @@ function projectStep(step: AsyncJobStep | NestedStepSummary, index: number, dept
 	return node;
 }
 
-function projectWorkflowGraphNode(node: WorkflowGraphSnapshot["nodes"][number], index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
+function projectWorkflowGraphNode(node: WorkflowGraphSnapshot["nodes"][number], index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNode {
 	const step: AsyncJobStep = {
 		agent: node.agent ?? node.label,
 		status: workflowGraphStepStatus(node.status),
@@ -258,13 +259,13 @@ function projectWorkflowGraphNode(node: WorkflowGraphSnapshot["nodes"][number], 
 	return projectStep(step, node.flatIndex ?? index, depth, ctx);
 }
 
-function projectNestedRun(child: NestedRunSummary, index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
+function projectNestedRun(child: NestedRunSummary, index: number, depth: number, ctx: ProjectionContext): AsyncStatusSnapshotNode {
 	const state = normalizeState(child.state);
 	const startedAt = publicTime(child.startedAt);
 	const endedAt = publicTime(child.endedAt);
 	const updatedAt = publicTime(child.lastUpdate) ?? endedAt ?? publicTime(child.lastActivityAt) ?? startedAt;
 	const activity = activityFor(child, ctx);
-	const node: AsyncStatusSnapshotNodeV1 = {
+	const node: AsyncStatusSnapshotNode = {
 		id: publicText(child.id, `nested:${index}`, ctx.caps.maxStringLength),
 		kind: kindForMode(child.mode),
 		label: child.agent ? publicText(child.agent, "subagent", ctx.caps.maxStringLength) : labelForAgents(child.agents, child.mode ?? "subagent", ctx.caps.maxStringLength),
@@ -277,7 +278,7 @@ function projectNestedRun(child: NestedRunSummary, index: number, depth: number,
 	if (depth < ctx.caps.maxDepth) {
 		const nestedSteps = child.steps?.map((step, stepIndex) => projectStep(step, stepIndex, depth + 1, ctx)) ?? [];
 		const nestedChildren = child.children?.map((nested, childIndex) => projectNestedRun(nested, childIndex, depth + 1, ctx)) ?? [];
-		const bounded: AsyncStatusSnapshotNodeV1[] = [];
+		const bounded: AsyncStatusSnapshotNode[] = [];
 		appendBoundedChildren(bounded, [...nestedSteps, ...nestedChildren], ctx);
 		if (bounded.length) node.children = bounded;
 	} else {
@@ -294,11 +295,11 @@ function hostStepSnapshotState(state: HostStepState, verdict: HostStepVerdict | 
 	return verdict === undefined || verdict === "inconclusive" ? "partial" : "complete";
 }
 
-function projectHostStep(hostStep: HostStepNodeV1, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
+function projectHostStep(hostStep: HostStepNode, ctx: ProjectionContext): AsyncStatusSnapshotNode {
 	const state = hostStepSnapshotState(hostStep.state, hostStep.verdict);
 	const detail = publicOptionalText(hostStep.detail, ctx.caps.maxStringLength);
 	const report = publicOptionalText(hostStepReportName(hostStep.reportPath), ctx.caps.maxStringLength);
-	const hostMetadata: AsyncStatusSnapshotHostStepV1 = {
+	const hostMetadata: AsyncStatusSnapshotHostStep = {
 		kind: hostStep.monitorKind,
 		state: hostStep.state,
 		...(hostStep.provider ? { provider: publicText(hostStep.provider, "provider", ctx.caps.maxStringLength) } : {}),
@@ -321,12 +322,12 @@ function projectHostStep(hostStep: HostStepNodeV1, ctx: ProjectionContext): Asyn
 	};
 }
 
-function projectRun(job: AsyncJobState, ctx: ProjectionContext): AsyncStatusSnapshotNodeV1 {
+function projectRun(job: AsyncJobState, ctx: ProjectionContext): AsyncStatusSnapshotNode {
 	const state = normalizeState(job.status);
 	const startedAt = publicTime(job.startedAt);
 	const updatedAt = publicTime(job.updatedAt) ?? startedAt;
 	const activity = activityFor(job, ctx);
-	const node: AsyncStatusSnapshotNodeV1 = {
+	const node: AsyncStatusSnapshotNode = {
 		id: publicText(job.asyncId, "async", ctx.caps.maxStringLength),
 		kind: kindForMode(job.mode),
 		label: labelForAgents(job.agents, job.mode ?? "subagent", ctx.caps.maxStringLength),
@@ -348,7 +349,7 @@ function projectRun(job: AsyncJobState, ctx: ProjectionContext): AsyncStatusSnap
 		const ordinaryChildren = [...stepChildren, ...graphChildren, ...nestedChildren];
 		const retainedHostSteps = hostStepChildren.slice(0, ctx.caps.maxChildrenPerNode);
 		const retainedOrdinaryChildren = ordinaryChildren.slice(0, ctx.caps.maxChildrenPerNode - retainedHostSteps.length);
-		const bounded: AsyncStatusSnapshotNodeV1[] = [];
+		const bounded: AsyncStatusSnapshotNode[] = [];
 		bounded.push(...retainedOrdinaryChildren, ...retainedHostSteps);
 		ctx.omitted.children += ordinaryChildren.length - retainedOrdinaryChildren.length + hostStepChildren.length - retainedHostSteps.length;
 		if (bounded.length) node.children = bounded;
@@ -361,11 +362,11 @@ function projectRun(job: AsyncJobState, ctx: ProjectionContext): AsyncStatusSnap
 	return node;
 }
 
-function snapshotBytes(snapshot: AsyncStatusSnapshotV1): number {
+function snapshotBytes(snapshot: AsyncStatusSnapshot): number {
 	return Buffer.byteLength(JSON.stringify(snapshot), "utf8");
 }
 
-function enforceByteLimit(snapshot: AsyncStatusSnapshotV1): void {
+function enforceByteLimit(snapshot: AsyncStatusSnapshot): void {
 	if (snapshotBytes(snapshot) <= snapshot.caps.maxSerializedBytes) return;
 	snapshot.omitted.byteLimitExceeded = true;
 	const runs = snapshot.runs;
@@ -400,7 +401,7 @@ function workflowStepName(step: AsyncJobStep, index: number): string {
 	return `${phase}${key}${label} (${step.agent})`;
 }
 
-function hostStepRow(hostStep: HostStepNodeV1): AsyncStatusWorkflowRow {
+function hostStepRow(hostStep: HostStepNode): AsyncStatusWorkflowRow {
 	const freshness = hostStep.freshness
 		? {
 			expectedRef: publicText(hostStep.freshness.expectedRef, "ref", HOST_STEP_MAX_REF_CHARS),
@@ -424,11 +425,11 @@ function hostStepRow(hostStep: HostStepNodeV1): AsyncStatusWorkflowRow {
 }
 
 
-function isWorkflowPreflight(value: readonly HostStepNodeV1[] | WorkflowGraphSnapshot | WorkflowPreflightV1 | undefined): value is WorkflowPreflightV1 {
+function isWorkflowPreflight(value: readonly HostStepNode[] | WorkflowGraphSnapshot | WorkflowPreflight | undefined): value is WorkflowPreflight {
 	return value !== undefined && !Array.isArray(value) && "lanes" in value;
 }
 
-function isWorkflowGraph(value: readonly HostStepNodeV1[] | WorkflowGraphSnapshot | WorkflowPreflightV1 | undefined): value is WorkflowGraphSnapshot {
+function isWorkflowGraph(value: readonly HostStepNode[] | WorkflowGraphSnapshot | WorkflowPreflight | undefined): value is WorkflowGraphSnapshot {
 	return value !== undefined && !Array.isArray(value) && "nodes" in value;
 }
 
@@ -464,7 +465,7 @@ function workflowGraphRowName(node: WorkflowGraphSnapshot["nodes"][number]): str
 	return `${phase ? `${phase}: ` : ""}${key}${label && label !== node.id ? ` · ${label}` : ""}${agent ? ` (${agent})` : ""}`;
 }
 
-function projectWorkflowGraphRow(node: WorkflowGraphSnapshot["nodes"][number], preflight?: WorkflowPreflightLaneV1): AsyncStatusWorkflowRow {
+function projectWorkflowGraphRow(node: WorkflowGraphSnapshot["nodes"][number], preflight?: WorkflowPreflightLane): AsyncStatusWorkflowRow {
 	return {
 		name: workflowGraphRowName(node),
 		state: workflowGraphRowState(node.status),
@@ -472,17 +473,18 @@ function projectWorkflowGraphRow(node: WorkflowGraphSnapshot["nodes"][number], p
 	};
 }
 
-/** Project loaded workflow child facts plus stored preflight hints into compact rows. */
+/** Project authoritative workflow facts into compact rows, annotated by preflight hints. */
 export function projectAsyncWorkflowRows(
 	steps: readonly AsyncJobStep[] | undefined,
-	hostStepsOrPreflight?: readonly HostStepNodeV1[] | WorkflowGraphSnapshot | WorkflowPreflightV1,
-	preflightOverride?: WorkflowPreflightV1,
+	hostStepsOrPreflight?: readonly HostStepNode[] | WorkflowGraphSnapshot | WorkflowPreflight,
+	preflightOverride?: WorkflowPreflight,
 ): AsyncStatusWorkflowRow[] {
 	const preflight = preflightOverride ?? (isWorkflowPreflight(hostStepsOrPreflight) ? hostStepsOrPreflight : undefined);
 	const graph = isWorkflowGraph(hostStepsOrPreflight) ? hostStepsOrPreflight : undefined;
 	const hostSteps = isWorkflowPreflight(hostStepsOrPreflight) || graph ? undefined : hostStepsOrPreflight;
 	const loaded = steps ?? [];
-	const declared = new Map<string, WorkflowPreflightLaneV1>();
+	const preflightForKey = (key: string, groupKeys: readonly (string | undefined)[] = []): WorkflowPreflightLane | undefined =>
+		workflowPreflightLaneForRuntimeKey(preflight, key, groupKeys);
 	if (graph) {
 		const loadedIndexesByKey = new Map<string, number[]>();
 		for (const [index, step] of loaded.entries()) {
@@ -493,7 +495,6 @@ export function projectAsyncWorkflowRows(
 		}
 		const consumed = new Set<number>();
 		const childRows: AsyncStatusWorkflowRow[] = [];
-		for (const lane of preflight?.lanes ?? []) declared.set(lane.key, lane);
 		const graphStages = workflowGraphStageNodes(graph);
 		const graphKeys = new Set(graphStages.map((node) => node.id));
 		const graphPhaseByNodeId = new Map<string, string>();
@@ -502,63 +503,30 @@ export function projectAsyncWorkflowRows(
 				if (graphKeys.has(nodeId) && !graphPhaseByNodeId.has(nodeId)) graphPhaseByNodeId.set(nodeId, phase.title);
 			}
 		}
-		const graphLaneKeys = new Set(graphPhaseByNodeId.values());
-		const preflightForNode = (node: WorkflowGraphSnapshot["nodes"][number]): WorkflowPreflightLaneV1 | undefined => {
-			const phaseTitle = graphPhaseByNodeId.get(node.id);
-			return declared.get(node.id) ?? (node.phase ? declared.get(node.phase) : undefined) ?? (phaseTitle ? declared.get(phaseTitle) : undefined);
-		};
 		for (const node of graphStages) {
+			const lane = preflightForKey(node.id, [node.phase, graphPhaseByNodeId.get(node.id)]);
 			const indexes = (loadedIndexesByKey.get(node.id) ?? []).filter((index) => !consumed.has(index));
-			if (indexes.length > 0) {
-				for (const index of indexes) {
-					consumed.add(index);
-					childRows.push(projectLoadedWorkflowRow(loaded[index]!, index, preflightForNode(node)));
-				}
-			} else {
-				childRows.push(projectWorkflowGraphRow(node, preflightForNode(node)));
-			}
-		}
-		for (const lane of preflight?.lanes ?? []) {
-			if (graphKeys.has(lane.key) || graphLaneKeys.has(lane.key)) continue;
-			const indexes = (loadedIndexesByKey.get(lane.key) ?? []).filter((index) => !consumed.has(index));
 			if (indexes.length > 0) {
 				for (const index of indexes) {
 					consumed.add(index);
 					childRows.push(projectLoadedWorkflowRow(loaded[index]!, index, lane));
 				}
 			} else {
-				childRows.push({ name: lane.key, state: "planned", preflight: lane });
+				childRows.push(projectWorkflowGraphRow(node, lane));
 			}
 		}
 		for (const [index, step] of loaded.entries()) {
-			if (!consumed.has(index)) childRows.push(projectLoadedWorkflowRow(step, index, step.workflowKey ? declared.get(step.workflowKey) : undefined));
+			if (!consumed.has(index)) childRows.push(projectLoadedWorkflowRow(step, index, step.workflowKey ? preflightForKey(step.workflowKey, [step.phase]) : undefined));
 		}
 		return [...childRows, ...validHostStepList(graph).map(hostStepRow)];
 	}
-	const loadedIndexByKey = new Map<string, number>();
-	for (const [index, step] of loaded.entries()) {
-		if (step.workflowKey !== undefined && !loadedIndexByKey.has(step.workflowKey)) loadedIndexByKey.set(step.workflowKey, index);
-	}
-	const consumed = new Set<number>();
-	const childRows: AsyncStatusWorkflowRow[] = [];
-	for (const lane of preflight?.lanes ?? []) {
-		declared.set(lane.key, lane);
-		const index = loadedIndexByKey.get(lane.key);
-		if (index === undefined) {
-			childRows.push({ name: lane.key, state: "planned", preflight: lane });
-			continue;
-		}
-		consumed.add(index);
-		childRows.push(projectLoadedWorkflowRow(loaded[index]!, index, lane));
-	}
-	for (const [index, step] of loaded.entries()) {
-		if (consumed.has(index)) continue;
-		childRows.push(projectLoadedWorkflowRow(step, index, step.workflowKey ? declared.get(step.workflowKey) : undefined));
-	}
-	return [...childRows, ...validHostStepList(hostSteps).map(hostStepRow)];
+	return [
+		...loaded.map((step, index) => projectLoadedWorkflowRow(step, index, step.workflowKey ? preflightForKey(step.workflowKey, [step.phase]) : undefined)),
+		...validHostStepList(hostSteps).map(hostStepRow),
+	];
 }
 
-function projectLoadedWorkflowRow(step: AsyncJobStep, index: number, preflight?: WorkflowPreflightLaneV1): AsyncStatusWorkflowRow {
+function projectLoadedWorkflowRow(step: AsyncJobStep, index: number, preflight?: WorkflowPreflightLane): AsyncStatusWorkflowRow {
 	const modelThinking = formatModelThinking(step.model, step.thinking) || undefined;
 	const activity = workflowStepActivity(step);
 	return {
@@ -575,7 +543,7 @@ function projectLoadedWorkflowRow(step: AsyncJobStep, index: number, preflight?:
 }
 
 /** Project already-loaded async status facts into the bounded public snapshot shape. */
-export function projectAsyncStatusSnapshot(jobs: Iterable<AsyncJobState>, options: AsyncStatusSnapshotOptions = {}): AsyncStatusSnapshotV1 {
+export function projectAsyncStatusSnapshot(jobs: Iterable<AsyncJobState>, options: AsyncStatusSnapshotOptions = {}): AsyncStatusSnapshot {
 	const caps = resolveCaps(options);
 	const ctx: ProjectionContext = { caps, omitted: { runs: 0, children: 0, byteLimitExceeded: false } };
 	const sorted = [...jobs].sort((left, right) => {
@@ -584,7 +552,7 @@ export function projectAsyncStatusSnapshot(jobs: Iterable<AsyncJobState>, option
 		return rightUpdated - leftUpdated || left.asyncId.localeCompare(right.asyncId);
 	});
 	ctx.omitted.runs += Math.max(0, sorted.length - caps.maxRuns);
-	const snapshot: AsyncStatusSnapshotV1 = {
+	const snapshot: AsyncStatusSnapshot = {
 		kind: ASYNC_STATUS_SNAPSHOT_KIND,
 		version: ASYNC_STATUS_SNAPSHOT_VERSION,
 		generatedAt: options.generatedAt ?? Date.now(),

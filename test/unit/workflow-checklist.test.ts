@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { formatWorkflowChecklistBottleneck, formatWorkflowChecklistText, projectWorkflowChecklist } from "../../src/workflows/workflow-checklist.ts";
-import type { HostStepNodeV1, WorkflowGraphSnapshot } from "../../src/shared/types.ts";
+import type { HostStepNode, WorkflowGraphSnapshot } from "../../src/shared/types.ts";
 
 function graph(): WorkflowGraphSnapshot {
 	return {
@@ -50,7 +50,7 @@ test("workflow checklist fuses graph phases with loaded child state without dupl
 });
 
 test("workflow checklist preserves explicit host monitor verdicts and trace lane identity", () => {
-	const host: HostStepNodeV1 = {
+	const host: HostStepNode = {
 		version: 1,
 		kind: "host-step",
 		monitorKind: "ci",
@@ -81,8 +81,22 @@ test("workflow checklist preserves explicit host monitor verdicts and trace lane
 	assert.match(formatWorkflowChecklistBottleneck(projection.bottleneck) ?? "", /CI/);
 });
 
+test("workflow checklist renders a failed item error only once when item details are included", () => {
+	const projection = projectWorkflowChecklist({
+		steps: [{ workflowKey: "review", agent: "reviewer", status: "failed", error: "review failed with details" }],
+	});
+
+	const expanded = formatWorkflowChecklistText(projection).join("\n");
+	assert.equal(expanded.match(/review failed with details/g)?.length, 1);
+	assert.doesNotMatch(expanded, /bottleneck .*error:review failed with details/);
+
+	const collapsed = formatWorkflowChecklistText(projection, "", { includeItems: false }).join("\n");
+	assert.equal(collapsed.match(/review failed with details/g)?.length, 1);
+	assert.match(collapsed, /bottleneck .*error:review failed with details/);
+});
+
 test("workflow checklist counts one host monitor when host status and trace share an id", () => {
-	const host: HostStepNodeV1 = {
+	const host: HostStepNode = {
 		version: 1,
 		kind: "host-step",
 		monitorKind: "ci",
@@ -154,15 +168,49 @@ test("workflow checklist keeps graph acceptance blockers ahead of stale running 
 	assert.equal(projection.phases[1]!.items[1]!.state, "blocked");
 });
 
-test("workflow checklist does not duplicate preflight lanes already represented by graph nodes", () => {
+test("workflow checklist uses preflight only to annotate authoritative work", () => {
 	const projection = projectWorkflowChecklist({
 		graph: graph(),
-		preflight: { version: 1, lanes: [{ key: "writer-b", mode: "mutation" }, { key: "writers", mode: "mutation" }, { key: "deploy", mode: "gate" }] },
+		preflight: { version: 1, coverage: "partial", lanes: [{ key: "writer-b", mode: "mutation" }, { key: "writers", mode: "mutation" }, { key: "deploy", mode: "gate" }] },
 	});
 
-	assert.equal(projection.total, 6);
-	assert.deepEqual(projection.phases.map((phase) => phase.label), ["inventory", "writers", "reviews", "gate", "deploy"]);
-	assert.equal(projection.phases.at(-1)?.items[0]?.state, "queued");
+	assert.equal(projection.total, 5);
+	assert.deepEqual(projection.phases.map((phase) => phase.label), ["inventory", "writers", "reviews", "gate"]);
+	assert.equal(projection.queued, 1);
+	assert.equal(projection.phases[2]?.items[0]?.key, "review");
+});
+
+test("workflow checklist does not turn unmatched preflight metadata into queued work", () => {
+	const preflight = { version: 1 as const, coverage: "partial" as const, lanes: [{ key: "pr14", mode: "review" as const }] };
+	const declarationOnly = projectWorkflowChecklist({ preflight });
+	const mismatchedRuntime = projectWorkflowChecklist({
+		preflight,
+		trace: [{ operation: "run", key: "pr14-quality", state: "started", agent: "reviewer" }],
+	});
+
+	assert.deepEqual(declarationOnly, { phases: [], total: 0, done: 0, running: 0, queued: 0, blocked: 0, failed: 0, paused: 0, stopped: 0 });
+	assert.equal(mismatchedRuntime.total, 1);
+	assert.equal(mismatchedRuntime.running, 1);
+	assert.equal(mismatchedRuntime.queued, 0);
+	assert.deepEqual(mismatchedRuntime.phases.flatMap((phase) => phase.items).map((item) => item.key), ["pr14-quality"]);
+});
+
+test("workflow checklist prefers specific dotted preflight lanes over generated aliases", () => {
+	const projection = projectWorkflowChecklist({
+		preflight: {
+			version: 1,
+			coverage: "partial",
+			lanes: [
+				{ key: "writer", mode: "mutation" },
+				{ key: "writer.quality", mode: "review" },
+			],
+		},
+		trace: [{ operation: "run", key: "writer.quality.deep", generatedLaneKey: "writer", state: "started", agent: "reviewer" }],
+	});
+
+	assert.equal(projection.total, 1);
+	assert.deepEqual(projection.phases.map((phase) => phase.label), ["writer.quality"]);
+	assert.equal(projection.phases[0]?.items[0]?.preflight?.mode, "review");
 });
 
 test("workflow checklist text exposes aggregate, phase, and bottleneck signals with bounded errors", () => {

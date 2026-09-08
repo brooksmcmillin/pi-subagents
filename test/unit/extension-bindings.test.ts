@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
-import { afterEach, describe, it } from "node:test";
+import * as os from "node:os";
+import { describe, it } from "node:test";
 import { launchBindingDigest } from "../../src/shared/launch-contract.ts";
 import {
 	MAX_EXTENSION_BINDING_NAMESPACES,
@@ -10,29 +10,22 @@ import {
 	normalizeExtensionBindings,
 	omitExtensionBindingsEnv,
 } from "../../src/runs/shared/extension-bindings.ts";
-import { buildPiArgs } from "../../src/runs/shared/pi-args.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 
-const originalBindingEnv = process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
-const tempDirs: string[] = [];
-
-afterEach(() => {
-	if (originalBindingEnv === undefined) delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
-	else process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = originalBindingEnv;
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
-
-function childEnv(extensionBindings?: ExtensionBindings): Record<string, string | undefined> {
+function childEnv(extensionBindings?: ExtensionBindings, host: "parent" | "runner" = "runner"): Record<string, string | undefined> {
 	const normalizedExtensionBindings = normalizeExtensionBindings(extensionBindings)?.value;
-	const result = buildPiArgs({
-		baseArgs: [],
-		task: "test",
+	const launch = buildInProcessChildLaunch({
+		host,
+		cwd: os.tmpdir(),
+		childAgentName: "worker",
+		childIndex: 0,
 		sessionEnabled: false,
 		inheritProjectContext: false,
+		inheritGlobalContext: false,
 		inheritSkills: false,
 		extensionBindings: normalizedExtensionBindings,
 	});
-	if (result.tempDir) tempDirs.push(result.tempDir);
-	return result.env;
+	return launch.session.processEnv ?? {};
 }
 
 describe("extension bindings", () => {
@@ -47,7 +40,7 @@ describe("extension bindings", () => {
 
 	it("rejects malformed, oversized, and unsafe values", () => {
 		assert.throws(() => normalizeExtensionBindings({ invalid: true }), /namespace/);
-		assert.throws(() => normalizeExtensionBindings(Object.fromEntries(Array.from({ length: MAX_EXTENSION_BINDING_NAMESPACES + 1 }, (_, index) => [`pkg${index}\/1`, true]))), /at most/);
+		assert.throws(() => normalizeExtensionBindings(Object.fromEntries(Array.from({ length: MAX_EXTENSION_BINDING_NAMESPACES + 1 }, (_, index) => [`pkg${index}/1`, true]))), /at most/);
 		assert.throws(() => normalizeExtensionBindings({ "pkg/1": "x".repeat(MAX_EXTENSION_BINDINGS_BYTES) }), /maximum/);
 		assert.throws(() => normalizeExtensionBindings({ "pkg/1": Number.NaN }), /finite/);
 		const cyclic: Record<string, unknown> = { "pkg/1": {} };
@@ -58,10 +51,12 @@ describe("extension bindings", () => {
 		assert.throws(() => normalizeExtensionBindings(accessor), /data property/);
 	});
 
-	it("sets canonical child-only env and clears inherited authority when omitted", () => {
-		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = '{"parent/1":true}';
-		assert.equal(childEnv()[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], undefined);
+	it("sets canonical child env for the runner host and clears it when omitted", () => {
+		const omitted = childEnv();
+		assert.equal(Object.hasOwn(omitted, PI_SUBAGENT_EXTENSION_BINDINGS_ENV), true);
+		assert.equal(omitted[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], undefined);
 		assert.equal(childEnv({ "child/1": { z: 1, a: 2 } })[PI_SUBAGENT_EXTENSION_BINDINGS_ENV], '{"child/1":{"a":2,"z":1}}');
+		assert.deepEqual(childEnv({ "child/1": true }, "parent"), {}, "the parent host never writes child environment values");
 	});
 
 	it("removes ambient bindings from external runner environments", () => {

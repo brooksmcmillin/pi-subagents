@@ -1,5 +1,6 @@
-import type { AsyncJobStep, HostStepNodeV1, WorkflowGraphNode, WorkflowGraphSnapshot, WorkflowPreflightLaneV1, WorkflowPreflightV1 } from "../shared/types.ts";
+import type { AsyncJobStep, HostStepNode, WorkflowGraphNode, WorkflowGraphSnapshot, WorkflowPreflightLane, WorkflowPreflight } from "../shared/types.ts";
 import { sanitizeDisplayText } from "../shared/display-text.ts";
+import { workflowPreflightLaneForRuntimeKey as laneFor } from "./workflow-preflight.ts";
 
 export type WorkflowChecklistState = "complete" | "running" | "queued" | "blocked" | "failed" | "paused" | "stopped";
 
@@ -61,12 +62,12 @@ export interface WorkflowChecklistItem {
 	toolCount?: number;
 	outputName?: string;
 	error?: string;
-	preflight?: WorkflowPreflightLaneV1;
+	preflight?: WorkflowPreflightLane;
 	kind?: "child" | "host";
-	monitorKind?: HostStepNodeV1["monitorKind"];
+	monitorKind?: HostStepNode["monitorKind"];
 	provider?: string;
 	role?: string;
-	verdict?: HostStepNodeV1["verdict"];
+	verdict?: HostStepNode["verdict"];
 	target?: string;
 	reasonCode?: string;
 	stale?: boolean;
@@ -105,8 +106,8 @@ export interface WorkflowChecklistProjection {
 export interface WorkflowChecklistInput {
 	graph?: WorkflowGraphSnapshot;
 	steps?: readonly WorkflowChecklistStep[] | readonly AsyncJobStep[];
-	hostSteps?: readonly HostStepNodeV1[];
-	preflight?: WorkflowPreflightV1;
+	hostSteps?: readonly HostStepNode[];
+	preflight?: WorkflowPreflight;
 	trace?: readonly WorkflowChecklistTraceEntry[];
 	now?: number;
 }
@@ -189,15 +190,11 @@ function duration(step: Pick<WorkflowChecklistStep, "durationMs" | "startedAt" |
 	return end === undefined ? undefined : Math.max(0, end - startedAt);
 }
 
-function laneFor(key: string, phase: string, lanes: ReadonlyMap<string, WorkflowPreflightLaneV1>): WorkflowPreflightLaneV1 | undefined {
-	return lanes.get(key) ?? lanes.get(phase) ?? [...lanes.values()].find((lane) => key.startsWith(`${lane.key}.`));
-}
-
 function stepKey(step: WorkflowChecklistStep): string | undefined {
 	return step.key ?? step.workflowKey ?? step.runId;
 }
 
-function stepItem(step: WorkflowChecklistStep, index: number, phase: string, key = stepKey(step) ?? `step-${index + 1}`, label = step.label ?? step.description ?? stepKey(step) ?? step.agent ?? key, preflight?: WorkflowPreflightLaneV1): WorkflowChecklistItem {
+function stepItem(step: WorkflowChecklistStep, index: number, phase: string, key = stepKey(step) ?? `step-${index + 1}`, label = step.label ?? step.description ?? stepKey(step) ?? step.agent ?? key, preflight?: WorkflowPreflightLane): WorkflowChecklistItem {
 	const state = checklistState(step);
 	return {
 		key: keyText(key, `step-${index + 1}`),
@@ -218,7 +215,7 @@ function stepItem(step: WorkflowChecklistStep, index: number, phase: string, key
 	};
 }
 
-function hostItem(host: HostStepNodeV1, phase: string, key = host.id): WorkflowChecklistItem {
+function hostItem(host: HostStepNode, phase: string, key = host.id): WorkflowChecklistItem {
 	const state = checklistState({ status: host.state, verdict: host.verdict, stale: host.freshness?.stale });
 	return {
 		key: keyText(key, "host-step"),
@@ -263,8 +260,8 @@ function traceSources(trace: readonly WorkflowChecklistTraceEntry[] | undefined)
 	return [...latest.values()];
 }
 
-function traceItem(entry: WorkflowChecklistTraceEntry, index: number, preflight: WorkflowPreflightLaneV1 | undefined): WorkflowChecklistItem {
-	const phase = keyText(entry.generatedLaneKey ?? entry.phase ?? preflight?.key, "Workflow");
+function traceItem(entry: WorkflowChecklistTraceEntry, index: number, preflight: WorkflowPreflightLane | undefined): WorkflowChecklistItem {
+	const phase = keyText(preflight?.key ?? entry.generatedLaneKey ?? entry.phase, "Workflow");
 	const item = stepItem({ key: entry.key, label: entry.label, phase, agent: entry.agent, status: entry.state === "started" ? "running" : entry.state, durationMs: entry.durationMs, error: entry.error }, index, phase, entry.key, entry.label ?? entry.key, preflight);
 	if (entry.operation === "host") item.kind = "host";
 	return item;
@@ -283,7 +280,7 @@ function add(phases: Map<string, WorkflowChecklistPhase>, phase: string, item: W
 	phaseFor(phases, phase).items.push(item);
 }
 
-function mergeNodeStep(node: WorkflowGraphNode, step: WorkflowChecklistStep, phase: string, trace: WorkflowChecklistTraceEntry | undefined, preflight: WorkflowPreflightLaneV1 | undefined): WorkflowChecklistItem {
+function mergeNodeStep(node: WorkflowGraphNode, step: WorkflowChecklistStep, phase: string, trace: WorkflowChecklistTraceEntry | undefined, preflight: WorkflowPreflightLane | undefined): WorkflowChecklistItem {
 	const state = checklistState(step);
 	const nodeState = checklistState({ status: node.status, acceptance: node.acceptanceStatus ? { status: node.acceptanceStatus } : undefined });
 	const status = TERMINAL_STATES.has(nodeState) && !TERMINAL_STATES.has(state)
@@ -317,16 +314,13 @@ function finalize(phase: WorkflowChecklistPhase): void {
 
 export function projectWorkflowChecklist(input: WorkflowChecklistInput): WorkflowChecklistProjection {
 	const phases = new Map<string, WorkflowChecklistPhase>();
-	const lanes = new Map((input.preflight?.lanes ?? []).map((lane) => [lane.key, lane]));
 	const steps = (input.steps ?? []) as readonly WorkflowChecklistStep[];
 	const nodes = graphNodes(input.graph);
 	const trace = traceSources(input.trace);
 	const traceByKey = new Map(trace.map((entry) => [entry.key, entry]));
 	const phaseByNode = new Map<string, string>();
-	const graphPhaseLabels = new Set<string>();
 	for (const phase of input.graph?.phases ?? []) {
 		const title = keyText(phase.title, "Workflow");
-		graphPhaseLabels.add(title);
 		phaseFor(phases, title);
 		for (const nodeId of phase.nodeIds) if (!phaseByNode.has(nodeId)) phaseByNode.set(nodeId, title);
 	}
@@ -341,7 +335,7 @@ export function projectWorkflowChecklist(input: WorkflowChecklistInput): Workflo
 	const usedSteps = new Set<number>();
 	const hostById = new Map((input.hostSteps ?? []).map((host) => [host.id, host]));
 	const graphKeys = new Set(nodes.map((node) => node.id));
-	const stepKeys = new Set([...stepsByKey.keys()]);
+	const stepKeys = new Set(stepsByKey.keys());
 	const hostKeys = new Set(hostById.keys());
 
 	for (const node of nodes) {
@@ -356,28 +350,28 @@ export function projectWorkflowChecklist(input: WorkflowChecklistInput): Workflo
 		if (matches.length) {
 			for (const match of matches) {
 				usedSteps.add(match.index);
-				add(phases, phase, applyNow(mergeNodeStep(node, match.step, phase, traceByKey.get(stepKey(match.step) ?? node.id), laneFor(node.id, phase, lanes)), input.now));
+				add(phases, phase, applyNow(mergeNodeStep(node, match.step, phase, traceByKey.get(stepKey(match.step) ?? node.id), laneFor(input.preflight, node.id, [phase])), input.now));
 			}
 			continue;
 		}
-		add(phases, phase, applyNow(mergeNodeStep(node, { key: node.id, label: node.label, phase, agent: node.agent, status: node.status, outputName: node.outputName, error: node.error, acceptance: node.acceptanceStatus ? { status: node.acceptanceStatus } : undefined }, phase, traceByKey.get(node.id), laneFor(node.id, phase, lanes)), input.now));
+		add(phases, phase, applyNow(mergeNodeStep(node, { key: node.id, label: node.label, phase, agent: node.agent, status: node.status, outputName: node.outputName, error: node.error, acceptance: node.acceptanceStatus ? { status: node.acceptanceStatus } : undefined }, phase, traceByKey.get(node.id), laneFor(input.preflight, node.id, [phase])), input.now));
 	}
 
 	for (const [index, step] of steps.entries()) {
 		if (usedSteps.has(index)) continue;
 		const key = keyText(stepKey(step), `step-${index + 1}`);
 		const traceEntry = traceByKey.get(key);
-		const phase = keyText(step.phase ?? laneFor(key, "", lanes)?.key ?? traceEntry?.generatedLaneKey ?? traceEntry?.phase, "Workflow");
-		add(phases, phase, applyNow(stepItem(step, index, phase, key, step.label ?? step.key ?? step.agent, laneFor(key, phase, lanes)), input.now));
+		const lane = laneFor(input.preflight, key, [step.phase, traceEntry?.generatedLaneKey, traceEntry?.phase]);
+		const phase = keyText(lane?.key ?? step.phase ?? traceEntry?.generatedLaneKey ?? traceEntry?.phase, "Workflow");
+		add(phases, phase, applyNow(stepItem(step, index, phase, key, step.label ?? step.key ?? step.agent, lane), input.now));
 	}
 
 	for (const host of hostById.values()) add(phases, keyText(host.label, "Host"), hostItem(host, keyText(host.label, "Host")));
 	for (const entry of trace) {
 		if (graphKeys.has(entry.key) || stepKeys.has(entry.key) || hostKeys.has(entry.key)) continue;
-		const item = traceItem(entry, phases.size, laneFor(entry.key, entry.generatedLaneKey ?? entry.phase ?? "", lanes));
+		const item = traceItem(entry, phases.size, laneFor(input.preflight, entry.key, [entry.generatedLaneKey, entry.phase]));
 		add(phases, item.phase, item);
 	}
-	for (const lane of input.preflight?.lanes ?? []) if (!graphKeys.has(lane.key) && !graphPhaseLabels.has(lane.key) && !phases.get(lane.key)?.items.length) add(phases, lane.key, { key: lane.key, label: lane.key, phase: lane.key, state: "queued", preflight: lane });
 
 	const finalized = [...phases.values()].filter((phase) => phase.items.length > 0);
 	for (const phase of finalized) {
@@ -404,11 +398,12 @@ export function formatWorkflowChecklistPhase(phase: WorkflowChecklistPhase): str
 	return counts.length ? `${phase.label} ${counts.join(" · ")}` : phase.label;
 }
 
-export function formatWorkflowChecklistBottleneck(item: WorkflowChecklistItem | undefined, options: { includeOutput?: boolean } = {}): string | undefined {
+export function formatWorkflowChecklistBottleneck(item: WorkflowChecklistItem | undefined, options: { includeOutput?: boolean; includeError?: boolean } = {}): string | undefined {
 	if (!item) return undefined;
 	const identity = [item.label, item.agent && item.agent !== item.label ? item.agent : undefined].filter((value): value is string => Boolean(value)).join(" · ") || item.key;
 	const includeOutput = options.includeOutput ?? true;
-	const details = [item.context ? `(${item.context})` : undefined, item.currentTool ? `${item.currentTool}${item.durationMs !== undefined ? ` ${formatDurationText(item.durationMs)}` : ""}` : undefined, !item.currentTool && item.currentPath ? item.currentPath : undefined, !item.currentTool && item.durationMs !== undefined ? formatDurationText(item.durationMs) : undefined, item.toolCount !== undefined ? `${item.toolCount} tools` : undefined, includeOutput && item.outputName ? `out:${item.outputName}` : undefined, item.error ? `error:${item.error.replace(/\bOutput:/g, "output:")}` : undefined].filter((value): value is string => Boolean(value));
+	const includeError = options.includeError ?? true;
+	const details = [item.context ? `(${item.context})` : undefined, item.currentTool ? `${item.currentTool}${item.durationMs !== undefined ? ` ${formatDurationText(item.durationMs)}` : ""}` : undefined, !item.currentTool && item.currentPath ? item.currentPath : undefined, !item.currentTool && item.durationMs !== undefined ? formatDurationText(item.durationMs) : undefined, item.toolCount !== undefined ? `${item.toolCount} tools` : undefined, includeOutput && item.outputName ? `out:${item.outputName}` : undefined, includeError && item.error ? `error:${item.error.replace(/\bOutput:/g, "output:")}` : undefined].filter((value): value is string => Boolean(value));
 	return [identity, ...details].join(" · ");
 }
 
@@ -435,7 +430,7 @@ export function formatWorkflowChecklistText(projection: WorkflowChecklistProject
 			lines.push(`${indent}    ${marker} ${formatWorkflowChecklistItem(item)}`);
 		}
 	}
-	const bottleneck = formatWorkflowChecklistBottleneck(projection.bottleneck);
+	const bottleneck = formatWorkflowChecklistBottleneck(projection.bottleneck, { includeError: options.includeItems === false });
 	if (bottleneck) lines.push(`${indent}  bottleneck · ${bottleneck}`);
 	return lines;
 }

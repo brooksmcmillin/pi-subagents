@@ -4,14 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { acquireActiveAsyncCapacity } from "../../src/runs/background/active-async-capacity.ts";
-import { consumeSteerRequests, consumeSteerRequestsFromDir, consumeStopRequestPayload, stepSteerInboxDir, writeSteerAck } from "../../src/runs/background/control-channel.ts";
+import { consumeSteerRequests, consumeStopRequestPayload } from "../../src/runs/background/control-channel.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
 import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
-import { steerWorkflowForegroundTarget, workflowForegroundSteeringDir } from "../../src/runs/foreground/workflow-foreground-steering.ts";
+import { steerWorkflowForegroundTarget } from "../../src/runs/foreground/workflow-foreground-steering.ts";
 import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
-import { ASYNC_DIR, RESULTS_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { ASYNC_DIR, RESULTS_DIR, type ForegroundChildControl, type ForegroundSteerInput, type SubagentState } from "../../src/shared/types.ts";
 
 function createState(): SubagentState {
 	return {
@@ -68,24 +68,38 @@ function cleanup(runId: string, asyncDir: string): void {
 	fs.rmSync(path.join(RESULTS_DIR, `${runId}.json`), { force: true });
 }
 
-function createWorkflowForegroundControl(state: SubagentState, workflowRunId: string, childRunId: string): string {
-	const routeDir = workflowForegroundSteeringDir(ASYNC_DIR, workflowRunId, childRunId);
+interface RecordedSteer {
+	message: string;
+	mode?: string;
+}
+
+function createWorkflowForegroundControl(
+	state: SubagentState,
+	workflowRunId: string,
+	childRunId: string,
+	options: { steer?: ForegroundChildControl["steer"] | null } = {},
+): RecordedSteer[] {
+	const steers: RecordedSteer[] = [];
+	const steer = options.steer === null
+		? undefined
+		: options.steer ?? (async (input: ForegroundSteerInput) => {
+			steers.push({ message: input.message, ...(input.mode ? { mode: input.mode } : {}) });
+			return { state: input.mode === "follow_up" ? "queued" as const : "delivered" as const };
+		});
 	state.workflowControllers ??= new Map();
 	state.workflowControllers.set(workflowRunId, new AbortController());
 	state.foregroundControls.set(childRunId, {
 		runId: childRunId,
 		parentWorkflowRunId: workflowRunId,
 		workflowKey: childRunId,
-		workflowSteeringDir: routeDir,
 		sessionId: "session",
 		mode: "single",
 		startedAt: 100,
 		updatedAt: 100,
-		activeChildren: new Map([[0, { index: 0, agent: "worker", startedAt: 100, updatedAt: 100 }]]),
+		activeChildren: new Map([[0, { index: 0, agent: "worker", startedAt: 100, updatedAt: 100, ...(steer ? { steer } : {}) }]]),
 		schedulingOwners: 1,
 	});
-	fs.mkdirSync(stepSteerInboxDir(routeDir, 0), { recursive: true });
-	return routeDir;
+	return steers;
 }
 
 async function waitUntil<T>(read: () => T | undefined, timeoutMs = 5_000): Promise<T> {
@@ -200,22 +214,15 @@ describe("async interrupt action", () => {
 		const workflowRunId = `workflow-child-${Date.now().toString(36)}`;
 		const childRunId = `${workflowRunId}-child`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+		const steers = createWorkflowForegroundControl(state, workflowRunId, childRunId);
 		try {
-			const action = executorWithKill(state, () => true)
+			const result = await executorWithKill(state, () => true)
 				.execute("steer", { action: "steer", id: childRunId, message: "Focus on the failing test." }, new AbortController().signal, undefined, ctx());
-			const request = await waitUntil(() => {
-				const inbox = stepSteerInboxDir(routeDir, 0);
-				const entry = fs.existsSync(inbox) ? fs.readdirSync(inbox).find((name) => name.endsWith(".json")) : undefined;
-				return entry ? JSON.parse(fs.readFileSync(path.join(inbox, entry), "utf-8")) as { id: string; message: string } : undefined;
-			});
-			writeSteerAck(routeDir, { requestId: request.id, index: 0, ts: Date.now(), state: "delivered", message: "accepted" });
-			const result = await action;
 
 			assert.equal(result.isError, undefined);
 			assert.equal(result.details.steering?.state, "delivered");
 			assert.equal(result.details.steering?.sourceRunId, childRunId);
-			assert.equal(request.message, "Focus on the failing test.");
+			assert.deepEqual(steers, [{ message: "Focus on the failing test." }]);
 			assert.match(text(result), /Message sent:\n```text\nFocus on the failing test\.\n```/);
 		} finally {
 			cleanup(workflowRunId, asyncDir);
@@ -227,16 +234,27 @@ describe("async interrupt action", () => {
 		const workflowRunId = `workflow-key-foreground-${Date.now().toString(36)}`;
 		const childRunId = `${workflowRunId}-writer`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+		const steers = createWorkflowForegroundControl(state, workflowRunId, childRunId);
 		try {
-			const action = steerWorkflowChildByKey({ state, workflowRunId, key: childRunId, message: "Focus on the contract.", options: { ackTimeoutMs: 500 } });
-			const request = await waitUntil(() => {
-				const inbox = stepSteerInboxDir(routeDir, 0);
-				const entry = fs.readdirSync(inbox).find((name) => name.endsWith(".json"));
-				return entry ? JSON.parse(fs.readFileSync(path.join(inbox, entry), "utf-8")) as { id: string } : undefined;
-			});
-			writeSteerAck(routeDir, { requestId: request.id, index: 0, ts: Date.now(), state: "delivered", message: "accepted" });
-			assert.equal((await action).state, "delivered");
+			const action = await steerWorkflowChildByKey({ state, workflowRunId, key: childRunId, message: "Focus on the contract.", options: { ackTimeoutMs: 500 } });
+			assert.equal(action.state, "delivered");
+			assert.deepEqual(steers, [{ message: "Focus on the contract." }]);
+		} finally {
+			cleanup(workflowRunId, asyncDir);
+		}
+	});
+
+	it("retries a foreground workflow-key steer until the child session is running", async () => {
+		const state = createState();
+		const workflowRunId = `workflow-key-early-${Date.now().toString(36)}`;
+		const childRunId = `${workflowRunId}-writer`;
+		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		let attempts = 0;
+		createWorkflowForegroundControl(state, workflowRunId, childRunId, { steer: async () => ++attempts < 3 ? { state: "failed" as const, reason: "Child session is not running yet." } : { state: "delivered" as const } });
+		try {
+			const action = await steerWorkflowChildByKey({ state, workflowRunId, key: childRunId, message: "Early.", options: { ackTimeoutMs: 500 } });
+			assert.equal(action.state, "delivered");
+			assert.equal(attempts, 3);
 		} finally {
 			cleanup(workflowRunId, asyncDir);
 		}
@@ -342,74 +360,65 @@ describe("async interrupt action", () => {
 		}
 	});
 
-	it("rejects a steer request when its workflow foreground route is already removed", async () => {
+	it("reports a failed steer when the child session rejects it", async () => {
 		const state = createState();
-		const workflowRunId = `workflow-missing-route-${Date.now().toString(36)}`;
+		const workflowRunId = `workflow-steer-failed-${Date.now().toString(36)}`;
 		const childRunId = `${workflowRunId}-child`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+		createWorkflowForegroundControl(state, workflowRunId, childRunId, { steer: async () => ({ state: "failed", reason: "session is settling" }) });
 		try {
 			const control = state.foregroundControls.get(childRunId)!;
-			fs.rmSync(routeDir, { recursive: true, force: true });
 			const result = await steerWorkflowForegroundTarget({
 				target: { control, workflowRunId, sourceRunId: childRunId },
 				message: "Focus on the failing test.",
-				ackTimeoutMs: 40,
 			});
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /no live workflow steering route/);
-			assert.equal(result.details.steering, undefined);
-			assert.equal(fs.existsSync(routeDir), false);
+			assert.match(text(result), /Steering failed .*session is settling/);
+			assert.equal(result.details.steering?.state, "failed");
 		} finally {
 			cleanup(workflowRunId, asyncDir);
 		}
 	});
 
-	it("rejects a steer request when its workflow foreground child inbox is missing", async () => {
+	it("rejects a steer request when the child session is not steerable", async () => {
 		const state = createState();
-		const workflowRunId = `workflow-missing-inbox-${Date.now().toString(36)}`;
+		const workflowRunId = `workflow-no-steer-${Date.now().toString(36)}`;
 		const childRunId = `${workflowRunId}-child`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+		createWorkflowForegroundControl(state, workflowRunId, childRunId, { steer: null });
 		try {
 			const control = state.foregroundControls.get(childRunId)!;
-			fs.rmSync(stepSteerInboxDir(routeDir, 0), { recursive: true, force: true });
 			const result = await steerWorkflowForegroundTarget({
 				target: { control, workflowRunId, sourceRunId: childRunId },
 				message: "Focus on the failing test.",
-				ackTimeoutMs: 40,
 			});
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /no live workflow steering route/);
+			assert.match(text(result), /does not support steering/);
 			assert.equal(result.details.steering, undefined);
-			assert.equal(fs.existsSync(stepSteerInboxDir(routeDir, 0)), false);
 		} finally {
 			cleanup(workflowRunId, asyncDir);
 		}
 	});
 
-	it("rejects a steer request when its workflow foreground route is removed during the final acknowledgment wait", async () => {
+	it("queues follow-up steering through the child session", async () => {
 		const state = createState();
-		const workflowRunId = `workflow-removed-route-${Date.now().toString(36)}`;
+		const workflowRunId = `workflow-follow-up-${Date.now().toString(36)}`;
 		const childRunId = `${workflowRunId}-child`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+		const steers = createWorkflowForegroundControl(state, workflowRunId, childRunId);
 		try {
 			const control = state.foregroundControls.get(childRunId)!;
-			const action = steerWorkflowForegroundTarget({
+			const result = await steerWorkflowForegroundTarget({
 				target: { control, workflowRunId, sourceRunId: childRunId },
-				message: "Focus on the failing test.",
-				ackTimeoutMs: 40,
+				message: "After this, update the docs.",
+				mode: "follow_up",
 			});
-			await waitUntil(() => fs.existsSync(stepSteerInboxDir(routeDir, 0)) ? true : undefined);
-			fs.rmSync(routeDir, { recursive: true, force: true });
-			const result = await action;
 
-			assert.equal(result.isError, true);
-			assert.match(text(result), /no live child session/);
-			assert.equal(result.details.steering, undefined);
+			assert.equal(result.isError, undefined);
+			assert.equal(result.details.steering?.deliveryStatus, "queued");
+			assert.deepEqual(steers, [{ message: "After this, update the docs.", mode: "follow_up" }]);
 		} finally {
 			cleanup(workflowRunId, asyncDir);
 		}
@@ -421,22 +430,95 @@ describe("async interrupt action", () => {
 			const workflowRunId = `workflow-${target}-${Date.now().toString(36)}`;
 			const childRunId = `${workflowRunId}-child`;
 			const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-			const routeDir = createWorkflowForegroundControl(state, workflowRunId, childRunId);
+			const steers = createWorkflowForegroundControl(state, workflowRunId, childRunId);
 			try {
-				const controller = new AbortController();
-				setTimeout(() => controller.abort(), 10);
 				const params = target === "id"
 					? { action: "steer", id: workflowRunId, message: "Review the contract." }
 					: { action: "steer", dir: asyncDir, message: "Review the contract." };
 				const result = await executorWithKill(state, () => true)
-					.execute("steer", params, controller.signal, undefined, ctx());
+					.execute("steer", params, new AbortController().signal, undefined, ctx());
 
 				assert.equal(result.isError, undefined);
 				assert.equal(result.details.steering?.sourceRunId, workflowRunId);
-				assert.equal(consumeSteerRequestsFromDir(stepSteerInboxDir(routeDir, 0))[0]?.message, "Review the contract.");
+				assert.deepEqual(steers, [{ message: "Review the contract." }]);
 			} finally {
 				cleanup(workflowRunId, asyncDir);
 			}
+		}
+	});
+
+	it("exposes exact async child targets when owned workflow steering has no foreground route", async () => {
+		const state = createState();
+		const workflowRunId = `workflow-async-target-${Date.now().toString(36)}`;
+		const childRunId = `${workflowRunId}-child`;
+		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		const childDir = createRunningAsync(state, childRunId);
+		state.currentSessionId = "session";
+		state.workflowControllers = new Map([[workflowRunId, new AbortController()]]);
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		status.steps = [{ agent: "worker", workflowKey: "writer", status: "running", async: true, runId: childRunId }];
+		writeJson(statusPath, status);
+		try {
+			const executor = executorWithKill(state, () => true);
+			const result = await executor.execute("steer", { action: "steer", id: workflowRunId, mode: "follow_up", message: "Continue carefully." }, new AbortController().signal, undefined, ctx());
+			assert.equal(result.isError, true);
+			assert.match(text(result), /no live foreground child/);
+			assert.ok(text(result).includes(`id: "${childRunId}"`));
+			assert.match(text(result), /recorded as running; direct steering rechecks/);
+			assert.deepEqual(consumeSteerRequests(asyncDir), []);
+			assert.deepEqual(consumeSteerRequests(childDir), []);
+			const view = inspectSubagentStatus({ id: workflowRunId }, { state, kill: () => true });
+			assert.ok(text(view).includes(`Child run: ${childRunId}`));
+			assert.ok(text(view).includes(`action: "steer", id: "${childRunId}"`));
+			assert.doesNotMatch(text(view), new RegExp(`action: "steer", id: "${workflowRunId}"`));
+			const direct = await executor.execute("steer-child", { action: "steer", id: childRunId, mode: "follow_up", message: "Continue carefully." }, new AbortController().signal, undefined, ctx());
+			assert.equal(direct.isError, undefined);
+			assert.equal(direct.details.steering?.deliveryStatus, "queued");
+			assert.notEqual(direct.details.steering?.state, "delivered");
+			assert.equal(consumeSteerRequests(childDir)[0]?.mode, "follow_up");
+		} finally {
+			cleanup(workflowRunId, asyncDir);
+			cleanup(childRunId, childDir);
+		}
+	});
+
+	it("keeps async workflow hints projection-only, selective, and scoped to the active owner", () => {
+		const state = createState();
+		const workflowRunId = `workflow-async-hints-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
+		state.currentSessionId = "session";
+		state.workflowControllers = new Map([[workflowRunId, new AbortController()]]);
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		const child = (runId: string, overrides = {}) => ({ agent: "worker", workflowKey: runId, status: "running", async: true, runId, ...overrides });
+		status.steps = [child("async-one"), child("async-two"), child("async-one"),
+			child("completed-child", { status: "complete" }), child("paused-child", { status: "paused" }),
+			child("pending-child", { status: "pending" }), child("foreground-child", { async: false }),
+			child("unknown-child", { async: undefined }), child("external-child", { runner: { type: "external-cli" } }),
+			child("job-child", { runner: { type: "external-job", provider: "test" } }), child("../unsafe"), child(workflowRunId)];
+		writeJson(statusPath, status);
+		try {
+			const read = () => text(inspectSubagentStatus({ id: workflowRunId }, { state, kill: () => true }));
+			const view = read();
+			const hints = view.split("\n").filter((line) => line.includes('action: "steer"'));
+			assert.equal(hints.length, 2);
+			assert.ok(hints[0].includes('id: "async-one"'));
+			assert.ok(hints[1].includes('id: "async-two"'));
+			assert.match(view, /queued does not mean consumed/);
+			for (const sessionId of [null, "other-session"]) {
+				state.currentSessionId = sessionId;
+				assert.doesNotMatch(read(), /Async children recorded as running/);
+			}
+			state.currentSessionId = "session";
+			state.workflowControllers.clear();
+			assert.doesNotMatch(read(), /Async children recorded as running/);
+			state.workflowControllers.set(workflowRunId, new AbortController());
+			status.state = "complete";
+			writeJson(statusPath, status);
+			assert.doesNotMatch(read(), /Async children recorded as running/);
+		} finally {
+			cleanup(workflowRunId, asyncDir);
 		}
 	});
 
@@ -444,16 +526,16 @@ describe("async interrupt action", () => {
 		const state = createState();
 		const workflowRunId = `workflow-ambiguous-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, workflowRunId, { track: false, mode: "workflow" });
-		const firstRoute = createWorkflowForegroundControl(state, workflowRunId, `${workflowRunId}-one`);
-		const secondRoute = createWorkflowForegroundControl(state, workflowRunId, `${workflowRunId}-two`);
+		const firstSteers = createWorkflowForegroundControl(state, workflowRunId, `${workflowRunId}-one`);
+		const secondSteers = createWorkflowForegroundControl(state, workflowRunId, `${workflowRunId}-two`);
 		try {
 			const result = await executorWithKill(state, () => true)
 				.execute("steer", { action: "steer", id: workflowRunId, message: "Do not guess." }, new AbortController().signal, undefined, ctx());
 
 			assert.equal(result.isError, true);
 			assert.match(text(result), /2 live foreground children/);
-			assert.equal(consumeSteerRequestsFromDir(stepSteerInboxDir(firstRoute, 0)).length, 0);
-			assert.equal(consumeSteerRequestsFromDir(stepSteerInboxDir(secondRoute, 0)).length, 0);
+			assert.equal(firstSteers.length, 0);
+			assert.equal(secondSteers.length, 0);
 		} finally {
 			cleanup(workflowRunId, asyncDir);
 		}
@@ -475,7 +557,7 @@ describe("async interrupt action", () => {
 				.execute("steer", { action: "steer", dir: asyncDir, message: "Too late." }, new AbortController().signal, undefined, ctx());
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /no live foreground child/);
+			assert.match(text(result), /not running or queued/);
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "steer-requests")), false);
 		} finally {
 			cleanup(workflowRunId, asyncDir);

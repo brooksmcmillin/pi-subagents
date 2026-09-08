@@ -21,8 +21,10 @@ import type {
 	ResolvedAcceptanceGate,
 	SingleResult,
 	SubagentRunMode,
+	ChildWatchdogProgress,
 } from "../../shared/types.ts";
-import { isAgentContractV1 } from "./agent-contract.ts";
+import { unresolvedChildWatchdogBlockers } from "../../watchdog/child-status.ts";
+import { isAgentContract } from "./agent-contract.ts";
 import { classifyTaskMutationIntent, stripSeverityCompounds, taskMayMutate } from "./task-intent.ts";
 
 const LEVEL_RANK: Record<Exclude<AcceptanceLevel, "auto">, number> = {
@@ -200,8 +202,21 @@ export function normalizeGateAcceptance(gate: unknown, acceptance: AcceptanceInp
 		return normalized.error ? { ok: false, error: normalized.error } : { ok: true, acceptance: normalized.value as AcceptanceInput };
 	}
 	if (typeof gate !== "string" || !gate.trim()) return { ok: false, error: "gate must be a non-empty command string." };
-	if (acceptance !== undefined) return { ok: false, error: "gate cannot be combined with acceptance; use one gate command or acceptance.verify." };
+	if (acceptance !== undefined && acceptance !== false) return { ok: false, error: "gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(gate, acceptance) };
 	return { ok: true, acceptance: { level: "verified", verify: [{ id: "gate", command: gate.trim() }] } };
+}
+
+export function describeGateAcceptanceConflict(gate: unknown, acceptance: unknown): string {
+	const render = (value: unknown): string => {
+		let encoded: string;
+		try {
+			encoded = JSON.stringify(value) ?? String(value);
+		} catch {
+			encoded = String(value);
+		}
+		return encoded.length > 120 ? `${encoded.slice(0, 120)}...` : encoded;
+	};
+	return ` Both fields were present: gate=${render(gate)} acceptance=${render(acceptance)}.`;
 }
 
 function explicitAcceptanceCanDisable(explicit: AcceptanceConfig): boolean {
@@ -420,7 +435,7 @@ export function resolveEffectiveAcceptance(input: {
 }): ResolvedAcceptanceConfig {
 	const explicit = normalizeAcceptanceInput(input.explicit);
 	const explicitLevel = normalizeLevel(explicit.level);
-	if (isAgentContractV1(input.agentContract)) {
+	if (isAgentContract(input.agentContract)) {
 		const level = explicitAcceptanceCanDisable(explicit) || explicitLevel === "auto"
 			? "none"
 			: explicitLevel;
@@ -1068,7 +1083,7 @@ function effectiveVerifyEnv(env: Record<string, string> | undefined): Record<str
 	const inherited = Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => {
 		return typeof value === "string" ? [[key, value]] : [];
 	}));
-	return { ...inherited, ...(env ?? {}) };
+	return { ...inherited, ...env };
 }
 
 function verifyRedactionEnv(env: Record<string, string> | undefined): Record<string, string> {
@@ -1360,6 +1375,7 @@ export async function evaluateAcceptance(input: {
 	reportOptional?: boolean;
 	artifactsDir?: string;
 	runId?: string;
+	watchdog?: ChildWatchdogProgress;
 }): Promise<AcceptanceLedger> {
 	const acceptance = input.acceptance;
 	const initialStatus = acceptance.level === "none" ? "not-required" : "claimed";
@@ -1374,6 +1390,13 @@ export async function evaluateAcceptance(input: {
 		verifyRuns: [],
 	};
 	if (acceptance.level === "none") return ledger;
+
+	if (input.watchdog) {
+		const unresolved = unresolvedChildWatchdogBlockers(input.watchdog);
+		ledger.runtimeChecks.push(unresolved.length
+			? { id: "watchdog-blocker", status: "failed", message: `Unresolved watchdog blocker: ${unresolved[0]!.summary}` }
+			: { id: "watchdog-blocker", status: "passed", message: "No unresolved watchdog blockers." });
+	}
 
 	const parsed: AcceptanceReportParseResult = input.reportError
 		? { error: input.reportError }

@@ -14,12 +14,14 @@ import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts"
 import { createAtomicJsonWriter, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { planChildLaunch, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
-import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { applyThinkingSuffix, getHostBuiltinToolNames, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { applyWatchdogLaunchRules, sendRuleViolationWarning } from "../../watchdog/rules.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveExistingReadInstructionPaths, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
-import { resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { JITI_ALIAS_ENV, resolveHostPeerAliases } from "./runner-aliases.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { backgroundProcessOptions } from "../shared/background-process-options.ts";
@@ -30,7 +32,7 @@ import { buildModelCandidates, resolveEffectiveSubagentModel, resolveModelOrigin
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
-import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
+import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
 import { resolveExpectedWorktreeAgentCwd, resolveWorktreeProvider, shouldDeferWorktreeCwd, WORKTREE_AGENT_CWD_PLACEHOLDER } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -64,7 +66,10 @@ import {
 	getAsyncConfigPath,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import { nestedResultsPath, nestedSummaryFromAsyncStatus, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
+import { inheritedNestedParentAddressOf, inheritedNestedRouteOf, nestedResultsPath, nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
+import type { ChildRuntimeConfig } from "../shared/child-runtime-config.ts";
+import { childSessionFactoryModule } from "../shared/child-session.ts";
+import { inheritedChildRuntime } from "../shared/child-launch.ts";
 import { resultFilePath } from "./result-files.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
@@ -74,7 +79,7 @@ import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
-import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
+import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
@@ -141,8 +146,11 @@ interface AsyncExecutionContext {
 	currentModel?: ParentModel;
 	/** Optional model-scope enforcement resolved from subagent settings. */
 	modelScope?: ModelScopeConfig;
+	modelResponseAliases?: Record<string, string[]>;
 	/** Whether the parent session has an interactive UI. */
 	interactive?: boolean;
+	/** The executor's own child runtime when the launch comes from an in-process child. */
+	childRuntime?: ChildRuntimeConfig;
 }
 
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
@@ -178,6 +186,7 @@ interface AsyncChainParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	baseRef?: string;
 	worktreeProvider?: import("../../shared/types.ts").WorktreeProvider;
 	worktreeBranchPrefix?: string;
 	controlConfig?: ResolvedControlConfig;
@@ -247,6 +256,7 @@ interface AsyncSingleParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	baseRef?: string;
 	worktreeProvider?: import("../../shared/types.ts").WorktreeProvider;
 	worktreeBranchPrefix?: string;
 	worktree?: boolean;
@@ -535,6 +545,13 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
 	}
+	if (!piPackageRoot) {
+		return { error: `Background children require pi installed as the npm package (${PI_CODING_AGENT_PACKAGE}); a standalone pi binary has no package directory, so the async runner cannot create child sessions. Run this child in the foreground (async: false) or install pi from npm.` };
+	}
+	const hostPeerAliases = resolveHostPeerAliases(piPackageRoot);
+	if (hostPeerAliases.missing.length > 0) {
+		return { error: `Background children require pi installed as the npm package (${PI_CODING_AGENT_PACKAGE}) with its dependencies; ${piPackageRoot} does not provide ${hostPeerAliases.missing.join(", ")}, so the async runner cannot create child sessions. A standalone pi binary cannot run background children.` };
+	}
 
 	fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
 	const cfgPath = getAsyncConfigPath(suffix);
@@ -570,13 +587,17 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			stdoutFd = fs.openSync(logPaths.stdoutPath, "a");
 			stderrFd = fs.openSync(logPaths.stderrPath, "a");
 		}
-		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
+		const preload = Object.keys(hostPeerAliases.aliases).length > 0
+			? ["--import", new URL("../../../runner-peer-preload.mjs", import.meta.url).href]
+			: [];
+		const proc = spawn(nodeCommand, [...preload, jitiCliPath, runner, cfgPath], {
 			cwd,
 			...backgroundProcessOptions(),
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
 			env: {
 				...omitExtensionBindingsEnv(process.env),
-				...(piPackageRoot ? { [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
+				[PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot,
+				[JITI_ALIAS_ENV]: JSON.stringify(hostPeerAliases.aliases),
 			},
 		});
 		closeFd(stdoutFd);
@@ -832,7 +853,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (unsupported.length > 0) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 		}
 		try {
-			assertAgentAllowedByCapabilityCeiling(a.name, intersectSubagentCapabilityCeilings(params.capabilityCeiling, decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV])));
+			assertAgentAllowedByCapabilityCeiling(a.name, intersectSubagentCapabilityCeilings(params.capabilityCeiling, ctx.childRuntime?.capabilityCeiling));
 		} catch (error) {
 			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 		}
@@ -912,7 +933,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 			params.thinkingCeiling,
 			a.maxThinking,
-			decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+			ctx.childRuntime?.thinkingCeiling,
 		);
 		if (!externalRunner) {
 			try {
@@ -939,7 +960,10 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 			}
 		}
+		const launchRuleError = applyWatchdogLaunchRules({ cwd: stepCwd, agent: a.name, model: modelCandidates[0] ?? model, warn: (violation) => sendRuleViolationWarning(ctx.pi, violation) });
+		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
+		const hostAvailableBuiltins = getHostBuiltinToolNames(ctx.pi);
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
 			excludeTools: a.excludeTools,
@@ -954,10 +978,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			model,
 			modelCandidates,
 			capabilityCeiling: params.capabilityCeiling,
-			inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
+			inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 			agentName: a.name,
 			permissionRules,
 			runtimeSnapshotHost: ctx.pi,
+			hostAvailableBuiltins,
 		});
 		const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
 		if (externalRunner && permissionRules) {
@@ -999,11 +1024,10 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			thinking: resolveEffectiveThinking(model, effectiveThinking),
 			...(thinkingCeiling ? { thinkingCeiling } : {}),
 			launchResolvedExtensions,
-			...(toolPlan.mcpConfig ? { mcpConfig: toolPlan.mcpConfig } : {}),
-			...(toolPlan.runtimeServerNames ? { runtimeServerNames: toolPlan.runtimeServerNames } : {}),
 			modelCandidates: externalRunner ? undefined : modelCandidates,
 			...(primaryModelFromParent ? { skipPrimaryModelVerification: true } : {}),
 			...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
+			...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 			tools: a.tools,
 			excludeTools: a.excludeTools,
 			allowNestedSubagents: a.allowNestedSubagents,
@@ -1204,6 +1228,7 @@ export function executeAsyncChain(
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
 		worktreeBaseDir,
+		baseRef,
 		worktreeProvider,
 		worktreeBranchPrefix,
 		controlConfig,
@@ -1221,8 +1246,8 @@ export function executeAsyncChain(
 	});
 	if (acceptanceErrors.length > 0) return formatAsyncStartError(resultMode, acceptanceErrors.join(" "));
 	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
+	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(DIRS.async, id);
@@ -1335,10 +1360,12 @@ export function executeAsyncChain(
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
-				piArgv1: process.argv[1],
+				childSessionFactoryModule: childSessionFactoryModule(),
+				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
+				baseRef,
 				worktreeProvider,
 				worktreeBranchPrefix,
 				controlConfig,
@@ -1352,6 +1379,7 @@ export function executeAsyncChain(
 				deadlineAt,
 				globalConcurrencyLimit: params.globalConcurrencyLimit,
 				runFanoutBudget,
+				hostAvailableBuiltins: getHostBuiltinToolNames(ctx.pi),
 				workflowGraph,
 				...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 				...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
@@ -1451,7 +1479,7 @@ export function executeAsyncChain(
 						path: nestedAddress.path,
 						asyncDir,
 						pid: spawnResult.pid,
-						ownerIntercomTarget: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
+						ownerIntercomTarget: ctx.childRuntime?.intercomSessionName,
 						leafIntercomTarget: childIntercomTargets?.[0],
 						intercomTarget: childIntercomTargets?.[0],
 						ownerState: "live",
@@ -1538,6 +1566,7 @@ export function executeAsyncSingle(
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
 		worktreeBaseDir,
+		baseRef,
 		worktreeProvider,
 		worktreeBranchPrefix,
 		controlConfig,
@@ -1578,7 +1607,7 @@ export function executeAsyncSingle(
 		if (extensionBindings !== undefined) unsupported.push("extension bindings");
 		if (unsupported.length > 0) return formatAsyncStartError("single", `Agent '${agentConfig.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 	}
-	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]));
+	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling);
 	try {
 		assertAgentAllowedByCapabilityCeiling(agentConfig.name, capabilityCeiling);
 	} catch (error) {
@@ -1621,8 +1650,8 @@ export function executeAsyncSingle(
 	}
 	systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: runnerCwd, agentName: agentConfig.name });
 
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
+	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(DIRS.async, id);
@@ -1687,7 +1716,7 @@ export function executeAsyncSingle(
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		params.thinkingCeiling,
 		agentConfig.maxThinking,
-		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+		ctx.childRuntime?.thinkingCeiling,
 	);
 	if (!externalRunner) {
 		try {
@@ -1733,6 +1762,7 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
+	const hostAvailableBuiltins = getHostBuiltinToolNames(ctx.pi);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
 		excludeTools: agentConfig.excludeTools,
@@ -1747,10 +1777,11 @@ export function executeAsyncSingle(
 		model,
 		modelCandidates,
 		capabilityCeiling,
-		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
+		inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 		agentName: agentConfig.name,
 		permissionRules: resolvePermissionRules(ctx.permissions, agentConfig.permissions),
 		runtimeSnapshotHost: ctx.pi,
+		hostAvailableBuiltins,
 	});
 	const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
 	if (!externalRunner) {
@@ -1801,6 +1832,7 @@ export function executeAsyncSingle(
 	});
 	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
+		...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 		version: 1,
 		...(lane ? { lane } : {}),
 		launchContractDigest,
@@ -1844,6 +1876,7 @@ export function executeAsyncSingle(
 		...(controlConfig ? { controlConfig } : {}),
 		...(params.context ? { context: params.context } : {}),
 		...(params.intercomBridge !== undefined ? { intercomBridge: params.intercomBridge } : {}),
+		...(params.baseRef !== undefined ? { baseRef: params.baseRef } : {}),
 		...(deadlineAt !== undefined ? { absoluteDeadlineAt: deadlineAt } : {}),
 		...(resolvedToolBudget.budget ? { initialToolBudget: resolvedToolBudget.budget } : {}),
 		maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, recoveryAgentConfig.maxSubagentDepth),
@@ -1888,14 +1921,13 @@ export function executeAsyncSingle(
 						modelCandidates,
 						...(modelOrigin === "inherited" ? { skipPrimaryModelVerification: true } : {}),
 						...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
+						...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 						tools: agentConfig.tools,
 						excludeTools: agentConfig.excludeTools,
 						allowNestedSubagents: agentConfig.allowNestedSubagents,
 						extensions: agentConfig.extensions,
 						subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
 						mcpDirectTools: agentConfig.mcpDirectTools,
-						...(toolPlan.mcpConfig ? { mcpConfig: toolPlan.mcpConfig } : {}),
-						...(toolPlan.runtimeServerNames ? { runtimeServerNames: toolPlan.runtimeServerNames } : {}),
 						mutationTools: agentConfig.mutationTools,
 						completionGuard: agentConfig.completionGuard,
 						systemPrompt,
@@ -1941,10 +1973,12 @@ export function executeAsyncSingle(
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
-				piArgv1: process.argv[1],
+				childSessionFactoryModule: childSessionFactoryModule(),
+				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
+				baseRef,
 				worktreeProvider,
 				worktreeBranchPrefix,
 				controlConfig,
@@ -1959,6 +1993,7 @@ export function executeAsyncSingle(
 				launchContractDigest,
 				launchResolvedExtensions,
 				runFanoutBudget,
+				hostAvailableBuiltins,
 				...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 				...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
 				...(lane ? { lane } : {}),
@@ -2027,7 +2062,7 @@ export function executeAsyncSingle(
 						path: nestedAddress.path,
 						asyncDir,
 						pid: spawnResult.pid,
-						ownerIntercomTarget: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
+						ownerIntercomTarget: ctx.childRuntime?.intercomSessionName,
 						leafIntercomTarget: childIntercomTarget?.(agent, 0),
 						intercomTarget: childIntercomTarget?.(agent, 0),
 						ownerState: "live",

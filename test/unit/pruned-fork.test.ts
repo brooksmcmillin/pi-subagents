@@ -59,8 +59,8 @@ describe("pruned fork sessions", () => {
 			assert.equal(record.utf8Bytes, Buffer.byteLength(record.body, "utf8"));
 			assert.equal(record.utf16CodeUnits, record.body.length);
 			assert.match(record.bodyDigest, /^sha256:[a-f0-9]{64}$/);
-			assert.ok(prunedText.includes(`\\\"batchId\\\":\\\"${recovery.batchId}\\\"`));
-			assert.ok(prunedText.includes(`\\\"itemId\\\":\\\"${record.itemId}\\\"`));
+			assert.ok(prunedText.includes(`\\"batchId\\":\\"${recovery.batchId}\\"`));
+			assert.ok(prunedText.includes(`\\"itemId\\":\\"${record.itemId}\\"`));
 			assert.ok(prunedText.includes("Keep this recent user decision exact."));
 			assert.ok(!prunedText.includes("raw-parent-output-raw-parent-output"));
 			assert.ok(fs.statSync(childSession).size < fullSize / 4);
@@ -185,9 +185,9 @@ describe("pruned fork sessions", () => {
 			assert.throws(() => resolver.sessionFileForIndex(0), /before pruning completed/);
 			await resolver.prepareSessionForIndex(0);
 			assert.equal(resolver.sessionFileForIndex(0), childSession);
-			assert.equal(resolver.thinkingOverrideForIndex(0), "off");
 			const text = fs.readFileSync(childSession, "utf-8");
 			assert.ok(!text.includes("thinkingSignature"));
+			assert.ok(!text.includes("thinking_level_change"));
 			assert.equal(JSON.parse(text.split("\n")[0]!).parentSession, parentSession);
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });

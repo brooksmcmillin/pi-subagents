@@ -135,6 +135,7 @@ export interface AgentConfig {
 	packageSourceVersion?: string;
 	packageSourceRoot?: string;
 	description: string;
+	advertise?: boolean;
 	aliases?: string[];
 	tools?: string[];
 	excludeTools?: string[];
@@ -1369,7 +1370,7 @@ function applyBuiltinOverride(
 		...meta,
 		base: agent.override?.base ?? cloneOverrideBase(agent),
 		fields: [...new Set([...(agent.override?.fields ?? []), ...Object.keys(override)])].sort(),
-		fieldScopes: Object.fromEntries(Object.entries({ ...(agent.override?.fieldScopes ?? {}) }).map(([field, scopes]) => [field, [...scopes]])),
+		fieldScopes: Object.fromEntries(Object.entries({ ...agent.override?.fieldScopes }).map(([field, scopes]) => [field, [...scopes]])),
 	};
 	for (const field of Object.keys(override)) {
 		const scopes = overrideInfo.fieldScopes![field] ?? [];
@@ -1985,6 +1986,12 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 
 		const runner = parseAgentRunnerFrontmatter(frontmatter.runner, localName);
 		validateExternalRunnerProfile(frontmatter, localName, runner);
+		let advertise: boolean | undefined;
+		if (frontmatter.advertise !== undefined) {
+			if (frontmatter.advertise === "true") advertise = true;
+			else if (frontmatter.advertise === "false") advertise = false;
+			else throw new Error(`Agent '${localName}' has invalid advertise frontmatter; expected true or false.`);
+		}
 		const rawTools = parseFrontmatterList(frontmatter.tools);
 		const parsedTools = splitToolList(rawTools);
 		const tools = parsedTools.tools ?? [];
@@ -2109,6 +2116,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			...(packageSource?.packageVersion ? { packageSourceVersion: packageSource.packageVersion } : {}),
 			...(packageSource?.packageRoot ? { packageSourceRoot: packageSource.packageRoot } : {}),
 			description: frontmatter.description,
+			...(advertise !== undefined ? { advertise } : {}),
 			...(aliases !== undefined ? { aliases } : {}),
 			...(rawTools !== undefined ? { tools } : {}),
 			...(excludeTools !== undefined ? { excludeTools } : {}),

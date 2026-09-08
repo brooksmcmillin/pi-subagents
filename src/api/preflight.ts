@@ -7,11 +7,11 @@ import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } f
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
 import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
+import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
+import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { resolvePermissionRules } from "../runs/shared/permissions.ts";
@@ -73,12 +73,15 @@ export interface SubagentLaunchContractInput {
 	/** Current parent leaf required before an implicit `defaultContext: fork` stays `fork`. */
 	parentLeafId?: string | null;
 	sessionRoot?: string;
+	/** Caller directory used as a root keyed by the child run id ("preflight" placeholder when runId is omitted). */
 	sessionDir?: string;
 	runId?: string;
 	/** Root run id supplied by a host when projecting nested async lifecycle paths. */
 	nestedRootRunId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Builtin tool names the host runtime provides; used to intersect agent-declared tools. */
+	hostAvailableBuiltins?: readonly string[];
 }
 
 export interface SubagentLaunchContractAgentCandidate {
@@ -287,7 +290,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	const context = resolveLaunchContractContext(input, agent);
 	if (context === "fork") {
-		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching and fork-thinking downgrade checks require Pi host session and model-registry snapshots." });
+		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching requires Pi host session snapshots." });
 	}
 	const effectiveCapabilityCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, input.inheritedCapabilityCeiling);
 	const restrictionMessage = capabilityCeilingAgentRestrictionMessage(agent.name, effectiveCapabilityCeiling);
@@ -330,7 +333,6 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		discovered.maxThinking,
 		input.thinkingCeiling,
 		input.inheritedThinkingCeiling,
-		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
 	);
 	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
 	const modelCandidates = externalRunner
@@ -371,6 +373,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
+			hostAvailableBuiltins: input.hostAvailableBuiltins,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -381,7 +384,10 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const artifactsDir = artifactsEnabled ? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir) : undefined;
 	const artifactPaths = artifactsDir ? getArtifactPaths(artifactsDir, runId, agent.name, 0) : undefined;
 	const outputPath = resolveSingleOutputPath(behavior.output, effectiveCwd, effectiveCwd, artifactsDir ? path.join(artifactsDir, "outputs", runId) : undefined);
-	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
+	// An explicit sessionDir is a root keyed by the child run id, matching the
+	// sibling sessionRoot derivation; hosts omitting runId get the documented
+	// deterministic "preflight" placeholder.
+	const sessionRoot = input.sessionDir ? path.join(path.resolve(input.sessionDir), runId) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
 	const sessionDir = sessionRoot ? path.join(sessionRoot, "run-0") : undefined;
 	const lifecycleAsyncDir = input.nestedRootRunId
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", input.nestedRootRunId, runId)

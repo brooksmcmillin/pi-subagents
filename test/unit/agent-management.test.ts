@@ -109,6 +109,79 @@ describe("agent management config parsing", () => {
 		assert.equal(JSON.stringify(capabilities).includes("SYSTEM_PROMPT_SENTINEL"), false);
 	});
 
+	it("reports bundled reviewer inspection and supervisor tools in capabilities", () => {
+		const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [] },
+		});
+
+		assert.equal(listed.isError, false);
+		const capabilities = listed.details?.agentCapabilities;
+		assert.ok(capabilities);
+		const reviewer = capabilities.agents.find((agent) => agent.name === "reviewer");
+		assert.ok(reviewer, "reviewer builtin should be present in capability output");
+		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "bash", "inspection_shell", "contact_supervisor"]);
+		assert.match(readText(listed), /Tools: read, grep, find, ls, bash, inspection_shell, contact_supervisor/);
+	});
+
+	it("reports passive external CLI availability for present and absent commands", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		const presentCommand = path.basename(process.execPath, path.extname(process.execPath));
+		fs.writeFileSync(path.join(agentsDir, "present-external.md"), `---
+name: present-external
+description: Present external CLI
+runner:
+  type: external-cli
+  command: ${presentCommand}
+---
+Present.
+`);
+		fs.writeFileSync(path.join(agentsDir, "missing-external.md"), `---
+name: missing-external
+description: Missing external CLI
+runner:
+  type: external-cli
+  command: missing-external-cli
+---
+Missing.
+`);
+		const previousPath = process.env.PATH;
+		try {
+			process.env.PATH = path.dirname(process.execPath);
+			const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, {
+				cwd: tempDir,
+				modelRegistry: { getAvailable: () => [] },
+			});
+			assert.equal(listed.isError, false);
+			const text = readText(listed);
+			assert.match(text, new RegExp(`external-cli:${presentCommand} ✓`));
+			assert.match(text, /external-cli:missing-external-cli missing/);
+
+			const rows = listed.details?.agentCapabilities?.agents;
+			assert.ok(rows);
+			const present = rows.find((agent) => agent.name === "present-external");
+			const missing = rows.find((agent) => agent.name === "missing-external");
+			assert.ok(present);
+			assert.ok(missing);
+			assert.equal(present.executable, true);
+			assert.equal(missing.executable, true);
+			assert.equal(present.runner.type, "external-cli");
+			assert.equal(missing.runner.type, "external-cli");
+			if (present.runner.type !== "external-cli" || missing.runner.type !== "external-cli") return;
+			assert.equal(present.runner.command, presentCommand);
+			assert.equal(present.runner.available, true);
+			assert.equal("unavailableReason" in present.runner, false);
+			assert.equal(missing.runner.command, "missing-external-cli");
+			assert.equal(missing.runner.available, false);
+			assert.match(missing.runner.unavailableReason ?? "", /External CLI binary 'missing-external-cli' was not found on PATH\./);
+			assert.ok((missing.runner.unavailableReason ?? "").length <= 256);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
 	it("rejects management attempts to widen the reserved read-only Claude profile", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const writerRunner = { type: "external-cli", adapter: "claude-code-writer", command: "claude" };
@@ -978,6 +1051,68 @@ Drive the failing test first.
 		assert.doesNotMatch(content, /^model:/m);
 		assert.doesNotMatch(content, /^thinking:/m);
 	});
+
+	for (const action of ["model", "thinking"]) {
+		it(`awaits an offline registry refresh before opening the ${action} picker`, async () => {
+			const agentPath = path.join(tempDir, ".pi", "agents", "refresh-worker.md");
+			fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+			fs.writeFileSync(agentPath, "---\nname: refresh-worker\ndescription: Refresh test\nmodel: custom/fresh\n---\nPrompt.\n");
+			let refreshed = false;
+			let choices: string[] = [];
+			const warnings: string[] = [];
+			await openSubagentsAdmin({ sendMessage: () => assert.fail("cancel must not save") } as never, {
+				cwd: tempDir, hasUI: true,
+				modelRegistry: {
+					refresh: async (options: { allowNetwork: boolean; signal: AbortSignal }) => {
+						assert.equal(options.allowNetwork, false);
+						assert.ok(options.signal instanceof AbortSignal);
+						await new Promise((resolve) => setImmediate(resolve));
+						refreshed = true;
+						return { aborted: false, errors: new Map() };
+					},
+					getAvailable: () => refreshed
+						? [{ provider: "custom", id: "fresh", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", max: "max" } }, { provider: "custom", id: "added" }]
+						: [],
+				},
+				ui: {
+					select: async (_title: string, items: string[]) => { choices = items; return undefined; },
+					notify: (message: string) => warnings.push(message),
+				},
+			} as never, `refresh-worker ${action}`);
+			assert.deepEqual(choices, action === "model"
+				? ["Default / inherit session model", "custom/fresh", "custom/added"]
+				: ["Default / inherit session thinking", "off", "high", "max"]);
+			assert.deepEqual(warnings, []);
+		});
+	}
+
+	for (const outcome of ["returned error", "aborted", "rejected"]) {
+		it(`warns and keeps registry choices when refresh ${outcome}`, async () => {
+			const agentPath = path.join(tempDir, ".pi", "agents", "refresh-worker.md");
+			fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+			fs.writeFileSync(agentPath, "---\nname: refresh-worker\ndescription: Refresh test\n---\nPrompt.\n");
+			const notices: Array<[string, string]> = [];
+			let choices: string[] = [];
+			await openSubagentsAdmin({ sendMessage: () => assert.fail("cancel must not save") } as never, {
+				cwd: tempDir, hasUI: true,
+				modelRegistry: {
+					refresh: async () => {
+						if (outcome === "rejected") throw new Error("refresh failed");
+						return { aborted: outcome === "aborted", errors: new Map(outcome === "returned error" ? [["custom", new Error("catalog failed")]] : []) };
+					},
+					getAvailable: () => [{ provider: "custom", id: "cached" }],
+				},
+				ui: {
+					select: async (_title: string, items: string[]) => { choices = items; return undefined; },
+					notify: (message: string, level: string) => notices.push([message, level]),
+				},
+			} as never, "refresh-worker model");
+			assert.deepEqual(choices, ["Default / inherit session model", "custom/cached"]);
+			assert.equal(notices.length, 1);
+			assert.equal(notices[0]?.[1], "warning");
+			assert.match(notices[0]![0], outcome === "returned error" ? /custom.*catalog failed/ : outcome === "aborted" ? /timed out/ : /refresh failed/);
+		});
+	}
 
 	it("keeps same-value custom override ownership for interactive admin edits", async () => {
 		const settingsPath = path.join(tempDir, ".pi", "settings.json");
