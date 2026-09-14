@@ -20,13 +20,15 @@ import {
 } from "../../watchdog/child-status.ts";
 import { projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleState } from "../shared/child-lifecycle.ts";
 import { formatSubagentModelVerificationError } from "../shared/model-fallback.ts";
+import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
-import { projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
+import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import { getReadonlySessionEvidence, requestReadonlySessionEvidence, type SettledReadonlyEvidence } from "../shared/readonly-session-evidence.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
+import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
 
 export interface ChildEventContext {
 	runId: string;
@@ -84,6 +86,8 @@ export interface RunChildSessionInput {
 	registerTimeout?: (interrupt: (() => void) | undefined) => void;
 	registerStop?: (stop: (() => void) | undefined) => void;
 	registerSteer?: (steer: StepSteerHandler | undefined) => void;
+	/** Consumption (or unconsumed settlement) after the child accepted a steer or follow-up. */
+	onSteerOutcome?: (request: SteerRequest, delivery: SteerDelivery) => void;
 	/** Receives the sink the child's watchdog hook reports status through; the launch's `watchdogStatus` must forward to it. */
 	registerWatchdogStatus?: (sink: ((event: ChildWatchdogStatusEvent) => void) | undefined) => void;
 	timeoutMessage?: string;
@@ -115,6 +119,7 @@ export interface RunChildSessionResult {
 	toolCount: number;
 	durationMs: number;
 	model?: string;
+	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: import("../../shared/types.ts").HerdrRemoteGitStatus; finalGit?: import("../../shared/types.ts").HerdrRemoteGitStatus };
 	error?: string;
 	finalOutput: string;
 	outputState: SubagentOutputState;
@@ -187,12 +192,14 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let currentPath: string | undefined;
 		let toolCount = 0;
 		let session: ChildSession | undefined;
+		const acceptedSteers: Array<{ request: SteerRequest; text: string }> = [];
 		let unsubscribe: (() => void) | undefined;
 		let settled = false;
 		let promptSettled = false;
 		let forcedTermination = false;
 		let cleanTerminalAssistantStopReceived = false;
 		let agentSettledReceived = false;
+		let queuedDrainHold = false;
 		let compactionStartedReceived = false;
 		let afterCompactionSettlement = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
@@ -311,14 +318,28 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		}
 		// If the child emits its terminal event but its run never settles (a hook
 		// is stuck), abort it after a short grace period and then finish without it.
+		const observeQueuedDrainHold = (): boolean => {
+			if (childSessionHasQueuedMessages(session)) queuedDrainHold = true;
+			return queuedDrainHold;
+		};
 		function startFinalDrain(): void {
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
 			}
 			if (promptSettled || finalDrainTimer || settled) return;
+			if (observeQueuedDrainHold()) return;
+			armFinalDrainTimer();
+		}
+		function armFinalDrainTimer(): void {
+			if (promptSettled || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || promptSettled) return;
+				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
+					finalDrainTimer = undefined;
+					armFinalDrainTimer();
+					return;
+				}
 				forcedTermination = true;
 				if (!cleanTerminalAssistantStopReceived && !agentSettledReceived && !error && !assistantError) {
 					error = `Subagent session did not settle within ${FINAL_STOP_GRACE_MS}ms after its terminal event. Aborting it.`;
@@ -403,6 +424,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
 			}
+			if (event.type === "turn_start" || event.type === "agent_start" || event.type === "auto_retry_start") {
+				queuedDrainHold = false;
+			}
 			if (event.type === "agent_start" || event.type === "auto_retry_start") {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
@@ -472,6 +496,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				messages.push(event.message);
 				const text = extractTextFromContent(event.message.content);
 				if (text) writeOutputText(text);
+				if (event.type === "message_end" && event.message.role === "user" && text) {
+					const matched = takeMatchingAcceptedSteer(acceptedSteers, text);
+					if (matched) {
+						input.onSteerOutcome?.(matched.request, {
+							state: "delivered",
+							deliveryStatus: "delivered",
+							message: "Child consumed the steering input.",
+						});
+					}
+				}
 
 				if (input.childWatchdog && event.type === "message_end") {
 					const next = applyChildWatchdogMessage(childWatchdogState, event.message);
@@ -531,14 +565,33 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		};
 
 		/** The child run ended (or was forced to end); fold in the outcome once the child's shutdown work is done. */
+		const failUnconsumedSteers = (): void => {
+			for (const entry of acceptedSteers.splice(0)) {
+				input.onSteerOutcome?.(entry.request, { state: "failed", message: unconsumedSteerReason(entry.request.mode) });
+			}
+		};
 		const settle = (promptError: unknown, forced = false): void => {
 			if (settled) return;
 			settled = true;
+			failUnconsumedSteers();
 			const closed = finish();
 			const finalOutput = getFinalOutput(messages);
 			let finalError = error ?? assistantError;
-			if (!finalError && promptError !== undefined) {
-				finalError = promptError instanceof Error ? promptError.message : String(promptError);
+			const promptErrorMessage = promptError === undefined ? undefined : promptError instanceof Error ? promptError.message : String(promptError);
+			if (!finalError && promptErrorMessage !== undefined) {
+				finalError = promptErrorMessage;
+			}
+			// A child launched without the ambient extensions resolves a provider
+			// extension's model as "not found". Annotate only a creation/prompt failure
+			// that produced no turn; keep the core error and add the rule and the
+			// remedies that load the extension for this child.
+			if (promptErrorMessage !== undefined
+				&& finalError === promptErrorMessage
+				&& isChildModelResolutionFailure(promptErrorMessage)
+				&& messages.length === 0
+				&& usage.turns === 0
+				&& !input.launch.session.ambientExtensions) {
+				finalError = `${promptErrorMessage}\n\n${formatChildModelResolutionDiagnostic({ agent: input.launch.config.agent, model: input.launch.session.model, host: "runner", capabilityCeiling: input.launch.toolPlan.capabilityCeiling })}`;
 			}
 			const forcedDrainAfterFinalSuccess = (forced || forcedTermination) && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !finalError;
 			const forcedDrainAfterEmptyTerminal = forcedDrainAfterFinalSuccess && hasEmptyTerminalAssistantResponse(messages);
@@ -558,6 +611,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					toolCount,
 					durationMs: Date.now() - startedAt,
 					model,
+					nativeMachine: session?.machineEvidence ? { provider: "herdr", machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
 					error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal) ? undefined : finalError,
 					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
 					outputState: finalOutput.trim() ? "present" : "absent",
@@ -613,6 +667,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					return;
 				}
 				session = created;
+				const steer = created.steer.bind(created);
+				const followUp = created.followUp.bind(created);
+				created.steer = async (text) => {
+					if (cleanTerminalAssistantStopReceived || agentSettledReceived) queuedDrainHold = true;
+					return steer(text);
+				};
+				created.followUp = async (text) => {
+					if (cleanTerminalAssistantStopReceived || agentSettledReceived) queuedDrainHold = true;
+					return followUp(text);
+				};
 				checkContinuation();
 				if (continuation && (created.modelId !== continuation.modelId || input.launch.capture.completionIntentContext?.()?.model?.api !== continuation.expected.api)) throw new Error("Read-only continuation model changed");
 				unsubscribe = created.subscribe(processEvent);
@@ -620,15 +684,22 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				input.registerSteer?.(async (request) => {
 					const text = formatSteerMessage(request);
 					const followUp = request.mode === "follow_up";
+					const accepted = { request, text };
+					acceptedSteers.push(accepted);
+					const queued: SteerDelivery = {
+						state: "queued",
+						deliveryStatus: "queued",
+						message: followUp ? "Pi queued the follow-up input." : "Pi accepted the steering input.",
+					};
 					try {
 						if (followUp) await created.followUp(text);
 						else await created.steer(text);
 					} catch (steerError) {
+						const index = acceptedSteers.indexOf(accepted);
+						if (index >= 0) acceptedSteers.splice(index, 1);
 						return { state: "failed", message: steerError instanceof Error ? steerError.message : String(steerError) };
 					}
-					return followUp
-						? { state: "queued", deliveryStatus: "queued", message: "Pi queued the follow-up input." }
-						: { state: "delivered", deliveryStatus: "delivered", message: "Pi accepted the steering input." };
+					return queued;
 				});
 				if (interrupted || timedOut || stopped) abortChild();
 				checkContinuation();

@@ -158,9 +158,14 @@ describe("worktree", () => {
 			await assert.rejects(() => createWorktrees(repoDir, "ready-rejected", 1, {
 				provider: "native",
 				onProgress: (snapshot) => {
-					if (snapshot.command?.result) {
-						assert.equal("stdout" in snapshot.command.result, false);
-						assert.equal("stderr" in snapshot.command.result, false);
+					const commands = [snapshot.command, ...snapshot.attempts.flatMap((attempt) => [attempt.command, attempt.hookCommand])];
+					for (const command of commands) {
+						if (!command?.result) continue;
+						assert.equal("stdout" in command.result, false);
+						assert.equal("stdoutBuffer" in command.result, false);
+						assert.equal("stderr" in command.result, false);
+						assert.equal(Object.values(command.result).some(Buffer.isBuffer), false);
+						assert.equal(JSON.stringify(command.result).includes('"data"'), false);
 					}
 					if (snapshot.phase === "ready") throw new Error("ready publication rejected");
 				},
@@ -434,6 +439,74 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 			else process.env.USERPROFILE = previousUserProfile;
 			cleanupRepo(repoDir);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps auto-managed extension repository worktrees outside extension discovery", async () => {
+		const sourceRepo = createRepo("pi-worktree-extension-source-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const repoDir = path.join(agentDir, "extensions", "powerline-footer");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		let setup: WorktreeSetup | undefined;
+		try {
+			fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+			fs.renameSync(sourceRepo, repoDir);
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			setup = await createWorktrees(repoDir, "extension-auto", 1);
+
+			assert.equal(setup.worktrees[0]?.provider, "native");
+			assert.equal(setup.worktrees[0]?.path, path.join(agentDir, "worktrees", "powerline-footer", "pi-worktree-extension-auto-0"));
+			assert.equal(resolveExpectedWorktreeAgentCwd(repoDir, "extension-auto", 0), setup.worktrees[0]?.path);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("does not relocate explicitly native extension repository worktrees", async () => {
+		const sourceRepo = createRepo("pi-worktree-extension-native-source-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const repoDir = path.join(agentDir, "extensions", "powerline-footer");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+			fs.renameSync(sourceRepo, repoDir);
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			await assert.rejects(
+				() => createWorktrees(repoDir, "extension-native", 1, { provider: "native" }),
+				/worktree base directory cannot be inside Pi extensions directory/i,
+			);
+			assert.equal(fs.existsSync(path.join(agentDir, "worktrees")), false);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
 			fs.rmSync(tempHome, { recursive: true, force: true });
 		}
 	});

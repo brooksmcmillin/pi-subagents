@@ -121,6 +121,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./external-runs": "./src/api/external-runs.ts",
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
 		"./workflow-resources": "./src/api/workflow-resources.ts",
+		"./required-child-extensions": "./src/api/required-child-extensions.ts",
 		"./delegation": "./src/api/delegation.ts",
 		"./preflight": "./src/api/preflight.ts",
 		"./control-channel": "./src/api/control-channel.ts",
@@ -155,7 +156,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	const delegation = await import("pi-subagents/delegation");
 	assert.equal(delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, "prompt-template:subagent:request");
 	const preflight = await import("pi-subagents/preflight");
-	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 2);
+	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 3);
 	assert.equal(typeof preflight.resolveSubagentLaunchContract, "function");
 	const controlChannel = await import("pi-subagents/control-channel");
 	assert.equal(typeof controlChannel.requestAsyncStop, "function");

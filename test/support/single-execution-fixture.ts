@@ -65,6 +65,7 @@ interface LaunchResolvedExtensions {
 	disableAmbientExtensions?: boolean;
 	runtime?: string[];
 	configured?: string[];
+	required?: string[];
 	effective?: string[];
 }
 
@@ -223,6 +224,7 @@ interface ExecutorToolResult {
 	isError?: boolean;
 	details?: {
 		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
+		results?: Array<{ launchResolvedExtensions?: LaunchResolvedExtensions }>;
 		controlEvents?: Array<{ type?: string }>;
 		asyncId?: string;
 		timeoutMs?: number;

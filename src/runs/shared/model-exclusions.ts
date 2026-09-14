@@ -17,6 +17,7 @@ export type ModelExclusion = ModelExclusionTarget & {
 type RecordModelFailureOptions = ModelExclusionTarget & {
 	reason?: string;
 	ttlMs?: number;
+	preserveExisting?: boolean;
 };
 
 let exclusions: ModelExclusion[] = [];
@@ -183,7 +184,7 @@ function readPersistedExclusion(entry: unknown, index: number): PersistedExclusi
 	return { ok: true, exclusion: { modelId, ...(provider === undefined ? {} : { provider }), ...metadata } };
 }
 
-function dedupKey(entry: ModelExclusion): string {
+function dedupKey(entry: ModelExclusionTarget): string {
 	return `${entry.provider ?? ""}|${entry.modelId ?? ""}`;
 }
 
@@ -207,16 +208,22 @@ function deduplicate(items: ModelExclusion[]): ModelExclusion[] {
  */
 export function recordModelFailure(options: RecordModelFailureOptions): void {
 	ensureLoaded();
-	const ttl = options.ttlMs ?? defaultTTLMs;
+	const ttl = Math.min(options.ttlMs ?? defaultTTLMs, defaultTTLMs);
 	const now = Date.now();
 	const target: ModelExclusionTarget = options.modelId !== undefined
 		? { modelId: options.modelId, ...(options.provider ? { provider: options.provider } : {}) }
 		: { provider: options.provider };
+	const expiresAt = now + ttl;
+	if (options.preserveExisting) {
+		const key = dedupKey(target);
+		const existing = exclusions.find((entry) => dedupKey(entry) === key && entry.expiresAt > now);
+		if (existing) return;
+	}
 	const exclusion: ModelExclusion = {
 		...target,
 		reason: options.reason ?? "runtime-failure",
 		recordedAt: now,
-		expiresAt: now + ttl,
+		expiresAt,
 	};
 	exclusions.unshift(exclusion);
 	exclusions = deduplicate(exclusions);
@@ -277,11 +284,15 @@ export function isExcluded(modelId: string, provider: string): boolean {
  * The caller uses this for hard-fail diagnostics; fallback filtering should
  * continue to use {@link filterFallbackCandidates}.
  */
-export function findModelExclusion(fullId: string, now = Date.now()): Readonly<ModelExclusion> | undefined {
+export function findModelExclusion(fullId: string, opts?: {
+	now?: number;
+	ignoreExclusion?: (candidate: string, exclusion: Readonly<ModelExclusion>) => boolean;
+}): Readonly<ModelExclusion> | undefined {
 	ensureLoaded();
 	invalidateAuthExclusions();
 	const { provider, modelId } = parseModelKey(fullId);
-	return exclusions.find((entry) => entryMatches(entry, modelId, provider, now));
+	const now = opts?.now ?? Date.now();
+	return exclusions.find((entry) => entryMatches(entry, modelId, provider, now) && opts?.ignoreExclusion?.(fullId, entry) !== true);
 }
 
 /**
