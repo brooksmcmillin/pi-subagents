@@ -172,11 +172,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					assert.ok(error instanceof Error);
 					assert.match(error.message, new RegExp(`"steps":\\["${stepState}"\\]`));
 					assert.ok(error.message.includes(`mock queue: readable, prompt call records=${callCount}`));
-					assert.match(error.message, /runner.stdout.log: empty/);
-					assert.match(error.message, /runner.stderr.log: unreadable \(EISDIR\)/);
-					assert.match(error.message, /process-terminal.json: absent/);
-					assert.match(error.message, /runner-startup-proceed.json: readable, \d+ bytes \(contents withheld\)/);
-					assert.match(error.message, /events.jsonl: readable/);
+					assert.match(error.message, /runner.stdout.log: \{"bytes":0,.*\} \(contents withheld\)/);
+					assert.match(error.message, /runner.stderr.log: \{"bytes":\d+,.*\} \(contents withheld\)/);
+					assert.match(error.message, /process-terminal.json: ENOENT/);
+					assert.match(error.message, /runner-startup-proceed.json: \{"bytes":\d+,.*\} \(contents withheld\)/);
+					assert.match(error.message, /events.jsonl: .*"invalidLines":1/);
 					assert.doesNotMatch(error.message, /secret-/);
 					return true;
 				});
@@ -307,7 +307,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		try {
 			const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
 			assert.ok(discovered, "expected temporary agent definition to be discovered");
-			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "contract-preflight" });
+			// runSync and executeAsyncSingle sit below the executor step that applies the bridge.
+			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "contract-preflight", intercomBridge: { mode: "off" } });
 			assert.equal(preflight.ok, true);
 			assert.ok(preflight.contract.tools.extensionArgs.some((entry) => entry.endsWith(path.join("pi-permission-system", "src", "index.ts"))));
 
@@ -337,6 +338,40 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
+	});
+
+	it("matches preflight launch and definition digests for executor-launched async runs with the Intercom bridge active", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const agentName = `bridge-async-${Date.now().toString(36)}`;
+		const task = "Compare bridged async launch identity.";
+		const agentPath = path.join(tempDir, ".pi", "agents", `${agentName}.md`);
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(agentPath, `---\nname: ${agentName}\ndescription: Bridged async worker\ntools:\n  - read\ncompletionGuard: false\n---\nAnswer from the task only.\n`, "utf-8");
+		const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
+		assert.ok(discovered, "expected temporary agent definition to be discovered");
+
+		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "bridged-async" });
+		assert.equal(preflight.ok, true);
+		if (!preflight.ok) return;
+		assert.deepEqual(preflight.contract.intercomBridge, { mode: "always", active: true });
+		assert.ok(preflight.contract.tools.effectiveAllowlist.includes("contact_supervisor"));
+
+		mockPi.onCall({ output: "bridged async done" });
+		const launch = await makeAsyncExecutor([discovered]).execute(
+			"bridged-async-launch",
+			{ agent: agentName, task, async: true, runId: "bridged-async", acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+		assert.equal(launch.isError, undefined, launch.content?.[0]?.text);
+		assert.ok(launch.details.asyncId);
+		assert.equal(launch.details.launchContractDigest, preflight.contract.launchContractDigest);
+
+		// launchContractDigest embeds the definition digest, so equality here also
+		// proves the async path hashed the parsed definition, not the bridged copy.
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		assert.equal(payload.launchContractDigest, preflight.contract.launchContractDigest);
+		assert.equal(payload.results[0]?.launchContractDigest, preflight.contract.launchContractDigest);
 	});
 
 	it("persists the actual launch digest in async status and result metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1102,6 +1137,33 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(outputPath && metadataPath);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "completed after artifact cleanup");
 		assert.equal((JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { exitCode?: number }).exitCode, 0);
+	});
+
+	it("publishes machine-readable output artifact persistence failure", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 800, output: "artifact write should fail" });
+		const id = `async-artifact-output-failure-${Date.now().toString(36)}`;
+		const artifactsDir = path.join(tempDir, ".pi/subagents", id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Report artifact persistence failure",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+			artifactsDir,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		await waitForMockPiCall(mockPi, 0);
+		const inputArtifact = fs.readdirSync(artifactsDir).find((file) => file.endsWith("_input.md"));
+		assert.ok(inputArtifact);
+		const sabotagedOutput = path.join(artifactsDir, inputArtifact.replace(/_input\.md$/, "_output.md"));
+		fs.mkdirSync(sabotagedOutput);
+		const child = (await readAsyncPayload(id)).results[0];
+		assert.equal(child?.artifactPaths?.outputPath, sabotagedOutput);
+		assert.match(child?.outputSaveError ?? "", /Artifact output post-processing failed/);
+		assert.equal(child?.artifactOutputSaveFailed, true);
 	});
 
 	it("background preserves retry lifecycle from an oversized agent_end aggregate", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

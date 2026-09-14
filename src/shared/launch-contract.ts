@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import type { AgentConfig } from "../agents/agents.ts";
+import type { PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
 import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 
-export const AGENT_DEFINITION_PROJECTION_VERSION = 1 as const;
-export const LAUNCH_BINDING_PROJECTION_VERSION = 1 as const;
+export const AGENT_DEFINITION_PROJECTION_VERSION = 2 as const;
+// v2: the Intercom bridge prompt and tools are part of the binding on every
+// path, and the bridge text no longer names the parent session.
+export const LAUNCH_BINDING_PROJECTION_VERSION = 2 as const;
 
 function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -60,6 +63,7 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		skills: agent.skills,
 		skillPath: agent.skillPath,
 		output: agent.output,
+		outputSchema: agent.outputSchema,
 		defaultReads: agent.defaultReads,
 		defaultProgress: agent.defaultProgress,
 		defaultContext: agent.defaultContext,
@@ -75,8 +79,9 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 	};
 }
 
+/** Digest of the parsed definition; a runtime overlay that already captured it wins over re-hashing the overlaid copy. */
 export function agentDefinitionDigest(agent: AgentConfig): string {
-	return stableJsonDigest(projectAgentDefinition(agent));
+	return agent.definitionDigest ?? stableJsonDigest(projectAgentDefinition(agent));
 }
 
 export interface LaunchBindingInput {
@@ -135,4 +140,63 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 
 export function launchBindingDigest(input: LaunchBindingInput): string {
 	return stableJsonDigest(projectLaunchBinding(input));
+}
+
+type LaunchBindingPromptMode = Pick<LaunchBindingInput, "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills">;
+
+/**
+ * Who the child is: the launched agent, or the identity a persisted step
+ * already captured when a runner recomputes the binding per model attempt.
+ */
+export type LaunchBindingIdentity =
+	| { agent: AgentConfig }
+	| ({ definitionDigest: string } & LaunchBindingPromptMode);
+
+export type LaunchBindingSource = LaunchBindingIdentity
+	& Pick<LaunchBindingInput, "fast" | "thinking" | "skills" | "outputPath" | "outputMode" | "structuredOutputSchema" | "extensionBindings">
+	& {
+		task: string;
+		modelCandidates: string[];
+		/** Effective child system prompt before runtime acceptance prose. */
+		systemPrompt: string;
+		toolPlan: Pick<PiLaunchToolPlan, "effectiveToolAllowlist" | "excludeTools" | "extensionArgs" | "effectiveMcpTools">;
+	};
+
+export interface LaunchBinding {
+	definitionDigest: string;
+	launchContractDigest: string;
+}
+
+/**
+ * Assemble launch identity from resolved preflight or execution inputs.
+ * The stable projection omits undefined optional fields.
+ */
+export function resolveLaunchBinding(source: LaunchBindingSource): LaunchBinding {
+	const identity = "agent" in source ? {
+		definitionDigest: agentDefinitionDigest(source.agent),
+		systemPromptMode: source.agent.systemPromptMode,
+		inheritProjectContext: source.agent.inheritProjectContext,
+		inheritGlobalContext: source.agent.inheritGlobalContext,
+		inheritSkills: source.agent.inheritSkills,
+	} : source;
+	return {
+		definitionDigest: identity.definitionDigest,
+		launchContractDigest: launchBindingDigest({
+			...identity,
+			task: source.task,
+			modelCandidates: source.modelCandidates,
+			fast: source.fast,
+			thinking: source.thinking || undefined,
+			systemPrompt: source.systemPrompt,
+			skills: source.skills,
+			tools: source.toolPlan.effectiveToolAllowlist,
+			excludeTools: source.toolPlan.excludeTools.length > 0 ? source.toolPlan.excludeTools : undefined,
+			extensions: source.toolPlan.extensionArgs,
+			mcpDirectTools: source.toolPlan.effectiveMcpTools,
+			outputPath: source.outputPath || undefined,
+			outputMode: source.outputMode,
+			structuredOutputSchema: source.structuredOutputSchema,
+			extensionBindings: source.extensionBindings || undefined,
+		}),
+	};
 }

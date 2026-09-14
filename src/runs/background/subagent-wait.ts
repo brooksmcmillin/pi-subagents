@@ -118,6 +118,8 @@ export interface SubagentWaitDeps {
 	failOnFailedRuns?: boolean;
 	/** Internal auto-drain mode surfaces actionable attention as an error. */
 	failOnAttention?: boolean;
+	/** Durable owned supervisor-request barrier used by headless auto-drain. */
+	hasPendingSupervisorRequest?: () => boolean;
 	/** Arm a durable exact-target wait subscription in a long-lived interactive runtime. */
 	subscribe?: (input: { targetKind: "async" | "foreground"; runId: string; requestedId: string; timeoutMs: number }) => { token: string; expiresAt: number };
 	/** Injectable provider protocol surfaces for deterministic tests. */
@@ -214,14 +216,13 @@ function matchesId(run: AsyncRunSummary, id: string): boolean {
 }
 
 function activeDetachedForegroundRuns(params: SubagentWaitParams, deps: SubagentWaitDeps): ForegroundResumeRun[] {
-	if (!params.id || !deps.state.foregroundRuns) return [];
 	const sessionId = deps.state.currentSessionId;
-	if (!sessionId) return [];
-	return [...deps.state.foregroundRuns.values()].filter((run) =>
-		(run.runId === params.id || run.runId.startsWith(params.id!))
-		&& run.sessionId === sessionId
-		&& run.children.some((child) => child.status === "detached")
+	if (!sessionId || !deps.state.foregroundRuns) return [];
+	const runs = [...deps.state.foregroundRuns.values()].filter((run) =>
+		run.sessionId === sessionId && run.children.some((child) => child.status === "detached")
 	);
+	if (params.id) return runs.filter((run) => run.runId === params.id || run.runId.startsWith(params.id!));
+	return params.all === true ? runs : [];
 }
 
 function summarizeForegroundChildren(run: ForegroundResumeRun, indices: Set<number>): string {
@@ -378,6 +379,49 @@ function windowElapsedResult(
 	};
 }
 
+function supervisorYieldResult(
+	activeRunIds: string[],
+	activeProviderItems: readonly RegisteredBackgroundWorkItem[] = [],
+): AgentToolResult<Details> {
+	return {
+		content: [{ type: "text", text: "Wait yielded for a pending supervisor request. Background work remains active and will continue after the supervisor reply." }],
+		details: {
+			mode: "management",
+			results: [],
+			wait: {
+				reason: "supervisor_request",
+				timedOut: false,
+				activeRunIds,
+				activeProviderItems: activeProviderItems.map(({ provider, id }) => ({ provider, id })),
+			},
+		},
+	};
+}
+
+interface InitialWaitScope {
+	asyncRunIds: Set<string>;
+	foregroundRuns: Array<{ runId: string; sessionId?: string; detachedIndices: Set<number> }>;
+	providerIds: Set<string>;
+}
+
+function supervisorYieldForScope(scope: InitialWaitScope, params: SubagentWaitParams, deps: SubagentWaitDeps, nowMs: number): AgentToolResult<Details> {
+	try {
+		const activeAsyncIds = new Set(activeRunsForSession(params.id ? { id: params.id } : {}, deps).map((run) => run.id));
+		const activeRunIds = new Set([...scope.asyncRunIds].filter((id) => activeAsyncIds.has(id)));
+		for (const initial of scope.foregroundRuns) {
+			const current = deps.state.foregroundRuns?.get(initial.runId);
+			if (!current || current.sessionId !== initial.sessionId) continue;
+			if (current.children.some((child) => initial.detachedIndices.has(child.index) && child.status === "detached")) activeRunIds.add(initial.runId);
+		}
+		const activeProviderItems = scope.providerIds.size > 0
+			? backgroundWorkForSession(deps, nowMs).items.filter((item) => scope.providerIds.has(backgroundWorkIdentity(item)))
+			: [];
+		return supervisorYieldResult([...activeRunIds], activeProviderItems);
+	} catch (error) {
+		return result(error instanceof Error ? error.message : String(error), true);
+	}
+}
+
 /** Build the live status shown while async work keeps bg_wait blocked. */
 function asyncWaitUpdate(runs: AsyncRunSummary[], providerCount: number, elapsedMs: number): AgentToolResult<Details> {
 	const activity = runs.flatMap((run) => {
@@ -500,6 +544,7 @@ async function waitForDetachedForegroundRun(
 	now: () => number,
 	pollIntervalMs: number,
 	timeoutMs: number,
+	supervisorYield: () => AgentToolResult<Details>,
 ): Promise<AgentToolResult<Details>> {
 	const initialDetachedIndices = new Set(run.children.filter((child) => child.status === "detached").map((child) => child.index));
 	while (true) {
@@ -510,6 +555,7 @@ async function waitForDetachedForegroundRun(
 		if (!current || current.sessionId !== run.sessionId) {
 			return result(`Remembered foreground run "${run.runId}" disappeared before a terminal child result was recorded. Completion cannot be confirmed; do not launch a replacement without checking the originating child session.`, true);
 		}
+		if (deps.hasPendingSupervisorRequest?.()) return supervisorYield();
 		const pending = current.children.filter((child) => initialDetachedIndices.has(child.index) && child.status === "detached");
 		const attention = foregroundChildrenNeedingAttention(current, initialDetachedIndices);
 		if (attention.length > 0) return formatForegroundAttention(current, attention, now() - startedAt);
@@ -532,6 +578,38 @@ async function waitForDetachedForegroundRun(
 		}
 		await waitForWake(pollIntervalMs, signal, deps);
 	}
+}
+
+async function waitForSessionDetachedForegroundRuns(
+	runs: ForegroundResumeRun[],
+	signal: AbortSignal | undefined,
+	deps: SubagentWaitDeps,
+	startedAt: number,
+	now: () => number,
+	pollIntervalMs: number,
+	timeoutMs: number,
+	supervisorYield: () => AgentToolResult<Details>,
+): Promise<AgentToolResult<Details>> {
+	const texts: string[] = [];
+	for (const run of runs) {
+		const one = await waitForDetachedForegroundRun(run, signal, deps, startedAt, now, pollIntervalMs, timeoutMs, supervisorYield);
+		if (one.isError) return one;
+		if (one.details.wait?.reason === "supervisor_request") return one;
+		if (one.details.wait?.reason === "window_elapsed") {
+			const activeRunIds = runs.filter((initial) => {
+				const current = deps.state.foregroundRuns?.get(initial.runId);
+				if (!current || current.sessionId !== initial.sessionId) return false;
+				return initial.children.some((child) => child.status === "detached"
+						&& current.children.some((candidate) => candidate.index === child.index && candidate.status === "detached"));
+			}).map((activeRun) => activeRun.runId);
+			return windowElapsedResult(
+				one.content.map((part) => part.type === "text" ? part.text : "").join("\n"),
+				activeRunIds,
+			);
+		}
+		texts.push(one.content.map((part) => part.type === "text" ? part.text : "").join("\n").trim());
+	}
+	return result(texts.filter(Boolean).join("\n") || `Waited ${formatDuration(now() - startedAt)} for remembered detached foreground run(s); done.`);
 }
 
 /**
@@ -570,12 +648,16 @@ export async function waitForSubagents(
 	let providerSnapshot: BackgroundWorkSnapshot;
 	try {
 		active = activeRunsForSession(params, deps);
-		foreground = activeDetachedForegroundRuns(params, deps);
+		foreground = activeDetachedForegroundRuns(params, deps).map((run) => ({
+			...run,
+			children: run.children.map((child) => ({ ...child })),
+		}));
 		providerSnapshot = params.id ? { providers: [], items: [] } : backgroundWorkForSession(deps, startedAt);
 	} catch (error) {
 		return result(error instanceof Error ? error.message : String(error), true);
 	}
 
+	let selectedForeground: ForegroundResumeRun | undefined;
 	if (params.id) {
 		const candidates = [
 			...active.map((run) => ({ kind: "async" as const, id: run.id, run })),
@@ -598,27 +680,47 @@ export async function waitForSubagents(
 				return result(error instanceof Error ? error.message : String(error), true);
 			}
 		}
-		if (selected?.kind === "foreground") {
-			return waitForDetachedForegroundRun(selected.run, signal, deps, startedAt, now, pollIntervalMs, timeoutMs);
-		}
+		selectedForeground = selected?.kind === "foreground" ? selected.run : undefined;
 		active = selected?.kind === "async" ? [selected.run] : [];
 	}
 
 	let providerActive = providerSnapshot.items;
+	const scopedForeground = selectedForeground ? [selectedForeground] : params.id ? [] : foreground;
+	const initialAsyncIds = new Set(active.map((run) => run.id));
+	const initialProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
+	const initialScope: InitialWaitScope = {
+		asyncRunIds: initialAsyncIds,
+		foregroundRuns: scopedForeground.map((run) => ({
+			runId: run.runId,
+			sessionId: run.sessionId,
+			detachedIndices: new Set(run.children.filter((child) => child.status === "detached").map((child) => child.index)),
+		})),
+		providerIds: initialProviderIds,
+	};
+	const supervisorYield = () => supervisorYieldForScope(initialScope, params, deps, now());
+	if (selectedForeground) {
+		return waitForDetachedForegroundRun(selectedForeground, signal, deps, startedAt, now, pollIntervalMs, timeoutMs, supervisorYield);
+	}
 	if (active.length === 0 && providerActive.length === 0) {
+		if (waitForAll && !params.id && foreground.length > 0) {
+			return waitForSessionDetachedForegroundRuns(foreground, signal, deps, startedAt, now, pollIntervalMs, timeoutMs, supervisorYield);
+		}
 		return result(params.id
 			? `No active run matched "${params.id}". Nothing to wait for.`
 			: "No active async runs or registered provider work in this session. Nothing to wait for.");
 	}
 	const waitParams = params.id ? { ...params, id: active[0]!.id } : params;
-	const initialAsyncIds = new Set(active.map((run) => run.id));
-	const initialProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
 	const initialProviderNames = new Set(providerActive.map((item) => item.provider));
 	const initialCount = initialAsyncIds.size + initialProviderIds.size;
 	const stopOnAttention = params.stopOnAttention ?? deps.stopOnAttention !== false;
 	let attention = active.filter((run) => needsAttention(run));
+	let supervisorBarrier = false;
 
 	const isDone = (): boolean => {
+		if (deps.hasPendingSupervisorRequest?.()) {
+			supervisorBarrier = true;
+			return true;
+		}
 		if (attention.some((run) => initialAsyncIds.has(run.id) && (stopOnAttention || hasSupervisorTool(run)))) return true;
 		const activeAsyncIds = new Set(active.map((run) => run.id));
 		const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
@@ -663,6 +765,9 @@ export async function waitForSubagents(
 			return result(error instanceof Error ? error.message : String(error), true);
 		}
 	}
+	if (supervisorBarrier) {
+		return supervisorYield();
+	}
 
 	let terminalSummary: string;
 	let finishedAsyncCount: number;
@@ -697,6 +802,15 @@ export async function waitForSubagents(
 	const recoveryNote = formatCompletionRecovery(completions);
 
 	if (waitForAll) {
+		const foregroundResult = !params.id && foreground.length > 0 && relevantAttention.length === 0
+			? await waitForSessionDetachedForegroundRuns(foreground, signal, deps, startedAt, now, pollIntervalMs, timeoutMs, supervisorYield)
+			: undefined;
+		if (foregroundResult?.isError) return foregroundResult;
+		if (foregroundResult?.details.wait?.reason === "supervisor_request") return foregroundResult;
+		if (foregroundResult?.details.wait?.reason === "window_elapsed") return foregroundResult;
+		const foregroundNote = foregroundResult
+			? `\n${foregroundResult.content.map((part) => part.type === "text" ? part.text : "").join("\n")}`
+			: "";
 		const scope = params.id
 			? `run "${params.id}"`
 			: initialProviderIds.size === 0
@@ -704,7 +818,7 @@ export async function waitForSubagents(
 				: `${initialAsyncIds.size} async run(s) and ${initialProviderIds.size} provider item(s)`;
 		const status = relevantAttention.length > 0 ? "attention required" : "done";
 		return result(
-			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${recoveryNote}${resumeGuidance}${attentionNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
+			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${recoveryNote}${resumeGuidance}${attentionNote}${foregroundNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
 			(deps.failOnFailedRuns === true && failedAsyncCount > 0) || (deps.failOnAttention === true && relevantAttention.length > 0),
 			completions,
 		);

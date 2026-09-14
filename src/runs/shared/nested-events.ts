@@ -232,10 +232,12 @@ function sanitizeLaunchResolvedExtensions(value: unknown): LaunchResolvedChildEx
 		disableAmbientExtensions: raw.disableAmbientExtensions,
 		runtime: stringList(raw.runtime),
 		configured: stringList(raw.configured),
+		required: Array.isArray(raw.required) ? raw.required.filter((item): item is string => typeof item === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(item)).slice(0, 32) : [],
 		effective: stringList(raw.effective),
 		omitted: {
 			runtime: omittedCount("runtime"),
 			configured: omittedCount("configured"),
+			required: omittedCount("required"),
 			effective: omittedCount("effective"),
 		},
 	};

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -24,11 +24,22 @@ export interface WorkflowScriptValidationError {
 	message: string;
 	line?: number;
 	column?: number;
+	kind?: "spawn-budget";
+}
+
+export interface WorkflowScriptValidationWarning {
+	message: string;
+	kind: "dynamic-spawn-count";
 }
 
 export interface WorkflowScriptValidationResult {
 	ok: boolean;
 	errors: WorkflowScriptValidationError[];
+	warnings?: WorkflowScriptValidationWarning[];
+}
+
+export interface WorkflowScriptValidationOptions {
+	maxSubagentSpawnsPerRun?: number;
 }
 
 const WORKER_SOURCE = String.raw`
@@ -539,7 +550,7 @@ function runLanes(laneSpecs) {
       generatedKey: stage.generatedKey,
       ...workflowPlanStringMetadata(stage.params),
       ...(typeof stage.params.as === "string" && stage.params.as.trim() ? { outputName: stage.params.as.trim() } : {}),
-      ...(stage.params.outputSchema !== undefined ? { structured: true } : {}),
+      ...(stage.params.outputSchema ? { structured: true } : {}),
     })),
   })) });
   const firstItems = lanes.map((lane) => {
@@ -696,8 +707,26 @@ function validateHostCommand(key, params) {
   hostKeys.add(key);
 }
 
+const RUNS_ALL_PERMISSIVE_WARNING = "runs.all received runs.run(...) launch promise(s) or thenable(s). Those children were already launched individually, so runs.all cannot apply batch fingerprint validation, batch grouping in the fleet view, or collectFailure semantics; a failed child will throw at the runs.all boundary instead of returning as { ok: false }. To get full runs.all semantics, pass config objects: runs.all(items.map((item) => ({ key: item.key, agent: item.agent, task: item.task }))).";
+
+function runsAllItemThenableInfo(item, index) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  if (typeof item.then !== "function") return null;
+  const tracker = promiseObservationTracker(item);
+  const observation = tracker && Array.isArray(tracker.observations) ? tracker.observations.find((entry) => entry && entry.operation === "run") : undefined;
+  return {
+    key: observation && typeof observation.key === "string" ? observation.key : ("runs.all[" + index + "]"),
+    callId: observation && typeof observation.callId === "number" ? observation.callId : null,
+    promise: item,
+  };
+}
+
+let warnedPermissiveRunsAll = false;
+
 function launchRunsAll(items, generatedLaneKeys) {
   if (!Array.isArray(items)) throw new Error("runs.all(items) requires an array.");
+  const anyThenable = items.some((item, index) => runsAllItemThenableInfo(item, index) !== null);
+  if (anyThenable) return launchRunsAllPermissive(items);
   const fingerprints = new Map(runFingerprints);
   const calls = [];
   for (let index = 0; index < items.length; index++) {
@@ -714,6 +743,33 @@ function launchRunsAll(items, generatedLaneKeys) {
   return { calls, launched };
 }
 
+function launchRunsAllPermissive(items) {
+  if (!warnedPermissiveRunsAll) {
+    warnedPermissiveRunsAll = true;
+    try { capturedConsole.warn(RUNS_ALL_PERMISSIVE_WARNING); } catch { /* console emission is best-effort */ }
+  }
+  const fingerprints = new Map(runFingerprints);
+  const calls = [];
+  const launched = [];
+  for (let index = 0; index < items.length; index++) {
+    if (!Object.prototype.hasOwnProperty.call(items, index)) throw new Error("runs.all items must not contain sparse entries.");
+    const item = items[index];
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("runs.all item " + index + " must be an object or a runs.run(...) launch promise.");
+    const thenable = runsAllItemThenableInfo(item, index);
+    if (thenable) {
+      calls.push({ key: thenable.key, params: {} });
+      launched.push(thenable);
+      continue;
+    }
+    const { key, ...params } = item;
+    validateRunCall(key, params, "runs.all item " + index, fingerprints);
+    calls.push({ key, params });
+    launched.push(null);
+  }
+  runFingerprints = fingerprints;
+  return { calls, launched: launched.map((entry, index) => entry ?? runHostCall(calls[index].key, calls[index].params, false, undefined)) };
+}
+
 const runs = Object.freeze({
   run(key, params) {
     validateRunCall(key, params, "runs.run", runFingerprints);
@@ -722,7 +778,7 @@ const runs = Object.freeze({
   },
   all(items) {
     const { calls, launched } = launchRunsAll(items);
-    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), Promise.all(launched.map(({ promise }) => promise)).then((results) => wrapRunsAllResults(results.map(decorateWorkflowChildResult), calls.map(({ key }) => key))));
+    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), trackPromiseCombinator(launched.map(({ promise }) => promise), (values) => Promise.all(values).then((results) => wrapRunsAllResults(results.map(decorateWorkflowChildResult), calls.map(({ key }) => key)))));
   },
   lanes(laneSpecs) {
     return runLanes(laneSpecs);
@@ -896,6 +952,12 @@ function omitUndefinedWorkflowValues(value, seen = new Set()) {
   return normalized;
 }
 
+function deepFreezeWorkflowArgs(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const entry of Object.values(value)) deepFreezeWorkflowArgs(entry);
+  return Object.freeze(value);
+}
+
 parentPort.on("message", async (message) => {
   if (message.type === "response") {
     const entry = pending.get(message.callId);
@@ -915,6 +977,9 @@ parentPort.on("message", async (message) => {
     if (message.stateEnabled) sandbox.state = state;
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
+    // Rebuild args inside the VM realm: a worker-realm object would expose the worker's unrestricted
+    // Function through args.constructor.constructor, bypassing codeGeneration.strings: false.
+    sandbox.args = deepFreezeWorkflowArgs(vm.runInContext("JSON.parse", context)(JSON.stringify(message.args ?? {})));
     let compiled;
     try {
       assertPortableWorkflowScript(message.script);
@@ -1113,6 +1178,10 @@ export interface WorkflowChildSettledNotification {
 
 export interface RunWorkflowScriptOptions {
 	script: string;
+	/** Normalized raw-script input exposed as the deeply frozen sandbox global `args`. */
+	args?: Readonly<Record<string, unknown>>;
+	/** Parent-session cwd used to recover a stale process cwd. */
+	processCwd?: string;
 	/** Workflow run ID for notifications. Required when onChildSettled is provided. */
 	workflowRunId?: string;
 	/** Host-only first-slice admission context. It is never sent to the workflow worker. */
@@ -1123,7 +1192,7 @@ export interface RunWorkflowScriptOptions {
 	continueAfterAbortWhenChildrenSettled?: (abortError: Error) => boolean;
 	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
 	globalConcurrencyLimit?: number;
-	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
+	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>, signal: AbortSignal) => void | Promise<void>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
 	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
@@ -1441,7 +1510,7 @@ function literalString(node: unknown): string | undefined {
 	return undefined;
 }
 
-function directRunsCall(node: unknown, method: "run" | "all" | "host"): node is AstNode {
+function directRunsCall(node: unknown, method: "run" | "all" | "host" | "lanes"): boolean {
 	if (!astNode(node) || node.type !== "CallExpression" || !astNode(node.callee) || node.callee.type !== "MemberExpression") return false;
 	const property = node.callee.computed === true ? literalString(node.callee.property) : astNode(node.callee.property) && node.callee.property.type === "Identifier" ? node.callee.property.name : undefined;
 	return property === method && astNode(node.callee.object) && node.callee.object.type === "Identifier" && node.callee.object.name === "runs";
@@ -1578,8 +1647,121 @@ function directRunsAllKeys(call: AstNode): Array<{ key: string; node: AstNode }>
 	});
 }
 
+function containsWorkflowLaunch(node: unknown): boolean {
+	let found = false;
+	walkAst(node, (candidate) => {
+		if (directRunsCall(candidate, "run") || directRunsCall(candidate, "all") || directRunsCall(candidate, "lanes")) found = true;
+	});
+	return found;
+}
+
+function containsRunsIdentifier(node: unknown): boolean {
+	let found = false;
+	walkAst(node, (candidate) => {
+		if (candidate.type === "Identifier" && candidate.name === "runs") found = true;
+	});
+	return found;
+}
+
+function invalidatesRunsBinding(workflowBody: AstNode): boolean {
+	let invalidated = false;
+	walkAst(workflowBody, (node) => {
+		if ((node.type === "VariableDeclarator" || node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ClassDeclaration" || node.type === "ClassExpression")
+			&& containsRunsIdentifier(node.id)) invalidated = true;
+		if ((node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") && Array.isArray(node.params)
+			&& node.params.some(containsRunsIdentifier)) invalidated = true;
+		if (node.type === "CatchClause" && containsRunsIdentifier(node.param)) invalidated = true;
+		if ((node.type === "AssignmentExpression" || node.type === "UpdateExpression") && containsRunsIdentifier(node.left ?? node.argument)) invalidated = true;
+	});
+	return invalidated;
+}
+
+function containsAbruptControl(node: AstNode): boolean {
+	let found = false;
+	walkAst(node, (candidate) => {
+		if (candidate !== node && (candidate.type === "ReturnStatement" || candidate.type === "ThrowStatement" || candidate.type === "BreakStatement" || candidate.type === "ContinueStatement")) found = true;
+	}, false);
+	return found;
+}
+
+function directLaunchCall(expression: unknown): AstNode | undefined {
+	if (!astNode(expression)) return undefined;
+	const candidate = expression.type === "AwaitExpression" && astNode(expression.argument) ? expression.argument : expression;
+	return directRunsCall(candidate, "run") || directRunsCall(candidate, "all") ? candidate : undefined;
+}
+
+function staticWorkflowLaunchPlan(workflowBody: AstNode): { keys: string[]; dynamic: boolean } {
+	if (workflowBody.type !== "BlockStatement" || !Array.isArray(workflowBody.body) || invalidatesRunsBinding(workflowBody)) {
+		return { keys: [], dynamic: containsWorkflowLaunch(workflowBody) };
+	}
+	const keys = new Set<string>();
+	let dynamic = false;
+	let remainderUncertain = false;
+	const addCall = (call: AstNode): void => {
+		const args = Array.isArray(call.arguments) ? call.arguments : [];
+		let nestedLaunch = false;
+		for (const argument of args) walkAst(argument, (node) => {
+			if (node !== call && (directRunsCall(node, "run") || directRunsCall(node, "all") || directRunsCall(node, "lanes"))) nestedLaunch = true;
+		});
+		if (nestedLaunch) {
+			dynamic = true;
+			return;
+		}
+		if (directRunsCall(call, "run")) {
+			const key = literalString(args[0]);
+			if (key === undefined) dynamic = true;
+			else keys.add(key);
+			return;
+		}
+		const array = astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements) ? args[0] : undefined;
+		if (!array) {
+			dynamic = true;
+			return;
+		}
+		const batchKeys: string[] = [];
+		for (const item of array.elements as unknown[]) {
+			if (!astNode(item) || item.type !== "ObjectExpression" || !Array.isArray(item.properties)
+				|| item.properties.some((property) => !astNode(property) || property.type !== "Property" || staticPropertyKey(property) === undefined)) {
+				dynamic = true;
+				return;
+			}
+			const key = literalString(directObjectPropertyValue(item, "key"));
+			if (key === undefined) {
+				dynamic = true;
+				return;
+			}
+			batchKeys.push(key);
+		}
+		for (const key of batchKeys) keys.add(key);
+	};
+	for (const statement of workflowBody.body) {
+		if (!astNode(statement)) continue;
+		if (remainderUncertain) {
+			if (containsWorkflowLaunch(statement)) dynamic = true;
+			continue;
+		}
+		const expressions: unknown[] = [];
+		if (statement.type === "VariableDeclaration" && Array.isArray(statement.declarations)) {
+			for (const declaration of statement.declarations) if (astNode(declaration)) expressions.push(declaration.init);
+		} else if (statement.type === "ExpressionStatement") expressions.push(statement.expression);
+		else if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") expressions.push(statement.argument);
+		let handledLaunch = false;
+		for (const expression of expressions) {
+			const call = directLaunchCall(expression);
+			if (call) {
+				addCall(call);
+				handledLaunch = true;
+			} else if (containsWorkflowLaunch(expression)) dynamic = true;
+		}
+		if (!handledLaunch && expressions.length === 0 && containsWorkflowLaunch(statement)) dynamic = true;
+		if (statement.type === "ReturnStatement" || statement.type === "ThrowStatement") remainderUncertain = true;
+		else if (containsAbruptControl(statement)) remainderUncertain = true;
+	}
+	return { keys: [...keys], dynamic };
+}
+
 /** Parse a workflowScript and apply only rules that are decidable from its local syntax. */
-export function validateWorkflowScript(script: string): WorkflowScriptValidationResult {
+export function validateWorkflowScript(script: string, options: WorkflowScriptValidationOptions = {}): WorkflowScriptValidationResult {
 	const errors: WorkflowScriptValidationError[] = [];
 	if (!script.trim()) return { ok: false, errors: [{ message: "workflowScript must not be empty." }] };
 	let root: AstNode;
@@ -1646,7 +1828,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			const statement = workflowBody.body[statementIndex];
 			if (!astNode(statement) || statement.type !== "VariableDeclaration" || !Array.isArray(statement.declarations)) continue;
 			for (const declaration of statement.declarations) {
-				if (!astNode(declaration) || !astNode(declaration.id) || declaration.id.type !== "Identifier" || !astNode(declaration.init) || declaration.init.type !== "AwaitExpression" || !directRunsCall(declaration.init.argument, "all")) continue;
+				if (!astNode(declaration) || !astNode(declaration.id) || declaration.id.type !== "Identifier" || !astNode(declaration.init) || declaration.init.type !== "AwaitExpression" || !astNode(declaration.init.argument) || !directRunsCall(declaration.init.argument, "all")) continue;
 				const name = declaration.id.name as string;
 				const keys = new Set(directRunsAllKeys(declaration.init.argument).map((entry) => entry.key));
 				if (keys.size === 0) continue;
@@ -1662,8 +1844,24 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 		}
 	}
 
+	const warnings: WorkflowScriptValidationWarning[] = [];
+	if (options.maxSubagentSpawnsPerRun !== undefined) {
+		const plan = staticWorkflowLaunchPlan(workflowBody);
+		if (plan.keys.length > options.maxSubagentSpawnsPerRun) {
+			errors.push({
+				kind: "spawn-budget",
+				message: `workflowScript statically requires child launches ${plan.keys.map((key) => `'${key}'`).join(", ")}; minimum required: ${plan.keys.length}; configured: ${options.maxSubagentSpawnsPerRun}.`,
+			});
+		}
+		if (plan.dynamic) {
+			warnings.push({
+				kind: "dynamic-spawn-count",
+				message: `workflowScript contains dynamic child launches; static validation proved ${plan.keys.length} launch(es), so runtime fan-out enforcement remains authoritative for the configured budget of ${options.maxSubagentSpawnsPerRun}.`,
+			});
+		}
+	}
 	const unique = errors.filter((error, index) => errors.findIndex((candidate) => candidate.message === error.message && candidate.line === error.line && candidate.column === error.column) === index);
-	return { ok: unique.length === 0, errors: unique };
+	return { ok: unique.length === 0, errors: unique, ...(warnings.length > 0 ? { warnings } : {}) };
 }
 function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowScriptTraceEntry, "phase" | "label" | "agent"> {
 	return {
@@ -1736,6 +1934,32 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		throw new Error("workflow script global concurrency limit must be a positive integer.");
 	}
 	const launchSemaphore = new Semaphore(options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
+
+	if (options.processCwd !== undefined) {
+		let staleCwd = false;
+		try {
+			realpathSync(process.cwd());
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+			if (code !== "ENOENT") throw new Error("Workflow current cwd could not be validated.", { cause: error });
+			staleCwd = true;
+		}
+		try {
+			if (staleCwd) process.chdir(options.processCwd);
+			else {
+				const target = realpathSync(options.processCwd);
+				if (!statSync(target).isDirectory()) {
+					const error = new Error(`ENOTDIR: not a directory, access '${target}'`) as NodeJS.ErrnoException;
+					error.code = "ENOTDIR";
+					throw error;
+				}
+				accessSync(target, constants.X_OK);
+			}
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			throw new Error(`Workflow process cwd is unavailable: ${options.processCwd}: ${detail}`, { cause: error });
+		}
+	}
 
 	let acornPath: string;
 	try {
@@ -2236,7 +2460,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				admission = Promise.resolve().then(() => {
 					if (settled || finishing) return;
 					for (const call of calls) assertRecoveryBarrierAllowsRun(call.key, call.params);
-					return options.admit?.(calls);
+					return options.admit?.(calls, childController.signal);
 				});
 				if (batch) batchAdmissions.set(batch.id, admission);
 			}
@@ -2293,6 +2517,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				} finally {
 					launchSemaphore.release();
 				}
+			}, (error: unknown) => {
+				if (!childController.signal.aborted) throw error;
+				const reason = childController.signal.reason;
+				return stoppedChildResult(key, reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 			}).then((result) => {
 				let normalized = !result.ok && !result.error ? { ...result, error: result.output } : result;
 				if (resolvedResumeLineage?.length && normalized.runId) {
@@ -2325,6 +2553,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			respond(deliver(promise), `runs.run('${key}') result`, (error) => children.set(key, responseBoundaryFailure(key, error)));
 		});
 
-		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined });
+		worker.postMessage({ type: "start", script: options.script, ...(options.args ? { args: options.args } : {}), stateEnabled: options.state !== undefined });
 	});
 }

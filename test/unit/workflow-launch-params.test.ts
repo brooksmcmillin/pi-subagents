@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { AgentConfig } from "../../src/agents/agents.ts";
 import {
 	compactSuccessfulFileOnlyWorkflowResult,
 	prepareWorkflowLaunchParams,
 	promptAuditRedoParams,
 	resolveRevivalControlConfig,
+	resolveWorkflowChildLocalCwd,
 	sanitizeRunPathSegment,
 	workflowChildResults,
 } from "../../src/runs/foreground/subagent-executor.ts";
@@ -22,6 +24,9 @@ describe("workflow launch params", () => {
 			outputMode: "file-only",
 			savedOutputPath: "/tmp/review.md",
 			outputReference: { path: "/tmp/review.md", authoritative: true },
+			model: "provider/fallback",
+			requestedModel: "provider/primary",
+			skippedModels: [{ model: "provider/primary", reason: "cached rate limit", expiresAt: 123 }],
 			structuredOutput: { verdict: "pass" },
 			messages: [{ role: "assistant", content: "large" }],
 			toolCalls: [{ name: "read", args: {}, text: "read", expandedText: "large" }],
@@ -32,6 +37,9 @@ describe("workflow launch params", () => {
 		const compact = compactSuccessfulFileOnlyWorkflowResult(result);
 		assert.equal(compact.task, "[prompt redacted]");
 		assert.equal(compact.savedOutputPath, "/tmp/review.md");
+		assert.equal(compact.model, "provider/fallback");
+		assert.equal(compact.requestedModel, "provider/primary");
+		assert.deepEqual(compact.skippedModels, result.skippedModels);
 		assert.equal(compact.structuredOutput, undefined);
 		assert.equal(compact.usage, undefined);
 		assert.equal(compact.messages, undefined);
@@ -87,6 +95,33 @@ describe("workflow launch params", () => {
 		} as unknown as SingleResult;
 
 		assert.equal(compactSuccessfulFileOnlyWorkflowResult(failed), failed);
+	});
+
+	it("keeps remote workflow cwd out of local discovery for explicit and agent-pinned machines", () => {
+		const workflowCwd = "/local/workflow";
+		const discoverCalls: string[] = [];
+		const pinned: AgentConfig = {
+			name: "pinned",
+			description: "Pinned agent",
+			systemPrompt: "Run remotely.",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/local/workflow/.pi/agents/pinned.md",
+			machine: "workmac",
+		};
+		const discoverAgents = (cwd: string) => {
+			discoverCalls.push(cwd);
+			return { agents: [pinned] };
+		};
+		const shared = { workflowCwd, discoverAgents, agents: [] as AgentConfig[] };
+
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "worker", machine: "workmac", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, []);
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "pinned", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, [workflowCwd]);
 	});
 
 	it("preserves omitted workflow child async defaults and awaits background resolution", () => {

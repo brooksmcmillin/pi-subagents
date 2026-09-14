@@ -18,36 +18,41 @@ export interface AutoDrainDeps {
 		deps: SubagentWaitDeps,
 	) => Promise<AgentToolResult<Details>>;
 	hasWork?: (sessionId: string, nowMs: number) => boolean;
+	hasPendingSupervisorRequest?: () => boolean;
 }
 
 function resultText(value: AgentToolResult<Details>): string {
 	return value.content.map((part) => part.type === "text" ? part.text : "").join(" ").trim();
 }
 
-function hasOutstandingWork(sessionId: string, nowMs: number, observation?: ReadonlyDrainObservation): boolean {
+function hasOutstandingWork(state: SubagentState, sessionId: string, nowMs: number, observation?: ReadonlyDrainObservation): boolean {
 	const asyncRuns = listAsyncRuns(DIRS.async, {
 		states: ["queued", "running"],
 		sessionId,
 		resultsDir: DIRS.results,
 		now: () => nowMs,
 	}, observation?.status);
-	return asyncRuns.length > 0 || snapshotBackgroundWork(sessionId, nowMs).items.length > 0;
+	const detachedForeground = [...(state.foregroundRuns?.values() ?? [])].some((run) =>
+		run.sessionId === sessionId && run.children.some((child) => child.status === "detached")
+	);
+	return asyncRuns.length > 0 || snapshotBackgroundWork(sessionId, nowMs).items.length > 0 || detachedForeground;
 }
 
 /** Drain all work owned by the current headless session, including work added while draining. */
 export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: ReadonlyDrainObservation): Promise<void> {
 	const sessionId = deps.state.currentSessionId;
-	observation?.begin(sessionId, !deps.hasWork && !deps.wait && !deps.now);
+	observation?.begin(sessionId, !deps.hasWork && !deps.wait && !deps.now && !deps.hasPendingSupervisorRequest);
 	try {
 		if (!sessionId) throw new Error("Cannot auto-drain background work without an active session identity.");
 		const now = deps.now ?? Date.now;
 		const timeoutMs = deps.timeoutMs ?? DEFAULT_AUTO_DRAIN_TIMEOUT_MS;
 		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Auto-drain timeoutMs must be a positive finite number.");
 		const deadlineAt = now() + timeoutMs;
-		const hasWork = deps.hasWork ?? (observation ? (id: string, time: number) => hasOutstandingWork(id, time, observation) : hasOutstandingWork);
+		const hasWork = deps.hasWork ?? ((id: string, time: number) => hasOutstandingWork(deps.state, id, time, observation));
 		const wait = deps.wait ?? waitForSubagents;
 
 		while (true) {
+			if (deps.hasPendingSupervisorRequest?.()) break;
 			const work = hasWork(sessionId, now());
 			observation?.predicate(work);
 			if (!work) break;
@@ -65,11 +70,14 @@ export async function drainOutstandingWork(deps: AutoDrainDeps, observation?: Re
 					stopOnAttention: false,
 					failOnFailedRuns: true,
 					failOnAttention: true,
+					hasPendingSupervisorRequest: deps.hasPendingSupervisorRequest,
 				},
 			);
 			if (waitResult.isError) {
 				throw new Error(`Auto-drain failed for session '${sessionId}': ${resultText(waitResult) || "bg_wait returned an error without details"}.`);
 			}
+			if (waitResult.details.wait?.reason === "supervisor_request") break;
+			if (deps.hasPendingSupervisorRequest?.()) break;
 		}
 		observation?.complete();
 	} catch (error) {

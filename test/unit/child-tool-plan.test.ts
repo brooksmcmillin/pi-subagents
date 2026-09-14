@@ -34,6 +34,52 @@ describe("child tool plan", () => {
 });
 
 describe("child tool plan host builtin intersection", () => {
+	it("keeps wrapped core slots regardless of source, including read for lazy skills", () => {
+		for (const source of ["builtin", "auto", "extension", "custom", undefined]) {
+			const hostAvailableBuiltins = getHostBuiltinToolNames({ getAllTools: () => [
+				...["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: source ? { source } : undefined })),
+				{ name: "ipython", sourceInfo: { source: "builtin" } },
+				{ name: "parent_only", sourceInfo: { source: "extension" } },
+			] });
+			assert.deepEqual(hostAvailableBuiltins, ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "ipython"]);
+			const plan = resolvePiLaunchToolPlan({ tools: ["bash"], requireReadTool: true, hostAvailableBuiltins });
+			assert.deepEqual(plan.requiredChildTools, ["read", "bash"]);
+			assert.deepEqual(plan.unavailableHostBuiltins, []);
+		}
+	});
+
+	it("preserves arbitrary non-core requirements without inferring their child providers", () => {
+		const tools = ["read", "fixture_search", "__proto__", "ipython"];
+		for (const configuration of [
+			{},
+			{ capabilityCeiling: { version: 1 as const, denyExtensions: true, sources: ["test"] } },
+		]) {
+			const plan = resolvePiLaunchToolPlan({ tools, hostAvailableBuiltins: ["bash"], ...configuration });
+			assert.deepEqual(plan.effectiveToolAllowlist, tools.slice(1));
+			assert.deepEqual(plan.requiredChildTools, tools.slice(1));
+			assert.deepEqual(plan.unavailableHostBuiltins, ["read"]);
+		}
+		const restricted = resolvePiLaunchToolPlan({
+			tools, hostAvailableBuiltins: ["read"], excludeTools: ["__proto__"],
+			capabilityCeiling: { version: 1, allowedTools: ["fixture_search", "__proto__"], sources: ["test"] },
+		});
+		assert.deepEqual(restricted.effectiveToolAllowlist, ["fixture_search"]);
+		assert.deepEqual(restricted.requiredChildTools, ["fixture_search"]);
+		for (const restriction of [{ tools: [] }, { capabilityCeiling: { version: 1 as const, allowedTools: [], sources: ["test"] } }]) {
+			const empty = resolvePiLaunchToolPlan({ tools, hostAvailableBuiltins: ["read"], ...restriction });
+			assert.deepEqual(empty.effectiveToolAllowlist, []);
+			assert.deepEqual(empty.requiredChildTools, []);
+		}
+	});
+
+	it("retains the supervisor pairing exception but requires a lone intercom", () => {
+		for (const tools of [["intercom"], ["intercom", "contact_supervisor"]]) {
+			const plan = resolvePiLaunchToolPlan({ tools, hostAvailableBuiltins: ["read"] });
+			assert.deepEqual(plan.effectiveToolAllowlist, tools);
+			assert.deepEqual(plan.requiredChildTools, tools.length === 1 ? tools : []);
+		}
+	});
+
 	it("intersects declared tools with host-available builtins", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read", "grep", "find", "ls", "bash"],
@@ -56,6 +102,56 @@ describe("child tool plan host builtin intersection", () => {
 		assert.ok(plan.toolExtensionPaths.some((extensionPath) => extensionPath.endsWith("inspection-shell.ts")));
 		assert.ok(plan.extensionArgs.some((extensionPath) => extensionPath.endsWith("inspection-shell.ts")));
 		assert.equal(plan.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("inspection-shell.ts")), false);
+	});
+
+	it("composes inspection_shell with extension and coordination tools under restricted host builtins", () => {
+		const tools = ["read", "bash", "inspection_shell", "custom_lookup", "subagent", "subagent_supervisor"];
+		const input = { tools, hostAvailableBuiltins: ["read"] };
+		const plan = resolvePiLaunchToolPlan(input);
+		assert.deepEqual(plan.effectiveToolAllowlist, tools.filter((tool) => tool !== "bash"));
+		assert.deepEqual(plan.unavailableHostBuiltins, ["bash"]);
+		assert.ok(plan.toolExtensionPaths.some((extensionPath) => extensionPath.endsWith("inspection-shell.ts")));
+		for (const restriction of [
+			{ excludeTools: ["inspection_shell"] },
+			{ capabilityCeiling: { version: 1 as const, allowedTools: ["read"], sources: ["test"] } },
+		]) {
+			const restricted = resolvePiLaunchToolPlan({ ...input, tools: ["read", "inspection_shell"], ...restriction });
+			assert.deepEqual(restricted.effectiveToolAllowlist, ["read"]);
+			assert.equal(restricted.toolExtensionPaths.some((extensionPath) => extensionPath.endsWith("inspection-shell.ts")), false);
+		}
+		const denied = resolvePiLaunchToolPlan({ ...input, capabilityCeiling: { version: 1, denyExtensions: true, sources: ["test"] } });
+		assert.deepEqual(denied.toolExtensionPaths, []);
+	});
+
+	it("keeps requested native coordination tools through host builtin filtering, but not ceilings or exclusions", () => {
+		const tools = ["read", "subagent", "contact_supervisor", "subagent_supervisor"];
+		const input = { tools, hostAvailableBuiltins: ["read"] };
+		const plan = resolvePiLaunchToolPlan(input);
+		assert.deepEqual(plan.effectiveToolAllowlist, tools);
+		assert.deepEqual(plan.requiredChildTools, ["read", "subagent", "subagent_supervisor"]);
+		assert.equal(plan.fanoutAuthorized, true);
+		assert.deepEqual(plan.unavailableHostBuiltins, []);
+		for (const restriction of [
+			{ excludeTools: ["subagent_supervisor"] },
+			{ capabilityCeiling: { version: 1 as const, allowedTools: ["read", "subagent", "contact_supervisor"], denyExtensions: true, sources: ["test"] } },
+		]) {
+			const restricted = resolvePiLaunchToolPlan({ ...input, ...restriction });
+			assert.equal(restricted.fanoutAuthorized, true);
+			assert.equal(restricted.effectiveToolAllowlist.includes("subagent_supervisor"), false);
+		}
+		const leaf = resolvePiLaunchToolPlan({ ...input, tools: ["read", "contact_supervisor"] });
+		assert.equal(leaf.fanoutAuthorized, false);
+		assert.equal(leaf.effectiveToolAllowlist.includes("subagent_supervisor"), false);
+	});
+
+	it("rejects an explicitly requested reply tool when fanout authorization is absent or removed", () => {
+		for (const input of [
+			{ tools: ["read", "subagent_supervisor"] },
+			{ tools: ["read", "subagent", "subagent_supervisor"], excludeTools: ["subagent"] },
+			{ tools: ["read", "subagent", "subagent_supervisor"], capabilityCeiling: { version: 1 as const, allowedTools: ["read", "subagent_supervisor"], sources: ["test"] } },
+		]) {
+			assert.throws(() => resolvePiLaunchToolPlan({ ...input, hostAvailableBuiltins: ["read"] }), /subagent_supervisor.*requires fanout authorization/);
+		}
 	});
 
 	it("keeps all tools when host provides them", () => {
@@ -161,6 +257,24 @@ describe("production launch path supplies hostAvailableBuiltins", () => {
 			assert.deepEqual(launch.toolPlan.declaredBuiltinTools, ["bash"]);
 			assert.deepEqual(launch.toolPlan.unavailableHostBuiltins, ["read", "grep"]);
 			assert.deepEqual(launch.toolPlan.effectiveToolAllowlist, ["bash"]);
+			assert.deepEqual(launch.warnings, [
+				"Agent 'test-agent': host runtime tool availability omitted [read, grep]. Requested tool names: [read, grep, bash]; effective tool allowlist: [bash]. This is a non-fatal tool-plan diagnostic, not verification of the child's runtime tool menu.",
+			]);
+			assert.throws(
+				() => buildInProcessChildLaunch({
+					host: "runner",
+					cwd,
+					childAgentName: "scout",
+					childIndex: 0,
+					sessionEnabled: false,
+					inheritProjectContext: false,
+					inheritGlobalContext: false,
+					inheritSkills: false,
+					tools: ["read", "grep", "bash"],
+					hostAvailableBuiltins: ["ipython", "bash"],
+				}),
+				/Agent 'scout': tool contract could not be satisfied.*permitted required repository tools \[read, grep\].*lane infrastructure failure/,
+			);
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -172,7 +286,8 @@ describe("production launch path supplies hostAvailableBuiltins", () => {
 		const mockPi = {
 			getAllTools: () => [
 				{ name: "read", sourceInfo: { source: "builtin" } },
-				{ name: "bash", sourceInfo: { source: "builtin" } },
+				{ name: "bash", sourceInfo: { source: "auto" } },
+				{ name: "custom-auto-tool", sourceInfo: { source: "auto" } },
 				{ name: "custom-tool", sourceInfo: { source: "extension", path: "/ext/tool.ts" } },
 				{ name: "mcp-tool", sourceInfo: { source: "mcp" } },
 			],

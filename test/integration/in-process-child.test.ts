@@ -72,6 +72,12 @@ describe("in-process foreground child", () => {
 		}
 	});
 
+	it("projects authoritative native-machine Git evidence into the public foreground result", async () => {
+		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "native-git-evidence", waitToolEnabled: false, childSessionFactory: wrapped });
+		assert.deepEqual(result.nativeMachine, { provider: "herdr", machineId: "remote-machine", initialGit: { head: "aaa", dirty: false }, finalGit: { head: "bbb", dirty: true } });
+	});
+
 	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {
 		const route = createNestedRoute("hooks-fanout");
 		try {
@@ -109,6 +115,28 @@ describe("in-process foreground child", () => {
 			{ text: "Focus on tests.", mode: "steer" },
 			{ text: "Then update docs.", mode: "followUp" },
 		]);
+	});
+
+	it("does not abort when a steer arrives after the final stop and turn_start is delayed", async () => {
+		mockPi.onCall({
+			jsonl: [events.assistantMessage("before steer")],
+			keepAliveAfterFinalMessageMs: 15_000,
+			queuedMessageTurnStartDelayMs: 1400,
+			queuedMessageOutput: "after steer",
+		});
+		let controls: ForegroundChildSessionControls | undefined;
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "queued-steer-after-final",
+			onChildSession: (next) => { controls = next; },
+		});
+		await waitFor(() => controls !== undefined && mockPi.sessions[0]?.scriptedFinalEmitted === true);
+		await controls!.steer("Continue after the final stop.");
+		const result = await run;
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.error, undefined);
+		assert.equal(result.finalOutput, "after steer");
+		assert.equal(mockPi.sessions[0]?.aborted, false);
+		assert.deepEqual(mockPi.sessions[0]?.steers, [{ text: "Continue after the final stop.", mode: "steer" }]);
 	});
 
 	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
@@ -419,22 +447,41 @@ describe("default child session factory", () => {
 		assert.deepEqual(errors, ["<loader>"]);
 	});
 
-	it("initializes the theme from settings before each child session", async () => {
-		const themed: Array<string | undefined> = [];
+	it("preserves an initialized parent theme when creating a child session", async () => {
+		const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
 		const pi = stubPi();
-		pi.initTheme = ((themeName?: string) => { themed.push(themeName); }) as PiCodingAgentModule["initTheme"];
-		pi.SettingsManager = { create: () => ({ getTheme: () => "solarized-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		pi.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		pi.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
-		await factory.create(stubLaunch);
-		await factory.create(stubLaunch);
-		assert.deepEqual(themed, ["solarized-dark", "solarized-dark"]);
+		globals[themeKey] = { name: "vesper-light" };
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, []);
+		} finally {
+			if (previousTheme === undefined) delete globals[themeKey];
+			else globals[themeKey] = previousTheme;
+		}
 	});
 
-	it("skips theme initialization when the pi module has no initTheme export", async () => {
-		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() });
-		await factory.create(stubLaunch);
-		// Reaching here without throwing is the assertion: `settingsManager.getTheme()`
-		// must not be evaluated when `initTheme` is unavailable.
+	it("initializes the theme in a headless runner process", async () => {
+		const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
+		const pi = stubPi();
+		pi.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		pi.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		delete globals[themeKey];
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, ["vesper-light/vesper-dark"]);
+		} finally {
+			if (previousTheme !== undefined) globals[themeKey] = previousTheme;
+		}
 	});
 
 	it("disposes the session when bindExtensions rejects", async () => {

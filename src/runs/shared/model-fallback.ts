@@ -1,10 +1,16 @@
 import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
-import type { Usage } from "../../shared/types.ts";
+import type { SkippedModel, Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 import { redactSecretValues } from "./permissions.ts";
 
 export type { AvailableModelInfo };
+
+export interface ModelCandidateEvidence {
+	candidates: string[];
+	requestedModel?: string;
+	skippedModels?: SkippedModel[];
+}
 
 interface ModelAttemptSummary {
 	model: string;
@@ -315,26 +321,18 @@ function formatExcludedCandidateEvidence(candidate: string, exclusion: NonNullab
 	return `${displayCandidate} — model: ${displayModel}; provider: ${displayProvider}; reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}`;
 }
 
-const MODEL_UNAVAILABLE_EXCLUSION_PATTERNS = [
-	/model.*not found/i,
-	/unknown model/i,
-	/model.*unavailable/i,
-	/model.*disabled/i,
-];
-
-function isCurrentRegistryModel(candidate: string, availableModels: AvailableModelInfo[] | undefined): boolean {
-	if (!availableModels || availableModels.length === 0) return false;
-	const { baseModel } = splitThinkingSuffix(candidate);
-	return availableModels.some((entry) => entry.fullId === baseModel);
-}
+const MODEL_UNAVAILABLE_PATTERN = /(?:model.*(?:not found|unavailable|disabled)|unknown model)/i;
 
 function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
 	const reason = exclusion.reason ?? "";
-	return MODEL_UNAVAILABLE_EXCLUSION_PATTERNS.some((pattern) => pattern.test(reason)) && isCurrentRegistryModel(candidate, availableModels);
+	const { baseModel } = splitThinkingSuffix(candidate);
+	return MODEL_UNAVAILABLE_PATTERN.test(reason) && availableModels?.some((entry) => entry.fullId === baseModel) === true;
 }
 
-function throwForExplicitModelExclusion(model: string): void {
-	const exclusion = findModelExclusion(model);
+function throwForExplicitModelExclusion(model: string, availableModels: AvailableModelInfo[] | undefined): void {
+	const exclusion = findModelExclusion(model, {
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
+	});
 	if (!exclusion) return;
 	const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
 	const expiry = Number.isFinite(exclusion.expiresAt) ? `; expires: ${new Date(exclusion.expiresAt).toISOString()}` : "";
@@ -377,7 +375,7 @@ export function resolveSubagentModelOverride(
 		const candidate = resolveSubagentModelCandidate(explicit, availableModels, preferredProvider);
 		if (options?.source === "explicit") {
 			resolved = candidate ?? resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
-			throwForExplicitModelExclusion(resolved);
+			throwForExplicitModelExclusion(resolved, availableModels);
 			resolvedFromRegistry = true;
 		} else if (candidate) {
 			resolved = candidate;
@@ -464,23 +462,26 @@ export function buildModelCandidates(
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
 	options?: BuildModelCandidatesOptions,
-): string[] {
+): ModelCandidateEvidence {
 	if (!primaryModel) throwForUnresolvedEnforcedInheritScope(options?.scope, true);
 	const origin = options?.origin ?? (options?.primaryModelFromParent ? "inherited" : "configured");
+	const requestedModel = origin === "inherited" ? undefined : primaryModel;
 	const scopes = configuredScopes(options?.scope);
 	type ExcludedCandidate = { candidate: string; exclusion: NonNullable<ReturnType<typeof findModelExclusion>> };
 	const excludedCandidates: ExcludedCandidate[] = [];
+	const skippedModels: SkippedModel[] = [];
 	let excludedCandidateCount = 0;
 	const warnCachedExclusion = (candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>) => {
 		excludedCandidateCount++;
 		if (excludedCandidates.length < MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES) excludedCandidates.push({ candidate, exclusion });
 		const displayCandidate = sanitizeModelExclusionDiagnostic(candidate, "unknown");
 		const reason = sanitizeModelExclusionDiagnostic(exclusion.reason, "runtime-failure");
+		skippedModels.push({ model: candidate, reason, ...(Number.isFinite(exclusion.expiresAt) ? { expiresAt: exclusion.expiresAt } : {}) });
 		console.warn(`[pi-subagents] Skipping model '${displayCandidate}' due to a cached exclusion (reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}).`);
 	};
 	if (origin === "explicit" && primaryModel) {
 		const normalized = resolveRequiredSubagentModelCandidate(primaryModel.trim(), availableModels, preferredProvider);
-		throwForExplicitModelExclusion(normalized);
+		throwForExplicitModelExclusion(normalized, availableModels);
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		primaryModel = normalized;
 	}
@@ -526,12 +527,12 @@ export function buildModelCandidates(
 				: "";
 			throw new Error(`${ZERO_USABLE_MODEL_CANDIDATES_ERROR}${evidence}`);
 		}
-		return resolved;
+		return { candidates: resolved, ...(requestedModel ? { requestedModel } : {}), ...(skippedModels.length ? { skippedModels } : {}) };
 	}
 	if (skippedPrimary) {
 		console.warn(`[pi-subagents] Skipping primary model '${skippedPrimary}' because it is unavailable in this environment.`);
 	}
-	return resolved;
+	return { candidates: resolved, ...(requestedModel ? { requestedModel } : {}), ...(skippedModels.length ? { skippedModels } : {}) };
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [
@@ -543,6 +544,8 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/quota/i,
 	/billing/i,
 	/credit/i,
+	// OpenRouter can return only a status-prefixed body, without auth-related prose.
+	/^\s*401\s*:/,
 	/auth(?:entication)?/i,
 	/unauthori[sz]ed/i,
 	/forbidden/i,
@@ -550,10 +553,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/token expired/i,
 	/invalid key/i,
 	/provider.*unavailable/i,
-	/model.*unavailable/i,
-	/model.*disabled/i,
-	/model.*not found/i,
-	/unknown model/i,
+	MODEL_UNAVAILABLE_PATTERN,
 	/overloaded/i,
 	/service unavailable/i,
 	/temporar(?:ily)? unavailable/i,
@@ -577,6 +577,20 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/model.*(?:load|fail|error)/i,
 ];
 
+const TRANSIENT_STREAM_FAILURE_PATTERNS = [
+	// Pi's Anthropic provider uses this exact error when a stream closes before
+	// its terminal event.
+	/^Anthropic stream ended before message_stop$/,
+	// Node's fetch reports a prematurely closed response body with this message.
+	/^terminated$/,
+];
+
+function isTransientStreamFailure(error: string | undefined): boolean {
+	if (!error) return false;
+	const normalized = error.trim();
+	return TRANSIENT_STREAM_FAILURE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 /**
  * Failures reported as `<tool> failed (exit N): ...` or `<tool> failed with
  * exit code N` come from a tool call inside the child's task, not from the
@@ -589,7 +603,7 @@ const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exi
 export function isRetryableModelFailure(error: string | undefined): boolean {
 	if (!error) return false;
 	if (TOOL_FAILURE_PREFIX.test(error.trim())) return false;
-	return RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+	return isTransientStreamFailure(error) || RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
 }
 
 function messageError(message: unknown): string | undefined {
@@ -598,10 +612,15 @@ function messageError(message: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
 
+function isTransientNoOutputFailure(error: string | undefined): boolean {
+	return error === "Subagent produced no output (possible model cold-start or empty response)."
+		|| /^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/.test(error ?? "");
+}
+
 export function isRetryableModelFailureAttempt(input: { error: string | undefined; messages?: readonly unknown[]; toolCount?: number }): boolean {
 	if (!isRetryableModelFailure(input.error)) return false;
 	if ((input.toolCount ?? 0) > 0) return false;
-	if (input.error === "Subagent produced no output (possible model cold-start or empty response)." || /^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/.test(input.error ?? "")) return true;
+	if (isTransientNoOutputFailure(input.error)) return true;
 	if ((input.toolCount ?? 0) === 0 && (input.messages?.length ?? 0) === 0) return true;
 	const error = input.error?.trim();
 	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
@@ -611,11 +630,39 @@ export function isRetryableModelFailureAttempt(input: { error: string | undefine
 // but do not establish that the model is unhealthy for subsequent requests.
 const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
 
+/**
+ * Failures that originate while assembling the child environment (extension
+ * npm install into a child prefix, a preflight script, spawning a helper)
+ * instead of from the provider. Their text can still trip the broad model
+ * failure patterns above: a package whose name contains the substring "model"
+ * next to a sentence containing "failed" matches {@link RETRYABLE_MODEL_FAILURE_PATTERNS}
+ * even though no model request ever happened. Retrying a different model
+ * cannot fix the environment, so keep the record only long enough to damp
+ * repeated attempts instead of blaming the model for the default TTL.
+ */
+const PROVISIONING_FAILURE_PATTERNS = [
+	/^npm (?:install|ci|uninstall|exec|run)\b/i,
+	/\bnpm\b[^\n]*failed with code \d+/i,
+	/\bnpm\b[^\n]*exited with code \d+/i,
+	/\bpreflight\b/i,
+];
+
+const PROVISIONING_FAILURE_TTL_MS = 15 * 60_000;
+
+function isProvisioningFailure(error: string): boolean {
+	return PROVISIONING_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+}
+
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
 	if (!model || !error || !isRetryableModelFailure(error) || isContextOverflow(error)) return;
-	if (REQUEST_SHAPE_FAILURE_PATTERN.test(error)) return;
+	if (REQUEST_SHAPE_FAILURE_PATTERN.test(error) || isTransientNoOutputFailure(error) || isTransientStreamFailure(error)) return;
 	const { provider, modelId } = parseModelKey(model);
-	recordModelFailure({ modelId, reason: error, ...(provider ? { provider } : {}) });
+	recordModelFailure({
+		modelId,
+		reason: error,
+		...(provider ? { provider } : {}),
+		...(isProvisioningFailure(error) ? { ttlMs: PROVISIONING_FAILURE_TTL_MS, preserveExisting: true } : {}),
+	});
 }
 
 /**

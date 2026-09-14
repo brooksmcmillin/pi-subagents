@@ -10,10 +10,13 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { prepareReadonlySessionEvidence } from "./readonly-session-evidence.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
 // Private runtime authority for host continuation planning; injected factories have none.
 const readonlyModels = new WeakMap<ChildSession, { current: ModelInfo; resolve(reference: string): ModelInfo | undefined; requestBytes: number }>();
@@ -54,6 +57,10 @@ export type ChildSessionStorage =
 
 export interface ChildSessionLaunch {
 	cwd: string;
+	/** Resolved pane-native placement. Local launches omit this field. */
+	machine?: HerdrMachineReference;
+	/** Logical names resolved only by the remote ambient package. */
+	remoteResources?: { agent: string; skills?: string[]; toolCeiling?: string[]; reads?: string[] | false };
 	storage: ChildSessionStorage;
 	/** Model reference as the agent config names it (`provider/id`, optionally `:thinking`). */
 	model?: string;
@@ -62,6 +69,8 @@ export interface ChildSessionLaunch {
 	excludeTools?: string[];
 	/** Extension files loaded for this child in addition to the inline hooks. */
 	extensionPaths: string[];
+	/** Canonical required paths and safe evidence identities for fail-closed loading. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	/**
 	 * Discover the ambient extensions (agent dir, project, settings) the way a
 	 * `pi` process would. False loads only `extensionPaths` and `hooks`.
@@ -93,14 +102,27 @@ export interface ChildSession {
 	abort(): Promise<void>;
 	/** Emits `session_shutdown` to the child's extensions and disposes the session; resolves once that shutdown work is done. */
 	dispose(): Promise<void>;
+	/** True while Pi still has steering or follow-up input that has not started a turn. */
+	hasQueuedMessages?(): boolean;
 	readonly messages: readonly AgentMessage[];
 	readonly sessionFile: string | undefined;
 	readonly sessionId: string;
 	readonly modelId: string | undefined;
+	readonly machineEvidence?: { machineId: string; initial?: HerdrRemoteGitStatus; final?: HerdrRemoteGitStatus };
+	/** Event-updated pane-native status; reading it performs no network work. */
+	readonly placementSnapshot?: unknown;
 	/** Set by the foreground host once the run detached; `factory.dispose()` leaves such children running. */
 	detached?: boolean;
 	/** Set by `factory.dispose()` before it aborts the child, so the host can report the stop truthfully. */
 	shutDown?: boolean;
+}
+
+export function childSessionHasQueuedMessages(session: ChildSession | undefined): boolean {
+	try {
+		return session?.hasQueuedMessages?.() === true;
+	} catch {
+		return false;
+	}
 }
 
 export interface ChildSessionFactory {
@@ -163,7 +185,7 @@ function applyProcessEnv(values: Record<string, string | undefined> | undefined)
 	}
 }
 
-async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined): Promise<void> {
+async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined, requiredPaths: ReadonlySet<string>): Promise<void> {
 	if (!("getExtensions" in loader) || typeof loader.getExtensions !== "function") return;
 	const { runtime } = loader.getExtensions();
 	let registered = false;
@@ -173,6 +195,7 @@ async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAge
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
+			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingProviderRegistrations)) runtime.pendingProviderRegistrations = [];
@@ -182,6 +205,7 @@ async function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAge
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
+			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingNativeProviderRegistrations)) runtime.pendingNativeProviderRegistrations = [];
@@ -213,8 +237,12 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const modelRuntime = await sharedRuntime(pi);
 			const agentDir = getAgentDir();
 			const settingsManager = pi.SettingsManager.create(launch.cwd, agentDir);
-			// Headless sessions skip Pi's CLI theme setup; extensions still need ctx.ui.theme.
-			if (typeof pi.initTheme === "function") pi.initTheme(settingsManager.getTheme());
+			// Foreground children share Pi's global theme with the parent, so reinitializing it
+			// would overwrite the parent's active light/dark appearance. Detached runners have
+			// no initialized theme and must initialize one for headless extension renderers.
+			const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+			const themeInitialized = Boolean((globalThis as Record<symbol, unknown>)[themeKey]);
+			if (!themeInitialized && typeof pi.initTheme === "function") pi.initTheme(settingsManager.getTheme());
 			const loader = new pi.DefaultResourceLoader({
 				cwd: launch.cwd,
 				agentDir,
@@ -231,11 +259,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
 			});
 			const open = async () => {
+				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				observeReadonly?.loadingHooks(true);
 				try { await loader.reload(); } finally { observeReadonly?.loadingHooks(false); }
-				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError);
+				const loadErrors = requiredPaths.size > 0
+					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
+				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
+				await flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, requiredPaths);
 				// No await between receipt validation and the SDK's permissive file open.
 				observeReadonly?.beforeOpen();
 				const sessionManager = launch.storage.kind === "file"
@@ -263,6 +295,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					settingsManager,
 					sessionStartEvent: { type: "session_start", reason: "startup" },
 				});
+				pinChildCacheRetention(session.agent);
 				try {
 					await session.bindExtensions({
 						mode: "print",
@@ -310,6 +343,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				steer: (text) => { evidence?.invalidate(); return session.steer(text); },
 				followUp: (text) => { evidence?.invalidate(); return session.followUp(text); },
 				abort: () => { evidence?.invalidate(); return session.abort(); },
+				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
 					if (!pending) {
 						live.delete(child);
@@ -356,8 +390,22 @@ let activeFactoryModule: string | undefined;
 
 /** The process-wide factory foreground runs use unless a run passes its own. */
 export function childSessionFactory(): ChildSessionFactory {
-	activeFactory ??= createDefaultChildSessionFactory();
+	activeFactory ??= createLazyPlacementFactory(createDefaultChildSessionFactory());
 	return activeFactory;
+}
+
+function createLazyPlacementFactory(local: ChildSessionFactory): ChildSessionFactory {
+	let placed: ChildSessionFactory | undefined;
+	const factory = async () => placed ??= (await import("./herdr-placed-run.ts")).createPlacementAwareChildSessionFactory(local);
+	return {
+		async create(launch) { return launch.machine ? (await factory()).create(launch) : local.create(launch); },
+		async dispose() { if (placed) await placed.dispose(); else await local.dispose(); },
+	};
+}
+
+/** Default factory including pane-native placement; detached runners use the same boundary. */
+export function createPlacementChildSessionFactory(options: DefaultChildSessionFactoryOptions = {}): ChildSessionFactory {
+	return createLazyPlacementFactory(createDefaultChildSessionFactory(options));
 }
 
 /**

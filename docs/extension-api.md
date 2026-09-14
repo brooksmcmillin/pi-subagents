@@ -226,7 +226,7 @@ unregisterExternalRun(ctx.sessionManager.getSessionId(), "dependency-review");
 
 The API validates and caches bounded display fields when the caller registers or updates a job. FleetView reads that cache only. It does not poll caller code. `snapshotExternalRuns(sessionId)` and `listExternalRuns(sessionId)` return bounded current-session snapshots. Snapshots filter the session-qualified cache key before inspecting record fields; API-written records avoid repeated normalization through module-private provenance, while records replaced or mutated through the process-local registry are validated on demand. By default, malformed records for the requested session throw with the validation error. Display-only Fleet callers can pass `{ ignoreMalformed: true, onMalformedRecord }` to remove bad records and keep rendering with a programmatic diagnostic.
 
-External jobs are observational. The caller owns execution, persistence, cancellation, and result delivery. FleetView does not expose stop, steer, resume, cancel, or Herdr controls for them. Supplied report and transcript paths are shown as bounded text only; FleetView does not read arbitrary external paths.
+External jobs are observational. The caller owns execution, persistence, cancellation, and result delivery. FleetView does not expose stop, steer, resume, cancel, or inspector controls for them. Supplied report and transcript paths are shown as bounded text only; FleetView does not read arbitrary external paths.
 
 ## Launch contract preflight
 
@@ -246,7 +246,8 @@ const result = await resolveSubagentLaunchContract({
 
 if (!result.ok) {
   // missing_agent, ambiguous_agent, missing_skill, denied_required_tool,
-  // invalid_artifact_dir, invalid_cwd, or unsupported_mode
+  // invalid_artifact_dir, invalid_cwd, unsupported_mode, restricted_agent,
+  // thinking_ceiling, invalid_extension_bindings, or invalid_intercom_bridge
   throw new Error(result.message);
 }
 
@@ -256,11 +257,17 @@ console.log(result.contract.digest, result.contract.tools.effectiveAllowlist);
 Preflight covers ordinary single-agent launch resolution:
 
 - Selected agent identity and shadowed candidates.
-- A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields.
+- A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields. Runtime overlays such as the Intercom bridge never change it.
 - Fresh/fork context, effective model and thinking, skill and tool resolution, direct MCP selections, runtime/configured extensions.
+- The resolved Intercom bridge state (`intercomBridge.mode` and `intercomBridge.active`). An active bridge appends the bridge instruction to the child prompt and adds `contact_supervisor` to a declared tool list, exactly as execution does.
 - Artifact/session paths, async lifecycle/status/result/event/process-terminal paths, package/lifecycle versions, capability-ceiling audit data, and stable digests.
 
-`launchContractDigest` is the canonical digest of the caller task, effective system prompt, model candidates, effective tools/extensions/MCP (including inherited capability ceilings), output binding, and structured-output schema that ordinary foreground and async execution report in results/status/events and metadata.
+`launchContractDigest` is the canonical digest of the caller task, effective system prompt (including an active bridge instruction), model candidates, effective tools/extensions/MCP (including inherited capability ceilings and the bridge tool), output binding, and structured-output schema that ordinary foreground and async execution report in results/status/events and metadata. Preflight and each execution path that reports the digest assemble it through one shared binding, so equal inputs produce equal digests.
+
+Bridge inputs:
+
+- `intercomBridge` replaces the global `intercomBridge` config for this launch, with the same semantics as the `subagent` tool and delegation overrides. Pass the same value to the launch you compare against. Preflight reads the global config from disk on each call while the running extension keeps the config it loaded at startup, so pass the override when the digest must not depend on that file.
+- The default bridge instruction never names the parent session, so most hosts need no further input. When the configured `instructionFile` interpolates `{orchestratorTarget}`, preflight reports a `host_required` diagnostic unless the host supplies a non-empty `orchestratorTarget`; the executor derives that target with `resolveIntercomSessionTarget` from `pi-subagents/intercom-bridge`, given the parent session name and id.
 
 Boundaries:
 
@@ -330,6 +337,7 @@ Bounds:
 
 - Schemas are capped at 64 KiB; tasks and returned text/structured values are capped at 1 MiB, with smaller bounds on identity/configuration strings and a maximum `timeoutMs` of 2,147,483,647.
 - Structured delegation accepts `toolBudget: { hard: 0, block: "*" }` to block the first tool call and run a zero-tool leaf; ordinary model-facing/configured budgets keep their existing minimum of one.
+- `intercomBridge` optionally replaces the global bridge config for one delegation, for example `{ mode: "off" }` when no supervisor session will answer the child. Pass the same value to `resolveSubagentLaunchContract` to compare `launchContractDigest` against the terminal response.
 - The foreground bridge retains up to 8,192 exact pending-cancellation and settled-attempt identities per extension context. If either history fills, it fails closed with `unavailable_context` for later starts rather than evicting identity facts; lifecycle reset clears the bounded history.
 
 Constraints:
@@ -427,6 +435,27 @@ The provider returns handles with `providerJobId`, `state`, optional `handleUrl`
 
 The async runner process does not import provider internals. It writes operation requests into its async run directory. The parent Pi process services those requests against the registered provider and writes operation responses. If the provider is not registered, the bridge fails closed with an actionable error. If a run is recovered after provider job metadata exists, the runner calls `reattach` and `result`; it does not call `start` or `follow-up` again.
 
+## Inspect integration
+
+Inspect is the portable command and action surface for an existing async run. The public actions are:
+
+```ts
+subagent({ action: "inspector.command", id: "<run-id>", index: 0 })
+subagent({ action: "inspector.open", id: "<run-id>", index: 0, focus: true })
+subagent({ action: "inspector.status", id: "<run-id>", index: 0 })
+subagent({ action: "inspector.close", id: "<run-id>", index: 0 })
+```
+
+`inspector.command` returns a standalone runner command without contacting a host or writing a binding. `inspector.open` selects an available bundled inspector plugin. `status` and `close` select the plugin that owns the run binding and report clearly when that plugin does not support the requested lifecycle action. Without an available plugin, `open` fails closed with an actionable message; ordinary launches remain headless. Closing an inspector never stops the run.
+
+### Herdr inspector plugin
+
+The bundled Herdr inspector plugin supports Herdr 0.7.5+. It opens a raw dashboard pane, not the child session and not a literal attach. It reads lifecycle, status, output, and mission artifacts; steer and stop continue through pi-subagents' existing control inbox. Use `focus` only with `inspector.open`; Herdr 0.7.5 cannot focus an arbitrary existing raw pane id.
+
+### Ghostty inspector plugin
+
+Ghostty 1.3+ on macOS is the second bundled open-only plugin, using Ghostty's preview AppleScript API. It splits the focused terminal and launches the read-only inspector command; status and close are unavailable because it writes no binding. Ghostty Automation permission is required.
+
 ## Herdr integration
 
 When Pi runs inside [Herdr](https://herdr.dev), pi-subagents automatically reports active async-run counts through Herdr pane metadata.
@@ -445,20 +474,6 @@ rows = [
   ["agent", "state_text"],
 ]
 ```
-
-### Inspector panes
-
-Herdr 0.7.5+ can open an on-demand inspector for an existing async run:
-
-```ts
-subagent({ action: "inspector.open", id: "<run-id>", index: 0, focus: true })
-subagent({ action: "inspector.status", id: "<run-id>", index: 0 })
-subagent({ action: "inspector.close", id: "<run-id>", index: 0 })
-```
-
-The inspector is a raw dashboard pane, not the child session and not a literal attach. It reads lifecycle/status/output/mission artifacts and sends `steer` or `stop` through pi-subagents' existing control inbox. Closing it never stops the run.
-
-Herdr remains optional. Ordinary launches stay headless, and missing/older Herdr versions affect only Herdr-specific inspector and project-pane actions. FleetView opens the selected active async child with `H`. Use `focus` only with `inspector.open`; Herdr 0.7.5 cannot focus an arbitrary existing raw pane id.
 
 ### Project panes
 

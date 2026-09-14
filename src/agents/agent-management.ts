@@ -30,7 +30,7 @@ import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { resolveEffectiveThinking, toModelInfos } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
-import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
+import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import { resolveExternalCliBinaryAvailability, type ExternalCliBinaryAvailability } from "../runs/shared/external-cli-preflight.ts";
 import type { AcceptanceInput, AgentCapabilitiesSnapshot, AgentCapabilityRow, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
@@ -713,13 +713,19 @@ function externalJobProviderSuffix(provider: string, names: Set<string> | undefi
 
 type ExternalCliAvailabilityByCommand = ReadonlyMap<string, ExternalCliBinaryAvailability>;
 
+/** A placed agent checks only local ssh; machine catalog and remote CLI validation happen at launch. */
+function externalCliAvailabilityKey(command: string, machine: string | undefined): string {
+	return machine ? `ssh@${machine}` : command;
+}
+
 function externalCliAvailabilityForAgents(agents: readonly AgentConfig[]): ExternalCliAvailabilityByCommand {
 	const availability = new Map<string, ExternalCliBinaryAvailability>();
 	for (const agent of agents) {
 		const runner = agent.runner;
-		if (runner?.type === "external-cli" && !availability.has(runner.command)) {
-			availability.set(runner.command, resolveExternalCliBinaryAvailability(runner.command, process.env));
-		}
+		if (runner?.type !== "external-cli") continue;
+		const key = externalCliAvailabilityKey(runner.command, agent.machine);
+		if (availability.has(key)) continue;
+		availability.set(key, resolveExternalCliBinaryAvailability(agent.machine ? "ssh" : runner.command, process.env));
 	}
 	return availability;
 }
@@ -727,10 +733,13 @@ function externalCliAvailabilityForAgents(agents: readonly AgentConfig[]): Exter
 function runnerListBadge(agent: AgentConfig, providerNames: Set<string> | undefined, externalCliAvailability?: ExternalCliAvailabilityByCommand): string | undefined {
 	if (agent.runner?.type === "external-job") return `external-job:${agent.runner.provider} ${externalJobProviderSuffix(agent.runner.provider, providerNames)}`;
 	if (agent.runner?.type === "external-cli") {
-		const availability = externalCliAvailability?.get(agent.runner.command);
-		if (!availability) return "external-cli";
-		return `external-cli:${agent.runner.command} ${availability.available ? "✓" : "missing"}`;
+		const placed = agent.machine ? `${agent.runner.command} @ ${agent.machine}` : agent.runner.command;
+		const availability = externalCliAvailability?.get(externalCliAvailabilityKey(agent.runner.command, agent.machine));
+		if (!availability) return `external-cli:${placed}`;
+		if (agent.machine) return `external-cli:${placed} saved Herdr placement; transport ${availability.available ? "✓" : "missing"}; machine not preflighted`;
+		return `external-cli:${placed} ${availability.available ? "✓" : "missing"}`;
 	}
+	if (agent.machine) return `machine: ${agent.machine} (saved Herdr placement)`;
 	return undefined;
 }
 
@@ -766,7 +775,39 @@ function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<stri
 		if (agent.modelProvider && !agent.model.includes("/")) model = `${agent.modelProvider}/${agent.model}`;
 	}
 	const thinking = agent.thinking === false ? "off" : agent.thinking ?? "default";
-	return `- ${agent.name} (${agentListMetadata(agent, providerNames, externalCliAvailability)}): Description: ${previewDisplayText(agent.description, 240)}; Tools: ${tools}; Model: ${model}; Thinking: ${thinking}`;
+	const machine = agent.machine ? `; Machine: ${agent.machine} (saved Herdr placement)` : "";
+	const acceptance = formatAcceptanceSummary(agent);
+	return `- ${agent.name} (${agentListMetadata(agent, providerNames, externalCliAvailability)}): Description: ${previewDisplayText(agent.description, 240)}; Tools: ${tools}; Model: ${model}; Thinking: ${thinking}${machine}${acceptance ? `; ${acceptance}` : ""}`;
+}
+
+function formatAcceptanceSummary(agent: AgentConfig): string | undefined {
+	const policy = agent.defaultAcceptance;
+	const summary: string[] = [];
+	if (policy === false) summary.push("Acceptance: disabled");
+	else if (typeof policy === "string") summary.push(`Acceptance: ${policy}`);
+	else if (policy) {
+		const modifiers = [
+			...(policy.evidence ?? []),
+			...(policy.verify ?? []).map((command) => `verify: ${formatAcceptanceDisplayLabel(command.id)}`),
+			...(policy.criteria?.length ? [`criteria: ${policy.criteria.length}`] : []),
+			...(policy.stopRules?.length ? [`stopRules: ${policy.stopRules.length}`] : []),
+		];
+		if (policy.review === false) modifiers.push("review: off");
+		else if (policy.review) {
+			const displayReview = policy.review.agent
+				? { ...policy.review, agent: formatAcceptanceDisplayLabel(policy.review.agent) }
+				: policy.review;
+			modifiers.push(`review: ${formatReviewGateLabel(displayReview)}`);
+		}
+		if (policy.report) modifiers.push(`report: ${policy.report}`);
+		summary.push(`Acceptance: ${policy.level ?? "auto"}${modifiers.length > 0 ? ` (${modifiers.join(", ")})` : ""}`);
+	}
+	if (agent.acceptanceRole) summary.push(`Acceptance role: ${agent.acceptanceRole}`);
+	return summary.length > 0 ? summary.join("; ") : undefined;
+}
+
+function formatAcceptanceDisplayLabel(value: string): string {
+	return JSON.stringify(previewDisplayText(value, 80));
 }
 
 const EXTERNAL_JOB_CAPABILITIES = { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } as const;
@@ -780,11 +821,12 @@ function agentCapabilityRunner(agent: AgentConfig, providerNames: Set<string> | 
 	const runner = agent.runner;
 	if (!runner || runner.type === "pi") return PI_AGENT_RUNNER;
 	if (runner.type === "external-cli") {
-		const availability = externalCliAvailability.get(runner.command)!;
+		const availability = externalCliAvailability.get(externalCliAvailabilityKey(runner.command, agent.machine))!;
 		return {
 			type: "external-cli",
 			adapter: runner.adapter,
 			command: runner.command,
+			...(agent.machine ? { machine: agent.machine } : {}),
 			...availability,
 			capabilities: resolveExternalCliRunnerStatus(runner).capabilities,
 		};
@@ -814,6 +856,7 @@ function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; 
 		tools: agentCapabilityTools(agent),
 		model: presentDetails({ value: agent.model, fallbackModels: agent.fallbackModels, thinking: agent.thinking }),
 		execution: presentDetails({ defaultAsync: agent.defaultAsync, timeoutMs: agent.defaultTimeoutMs }),
+		acceptance: presentDetails({ policy: agent.defaultAcceptance, role: agent.acceptanceRole }),
 		output: presentDetails({ path: agent.output, mode: agent.outputMode }),
 		extensions: presentDetails({ names: agent.extensions, subagentOnly: agent.subagentOnlyExtensions, skills: agent.skills }),
 	};
@@ -1385,8 +1428,8 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 		fs.unlinkSync(custom.filePath);
 		lines.push(`Deleted custom ${scope} agent file at ${custom.filePath}.`);
 	}
-	const overrideRemoval = removeBuiltinAgentOverride(ctx.cwd, runtimeName, scope);
-	if (overrideRemoval.removed) lines.push(`Removed ${scope} settings override at ${overrideRemoval.path}.`);
+	const overrideRemoval = removeBuiltinAgentOverride(ctx.cwd, runtimeName, scope, { preserveMachine: true });
+	if (overrideRemoval.removed) lines.push(`${overrideRemoval.machinePreserved ? "Cleared customization in" : "Removed"} ${scope} settings override at ${overrideRemoval.path}.${overrideRemoval.machinePreserved ? " Retained machine placement." : ""}`);
 	if (lines.length === 0) {
 		const otherScope = scope === "user" ? "project" : "user";
 		const otherCustom = (otherScope === "user" ? d.user : d.project).find((a) => a.name === raw || a.name === sanitized);

@@ -35,6 +35,9 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 		? formatAcceptancePrompt(step.effectiveAcceptance, { reportOptional: isAgentContract(step.agentContract), structuredOutput: Boolean(step.structuredOutput?.acceptanceReportPath) })
 		: "";
 	return buildInProcessChildLaunch({
+		machine: step.machine,
+		remoteSkillNames: step.skills,
+		remoteReads: step.remoteReads,
 		parentSessionId: step.parentSessionId,
 		forkCacheKey: step.context === "fork" ? deriveForkPromptCacheKey(step.parentSessionId) : undefined,
 		sessionEnabled: attempt.sessionEnabled,
@@ -50,6 +53,7 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 		allowNestedSubagents: step.allowNestedSubagents,
 		extensions: step.extensions,
 		subagentOnlyExtensions: step.subagentOnlyExtensions,
+		requiredExtensions: step.requiredExtensions,
 		fast: step.fast,
 		modelCandidates: step.modelCandidates,
 		systemPrompt: acceptancePrompt ? `${step.systemPrompt ?? ""}\n${acceptancePrompt}` : step.systemPrompt ?? "",
