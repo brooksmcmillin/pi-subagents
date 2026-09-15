@@ -169,6 +169,14 @@ export function validateFileOnlyOutputMode(outputMode: OutputMode | undefined, o
 	if (outputMode === "file-only" && !outputPath) {
 		return `${context} sets outputMode: "file-only" but does not configure an output file. Set output to a path or use outputMode: "inline".`;
 	}
+	if (outputMode === "file-only" && outputPath) {
+		try {
+			fs.lstatSync(outputPath);
+			return `${context} cannot reuse a published file-only output: ${outputPath}. Set the explicit output parameter to a new path; changing the task prose is not enough.`;
+		} catch (error) {
+			if (!missingFileStatError(error)) return `${context} cannot inspect output: ${String(error)}`;
+		}
+	}
 	return undefined;
 }
 
@@ -228,16 +236,23 @@ function persistSingleOutput(
 	outputPath: string | undefined,
 	fullOutput: string,
 	expectedClaimPath?: string,
+	immutable = false,
 ): { savedPath?: string; error?: string; fatalError?: boolean } {
 	if (!outputPath) return {};
 	try {
 		const claimError = outputClaimError(outputPath, expectedClaimPath);
 		if (claimError) return { error: claimError, fatalError: true };
 		fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-		fs.writeFileSync(outputPath, fullOutput, "utf-8");
+		fs.writeFileSync(outputPath, fullOutput, { encoding: "utf-8", flag: immutable ? "wx" : "w" });
 		return { savedPath: outputPath };
 	} catch (err) {
-		return { error: err instanceof Error ? err.message : String(err) };
+		if (immutable && (err as NodeJS.ErrnoException).code === "EEXIST") {
+			try {
+				if (!fs.lstatSync(outputPath).isSymbolicLink() && fs.readFileSync(outputPath, "utf8") === fullOutput) return { savedPath: outputPath };
+			} catch { /* Fail closed below. */ }
+			return { error: "Published file-only output differs; use a fresh output path.", fatalError: true };
+		}
+		return { error: err instanceof Error ? err.message : String(err), ...(immutable ? { fatalError: true } : {}) };
 	}
 }
 
@@ -245,13 +260,13 @@ export function resolveSingleOutput(
 	outputPath: string | undefined,
 	fallbackOutput: string,
 	beforeRun: SingleOutputSnapshot | undefined,
-	options: { authoritative?: boolean; expectedClaimPath?: string } = {},
+	options: { authoritative?: boolean; expectedClaimPath?: string; immutable?: boolean } = {},
 ): { fullOutput: string; savedPath?: string; saveError?: string; fatalError?: boolean } {
 	if (!outputPath) return { fullOutput: fallbackOutput };
 	const claimError = outputClaimError(outputPath, options.expectedClaimPath);
 	if (claimError) return { fullOutput: fallbackOutput, saveError: claimError, fatalError: true };
 	if (options.authoritative) {
-		const save = persistSingleOutput(outputPath, fallbackOutput, options.expectedClaimPath);
+		const save = persistSingleOutput(outputPath, fallbackOutput, options.expectedClaimPath, options.immutable);
 		return save.savedPath
 			? { fullOutput: fallbackOutput, savedPath: save.savedPath }
 			: { fullOutput: fallbackOutput, saveError: save.error, ...(save.fatalError ? { fatalError: true } : {}) };
@@ -276,7 +291,7 @@ export function resolveSingleOutput(
 		}
 	}
 
-	const save = persistSingleOutput(outputPath, fallbackOutput, options.expectedClaimPath);
+	const save = persistSingleOutput(outputPath, fallbackOutput, options.expectedClaimPath, options.immutable);
 	if (save.savedPath) return { fullOutput: fallbackOutput, savedPath: save.savedPath };
 	return { fullOutput: fallbackOutput, saveError: save.error, ...(save.fatalError ? { fatalError: true } : {}) };
 }

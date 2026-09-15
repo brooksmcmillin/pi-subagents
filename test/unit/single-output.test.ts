@@ -29,6 +29,29 @@ afterEach(() => {
 	}
 });
 
+describe("immutable file-only handoffs", () => {
+	it("requires a fresh explicit destination for a resumed published output", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-output-"));
+		tempDirs.push(dir);
+		const prior = path.join(dir, "prior.json");
+		fs.writeFileSync(prior, "original");
+		assert.match(validateFileOnlyOutputMode("file-only", prior, "Resume")!, /explicit output parameter/);
+		assert.equal(validateFileOnlyOutputMode("file-only", path.join(dir, "head-2.json"), "Resume"), undefined);
+		assert.equal(fs.readFileSync(prior, "utf8"), "original");
+	});
+
+	it("allows identical persistence replay but never replaces published bytes", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-output-"));
+		tempDirs.push(dir);
+		const output = path.join(dir, "report.json");
+		const options = { authoritative: true, immutable: true };
+		assert.equal(resolveSingleOutput(output, "original", undefined, options).savedPath, output);
+		assert.equal(resolveSingleOutput(output, "original", undefined, options).savedPath, output);
+		assert.equal(resolveSingleOutput(output, "rewritten", undefined, options).fatalError, true);
+		assert.equal(fs.readFileSync(output, "utf8"), "original");
+	});
+});
+
 describe("normalizeSingleOutputOverride", () => {
 	it("treats boolean and string false as disabled output", () => {
 		assert.equal(normalizeSingleOutputOverride(false, "default.md"), false);

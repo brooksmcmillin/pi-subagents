@@ -97,6 +97,7 @@ export interface BuildInProcessChildLaunchInput {
 	nestedRoute?: { rootRunId: string; eventSink: string; controlInbox: string; capabilityToken: string };
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	structuredOutput?: StructuredOutputRuntime;
+	fileHandoffPath?: string;
 	fast?: boolean;
 	modelCandidates?: readonly string[];
 	toolBudget?: ResolvedToolBudget;
@@ -271,6 +272,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 			enabled: input.waitToolEnabled ?? true,
 			...(input.waitToolDefaultTimeoutMs !== undefined ? { defaultTimeoutMs: input.waitToolDefaultTimeoutMs } : {}),
 		},
+		...(input.fileHandoffPath ? { fileHandoffPath: input.fileHandoffPath } : {}),
 		...(input.structuredOutput
 			? {
 				structuredOutput: {
