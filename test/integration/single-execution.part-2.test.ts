@@ -1921,7 +1921,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(mockPi.callCount(), 2);
 	});
 
-	it("preserves an agent default output contract when foreground workflow resume omits output", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("requires a fresh explicit output when resuming a published file-only handoff", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const configuredOutput = path.join(tempDir, "configured-resume-output.md");
 		const agent = makeAgent("echo", { output: configuredOutput, outputMode: "file-only" });
 		const executor = makeExecutor([agent]);
@@ -1952,10 +1952,16 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			makeMinimalCtx(tempDir),
 		);
 
-		assert.equal(resumedResult.isError, undefined, resumedResult.content[0]?.text ?? "workflow failed");
-		const resumed = resumedResult.details.results[0];
-		assert.match(resumed?.finalOutput ?? "", new RegExp(`Output saved to: ${escapeRegExp(configuredOutput)}`));
-		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "resumed report");
+		assert.equal(resumedResult.isError, true);
+		assert.match(JSON.stringify(resumedResult), /explicit output parameter/);
+		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "first report");
+		const freshOutput = path.join(tempDir, "head-2.md");
+		const repaired = await executor.execute("workflow-agent-output-fresh", {
+			async: false, workflowScript: `return runs.run("fresh", { resume: ${JSON.stringify(first.runId)}, task: "Resume with the new output", output: ${JSON.stringify(freshOutput)} });`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(repaired.isError, undefined, JSON.stringify(repaired));
+		assert.equal(fs.readFileSync(freshOutput, "utf-8"), "resumed report");
+		assert.equal(fs.readFileSync(configuredOutput, "utf-8"), "first report");
 	});
 
 	it("preserves failed foreground resume errors and transcript metadata", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -4739,7 +4745,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.progress.status, "failed");
 	});
 
-	it("treats an unchanged pre-existing file-only output as missing on dirty foreground timeout", async () => {
+	it("rejects a pre-existing file-only output before a worker can dirty the tree", async () => {
 		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
 		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
 		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
@@ -4761,11 +4767,9 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			acceptance: false,
 		});
 
-		assert.equal(result.timedOut, true);
-		assert.deepEqual(result.timeoutRecovery?.changedFiles, ["input.md"]);
-		assert.equal(result.timeoutRecovery?.reportStatus, "missing");
-		assert.equal(result.timeoutRecovery?.recoveryNeeded, true);
-		assert.match(result.finalOutput ?? "", /requested report: missing/i);
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? result.finalOutput ?? "", /cannot reuse a published file-only output/);
+		assert.equal(fs.readFileSync(path.join(tempDir, "input.md"), "utf-8"), "base\n");
 		assert.equal(fs.readFileSync(reportPath, "utf-8"), "stale report\n");
 	});
 

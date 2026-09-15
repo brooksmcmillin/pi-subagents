@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { permissionDecision } from "./permissions.ts";
+import { registerFileHandoffGuard } from "./file-handoff.ts";
 import type { SteerRequest } from "../background/control-channel.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, isRuntimeAcknowledgedExtensionId } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, validateStructuredOutputValue } from "./structured-output.ts";
@@ -488,6 +489,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	registerRuntimeExtensionAcknowledgements(pi, config.runtimeAcknowledgements);
 	registerPermissionGate(pi, config.permissions, config.childWatchdog);
 	registerToolBudget(pi, config.toolBudget);
+	registerFileHandoffGuard(pi, config.fileHandoffPath);
 	registerChildWatchdog(pi, config.childWatchdog, config.watchdogStatus);
 	const waitState = config.runtimeState ?? {
 		baseCwd: "",

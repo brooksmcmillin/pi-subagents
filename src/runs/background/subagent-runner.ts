@@ -959,7 +959,7 @@ export async function runSingleStepInner(
 				}
 				const output = settled.output;
 				try { fs.writeFileSync(ctx.outputFile, output, "utf-8"); } catch { /* Observability output is best-effort. */ }
-				const resolvedOutput = step.outputPath ? resolveSingleOutput(step.outputPath, output, outputSnapshot, { expectedClaimPath: step.outputClaimPath }) : { fullOutput: output };
+				const resolvedOutput = step.outputPath ? resolveSingleOutput(step.outputPath, output, outputSnapshot, { expectedClaimPath: step.outputClaimPath, immutable: step.outputMode === "file-only" }) : { fullOutput: output };
 				const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
 				const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({ fullOutput: resolvedOutput.fullOutput, outputPath: step.outputPath, outputMode: step.outputMode, exitCode: 1, preserveSavedOutput: true, savedPath: resolvedOutput.savedPath, outputReference, saveError: resolvedOutput.saveError }));
 				const artifactErrors = artifactPaths && ctx.artifactConfig?.enabled !== false ? persistStepArtifacts({ artifactPaths, artifactConfig: ctx.artifactConfig, output: formatOutputArtifactContent(omitUndefinedProperties({ output: resolvedOutput.fullOutput, metadataPath: ctx.artifactConfig?.includeMetadata === false ? undefined : artifactPaths.metadataPath })), metadata: { runId: ctx.id, agent: step.agent, task: PROMPT_REDACTED, runner, placement: session.owner.identity, settlement: settled.settlement, outcome: settled.outcome, timestamp: Date.now() } }) : {};
@@ -1014,7 +1014,7 @@ export async function runSingleStepInner(
 		const external = step.machine ? decorateHerdrMachineResult(ran, step.machine, step.runner.adapter) : ran;
 		try { fs.writeFileSync(ctx.outputFile, external.output, "utf-8"); } catch { /* Observability output is best-effort. */ }
 		const resolvedOutput = step.outputPath && external.exitCode === 0
-			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, { expectedClaimPath: step.outputClaimPath })
+			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, { expectedClaimPath: step.outputClaimPath, immutable: step.outputMode === "file-only" })
 			: { fullOutput: external.output };
 		const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
 		const exitCode = resolvedOutput.fatalError ? 1 : external.exitCode;
@@ -1085,7 +1085,7 @@ export async function runSingleStepInner(
 		}));
 		try { fs.writeFileSync(ctx.outputFile, external.output, "utf-8"); } catch { /* Observability output is best-effort. */ }
 		const resolvedOutput = step.outputPath && external.exitCode === 0
-			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, { expectedClaimPath: step.outputClaimPath })
+			? resolveSingleOutput(step.outputPath, external.output, outputSnapshot, { expectedClaimPath: step.outputClaimPath, immutable: step.outputMode === "file-only" })
 			: { fullOutput: external.output };
 		const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, resolvedOutput.fullOutput) : undefined;
 		const exitCode = resolvedOutput.fatalError ? 1 : external.exitCode;
@@ -1576,6 +1576,7 @@ export async function runSingleStepInner(
 		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, {
 			authoritative: validatedStructuredOutput,
 			expectedClaimPath: step.outputClaimPath,
+			immutable: step.outputMode === "file-only",
 		})
 		: { fullOutput: outputForPersistence };
 	if (validatedStructuredOutput && step.outputPath && finalResult?.exitCode === 0 && (!resolvedOutput.savedPath || resolvedOutput.saveError) && finalResult) {

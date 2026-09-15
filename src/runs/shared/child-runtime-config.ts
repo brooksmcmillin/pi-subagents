@@ -93,6 +93,8 @@ export interface ChildRuntimeConfig {
 	holdFinalDrain?: (held: boolean) => void;
 	/** Installation-local downward owner-channel barrier; never inherited or serialized into descendants. */
 	hasPendingSupervisorRequest?: () => boolean;
+	/** Terminal file-only output; never inherited by nested children. */
+	fileHandoffPath?: string;
 	structuredOutput?: ChildStructuredOutput;
 	requiredTools?: string[];
 	mcpDirectTools?: string[];

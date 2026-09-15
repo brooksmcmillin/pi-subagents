@@ -436,6 +436,7 @@ async function runSingleAttempt(
 		parentSessionId: options.parentSessionId,
 		forkCacheKey: options.context === "fork" ? deriveForkPromptCacheKey(options.parentSessionId) : undefined,
 		structuredOutput: options.structuredOutput,
+		...(options.outputMode === "file-only" && options.outputPath ? { fileHandoffPath: options.outputPath } : {}),
 		fast: options.fast ?? agent.fast,
 		modelCandidates: shared.modelCandidates,
 		toolBudget: options.toolBudget,
@@ -1634,7 +1635,7 @@ async function runSingleAttempt(
 			options.outputPath,
 			outputForPersistence,
 			shared.outputSnapshot,
-			{ authoritative: validatedStructuredOutput, expectedClaimPath: options.outputClaimPath },
+			{ authoritative: validatedStructuredOutput, expectedClaimPath: options.outputClaimPath, immutable: options.outputMode === "file-only" },
 		);
 		fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 		result.savedOutputPath = resolvedOutput.savedPath;
