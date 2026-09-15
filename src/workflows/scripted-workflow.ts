@@ -29,7 +29,7 @@ export interface WorkflowScriptValidationError {
 
 export interface WorkflowScriptValidationWarning {
 	message: string;
-	kind: "dynamic-spawn-count";
+	kind: "dynamic-spawn-count" | "keyed-result-access";
 }
 
 export interface WorkflowScriptValidationResult {
@@ -1763,6 +1763,7 @@ function staticWorkflowLaunchPlan(workflowBody: AstNode): { keys: string[]; dyna
 /** Parse a workflowScript and apply only rules that are decidable from its local syntax. */
 export function validateWorkflowScript(script: string, options: WorkflowScriptValidationOptions = {}): WorkflowScriptValidationResult {
 	const errors: WorkflowScriptValidationError[] = [];
+	const warnings: WorkflowScriptValidationWarning[] = [];
 	if (!script.trim()) return { ok: false, errors: [{ message: "workflowScript must not be empty." }] };
 	let root: AstNode;
 	try {
@@ -1841,13 +1842,13 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				for (const later of workflowBody.body.slice(statementIndex + 1)) walkAst(later, (node) => {
 					if (node.type !== "MemberExpression" || !astNode(node.object) || node.object.type !== "Identifier" || node.object.name !== name) return;
 					const property = node.computed === true ? literalString(node.property) : astNode(node.property) && node.property.type === "Identifier" ? node.property.name as string : undefined;
-					if (property && keys.has(property) && !(property in arrayResultShape)) errors.push({ message: `runs.all returns an ordered array; '${name}.${property}' is keyed access. Use an index, destructuring, or map(...).`, ...nodeLocation(node) });
+					// This local scan cannot prove binding identity after reassignment or shadowing.
+					if (property && keys.has(property) && !(property in arrayResultShape)) warnings.push({ kind: "keyed-result-access", message: `runs.all returns an ordered array; '${name}.${property}' may be keyed access. Use an index, destructuring, or map(...) unless the binding or value has changed. Runtime checks remain authoritative.`, ...nodeLocation(node) });
 				}, false);
 			}
 		}
 	}
 
-	const warnings: WorkflowScriptValidationWarning[] = [];
 	if (options.maxSubagentSpawnsPerRun !== undefined) {
 		const plan = staticWorkflowLaunchPlan(workflowBody);
 		if (plan.keys.length > options.maxSubagentSpawnsPerRun) {

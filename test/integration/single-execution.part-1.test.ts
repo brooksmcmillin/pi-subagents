@@ -3723,7 +3723,7 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state !== "started").map(({ state }) => state).sort(), ["completed", "failed"]);
 	});
 
-	it("rejects keyed runs.all result access before siblings launch", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("reports keyed runs.all result access after siblings settle", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "first child completed", matchArgIncludes: "First task" });
 		mockPi.onCall({ output: "second child completed", matchArgIncludes: "Second task" });
 		const executor = makeExecutor([makeAgent("echo")]);
@@ -3746,10 +3746,30 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, true);
-		assert.equal(mockPi.callCount(), 0);
-		assert.match(result.content[0]?.text ?? "", /runs\.all returns an ordered array/);
-		assert.match(result.content[0]?.text ?? "", /Use an index, destructuring, or map/);
-		assert.equal(result.details.workflow, undefined);
+		assert.equal(mockPi.callCount(), 2);
+		assert.match(result.content[0]?.text ?? "", /runs\.all resolves to an ordered array, not a key map/);
+		assert.match(result.content[0]?.text ?? "", /Use results\[0\], array destructuring, or results\.map/);
+		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state === "completed").map(({ key }) => key).sort(), ["first", "second"]);
+	});
+
+	it("allows result rebinding and shadowing through automatic script preflight", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		for (const [index, tail] of [
+			`results = { first: 1 }; return results.first;`,
+			`{ const results = { first: 1 }; return results.first; }`,
+			`const alias = results; alias.first = 1; return results.first;`,
+			`if (true) results = { first: 1 }; return results.first;`,
+			`function rebind() { results = { first: 1 }; } rebind(); return results.first;`,
+		].entries()) {
+			mockPi.onCall({ output: "reviewed" });
+			const result = await makeExecutor([makeAgent("echo")]).executePublic(
+				`rebound-result-${index}`,
+				{ async: false, workflowScript: `let results = await runs.all([{ key: "first", agent: "echo", task: "Review" }]); ${tail}` },
+				new AbortController().signal, undefined, makeMinimalCtx(tempDir),
+			);
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.equal(result.details.workflow?.value, 1);
+		}
+		assert.equal(mockPi.callCount(), 5);
 	});
 
 	it("keeps array access working when runs.all child keys collide with array properties", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

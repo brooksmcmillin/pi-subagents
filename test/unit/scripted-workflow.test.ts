@@ -145,7 +145,7 @@ describe("scripted workflow runtime", () => {
 		assert.equal(structural.ok, false);
 		assert.ok(structural.errors.some((error) => error.message.includes("runs.all item key")));
 		assert.ok(structural.errors.some((error) => error.message.includes("nested async functions")));
-		assert.ok(structural.errors.some((error) => error.message.includes("ordered array")));
+		assert.ok(structural.warnings?.some((warning) => warning.kind === "keyed-result-access"));
 
 		const invalidRunKey = validateWorkflowScript(`return runs.run("bad key", { agent: "worker" });`);
 		assert.equal(invalidRunKey.ok, false);
@@ -395,8 +395,22 @@ describe("scripted workflow runtime", () => {
 			`const results = await runs.all([{ key: "someChild", agent: "reviewer", task: "Review" }]);`,
 			`return results.someChild;`,
 		].join("\n"));
-		assert.equal(keyed.ok, false);
-		assert.ok(keyed.errors.some((error) => error.message.includes("'results.someChild' is keyed access")));
+		assert.equal(keyed.ok, true);
+		assert.ok(keyed.warnings?.some((warning) => warning.message.includes("'results.someChild' may be keyed access")));
+	});
+
+	it("does not reject changed or shadowed runs.all result bindings", () => {
+		for (const tail of [
+			`results = { first: 1 }; return results.first;`,
+			`{ const results = { first: 1 }; return results.first; }`,
+			`const alias = results; alias.first = 1; return results.first;`,
+			`if (true) results = { first: 1 }; return results.first;`,
+			`function rebind() { results = { first: 1 }; } rebind(); return results.first;`,
+		]) {
+			const validation = validateWorkflowScript(`let results = await runs.all([{key:"first",agent:"echo",task:"Review"}]); ${tail}`);
+			assert.equal(validation.ok, true, tail);
+			assert.deepEqual(validation.errors, []);
+		}
 	});
 
 	it("rejects statically non-JSON workflow boundary values", () => {

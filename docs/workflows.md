@@ -114,7 +114,7 @@ subagent({
 
 These controls are opt-in. Avoid tight hard budgets for mutation-capable workers unless the workflow has an explicit checkpoint and handoff path.
 
-The diagnostic result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, statically non-array `runs.all` arguments, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not discover agents, launch children, or create run artifacts.
+The diagnostic result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, statically non-array `runs.all` arguments, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, and statically clear non-JSON boundary values. Suspected keyed access to a `runs.all` result is advisory: local syntax cannot prove binding identity after reassignment, shadowing, or mutation. Runtime access checks remain authoritative. Dynamic keys and other runtime-only values are accepted; dynamic spawn counts may produce advisory warnings. Validation does not discover agents, launch children, or create run artifacts.
 
 ```js
 subagent({ workflowScript: `
