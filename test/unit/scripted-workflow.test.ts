@@ -165,6 +165,18 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(validateWorkflowScript(`return runs.run("same", { agent: selectedAgent });`), { ok: true, errors: [] });
 	});
 
+	it("rejects literal non-array fanout inputs while leaving dynamic arrays to runtime", () => {
+		for (const argument of ["", "{}", "null", "42", "false", '"text"', "`text`", "() => []", "function () { return []; }"]) {
+			const result = validateWorkflowScript(`return runs.all(${argument});`);
+			assert.equal(result.ok, false, argument);
+			assert.match(result.errors[0]?.message ?? "", /requires an array of keyed child configs/);
+			assert.equal(result.errors[0]?.line, 1);
+		}
+		for (const argument of ["[]", '[{ key: "first", agent: "worker" }]', "items", "items.map(makeChild)", "makeItems()", "...inputs"]) {
+			assert.deepEqual(validateWorkflowScript(`return runs.all(${argument});`), { ok: true, errors: [] });
+		}
+	});
+
 	it("reports literal child baseRef policy errors with source locations offline", () => {
 		for (const [call, value] of [
 			["run", JSON.stringify("a".repeat(40))],

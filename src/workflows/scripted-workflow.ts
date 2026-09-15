@@ -1798,6 +1798,9 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		if (directRunsCall(node, "all")) {
 			for (const entry of directRunsAllKeys(node)) if (!KEY_PATTERN.test(entry.key)) errors.push({ message: "runs.all item key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(entry.node) });
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
+			if (args.length === 0 || (astNode(args[0]) && ["ObjectExpression", "Literal", "TemplateLiteral", "FunctionExpression", "ArrowFunctionExpression"].includes(args[0].type))) {
+				errors.push({ message: "runs.all requires an array of keyed child configs, not an object map or scalar.", ...nodeLocation(node) });
+			}
 			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
 				for (const item of args[0].elements) if (astNode(item)) {
 					errors.push(...validateStaticBaseRef(item, "runs.all item"));
