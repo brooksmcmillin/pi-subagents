@@ -5140,14 +5140,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const workflowArgsEvidence = requestParams.args === undefined ? undefined : { args: requestParams.args, argsDigest: stableJsonDigest(requestParams.args) };
 			const workflowArgs = workflowArgsEvidence?.args;
 			const workflowArgsDigest = workflowArgsEvidence?.argsDigest;
-			const spawnBudgetValidation = validateWorkflowScript(requestParams.workflowScript, {
+			const validation = validateWorkflowScript(requestParams.workflowScript, {
 				maxSubagentSpawnsPerRun: requestParams.maxSubagentSpawnsPerRun ?? resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun),
 			});
-			const spawnBudgetErrors = spawnBudgetValidation.errors.filter((error) => error.kind === "spawn-budget");
-			if (spawnBudgetErrors.length > 0) {
-				return buildRequestedModeError(requestParams, `workflowScript validation failed before child launch; no children launched. ${spawnBudgetErrors.map((error) => error.message).join(" ")}`);
+			if (!validation.ok) {
+				return buildRequestedModeError(requestParams, `workflowScript validation failed before run creation; no children launched. ${validation.errors.map((error) => `${error.line === undefined ? "" : `line ${error.line}:${error.column ?? 0}: `}${error.message}`).join(" ")}`);
 			}
-			for (const warning of spawnBudgetValidation.warnings ?? []) console.warn(`[pi-subagents] ${warning.message}`);
+			for (const warning of validation.warnings ?? []) console.warn(`[pi-subagents] ${warning.message}`);
 			const acceptanceErrors = validateAcceptanceInput(requestParams.acceptance);
 			if (acceptanceErrors.length > 0) return buildRequestedModeError(requestParams, acceptanceErrors.join(" "));
 			const foregroundWorkflowRunId = encodeIndexSegment(_id);

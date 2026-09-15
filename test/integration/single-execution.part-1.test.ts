@@ -861,11 +861,49 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /validation failed before child launch; no children launched/);
+		assert.match(result.content[0]?.text ?? "", /validation failed before run creation; no children launched/);
 		assert.match(result.content[0]?.text ?? "", /'a', 'b', 'c', 'owner', 'review', 'owner-fix'/);
 		assert.match(result.content[0]?.text ?? "", /minimum required: 6; configured: 5/);
 		assert.equal(mockPi.callCount(), 0);
 		assert.deepEqual(fs.readdirSync(tempDir).sort(), before);
+	});
+
+	it("rejects invalid scripts before async allocation without an explicit validate call", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const asyncJobs: SubagentState["asyncJobs"] = new Map();
+		const executor = makeExecutor([makeAgent("echo")], {}, true, undefined, true, asyncJobs, undefined, undefined, createEventBus(), () => {
+			throw new Error("invalid scripts must not discover or launch agents");
+		});
+		const scripts = [
+			"{",
+			`return runs.run("bad key", { agent: "echo", task: "Never launch" });`,
+			`return runs.all({ first: { agent: "echo", task: "Wrong fanout syntax" } });`,
+			`const lane = async () => runs.run("child", { agent: "echo" }); return lane();`,
+		];
+		for (const [index, script] of scripts.entries()) {
+			const scriptPath = path.join(tempDir, `invalid-${index}.js`);
+			fs.writeFileSync(scriptPath, script);
+			for (const fileBacked of [false, true]) {
+				for (const asyncParams of [{ async: true }, {}]) {
+					const before = fs.readdirSync(tempDir, { recursive: true }).sort();
+					const agentBefore = fs.readdirSync(agentDir, { recursive: true }).sort();
+					const result = await executor.executePublic(
+						`invalid-script-${index}-${fileBacked}-${"async" in asyncParams}`,
+						{ ...asyncParams, ...(fileBacked ? { workflowScriptPath: scriptPath } : { workflowScript: script }) },
+						new AbortController().signal, undefined, makeMinimalCtx(tempDir),
+					);
+					assert.equal(result.isError, true);
+					assert.match(result.content[0]?.text ?? "", /validation failed before run creation; no children launched/);
+					assert.match(result.content[0]?.text ?? "", /line [0-9]+:/);
+					assert.equal(result.details.asyncId, undefined);
+					assert.equal(result.details.asyncDir, undefined);
+					assert.equal(result.details.workflow, undefined);
+					assert.equal(asyncJobs.size, 0);
+					assert.equal(mockPi.callCount(), 0);
+					assert.deepEqual(fs.readdirSync(tempDir, { recursive: true }).sort(), before);
+					assert.deepEqual(fs.readdirSync(agentDir, { recursive: true }).sort(), agentBefore);
+				}
+			}
+		}
 	});
 
 	it("validates workflow scripts without launching children or creating artifacts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1652,7 +1690,7 @@ Answer only from the supplied synthetic text.
 			});
 			const launchPromise = executor.execute(
 				"darwin-immediate-workflow-failure",
-				{ async: true, workflowScript: "{" },
+				{ async: true, workflowScript: "throw new Error('immediate runtime failure');" },
 				new AbortController().signal,
 				undefined,
 				{ ...makeMinimalCtx(tempDir), sessionManager: { getSessionId: () => "session-1700", getSessionFile: () => null } },
@@ -3553,8 +3591,8 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", new RegExp(`Workflow '${workflowId}' validation failed before child launch; no children launched`));
-		assert.match(result.content[0]?.text ?? "", /Parallel plus sequential rewrite/);
+		assert.match(result.content[0]?.text ?? "", /workflowScript validation failed before run creation; no children launched/);
+		assert.match(result.content[0]?.text ?? "", /does not support nested async functions/);
 		assert.deepEqual(result.details.results, []);
 	});
 
@@ -3714,6 +3752,26 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state === "completed").map(({ key }) => key).sort(), ["first", "second"]);
 	});
 
+	it("allows result rebinding and shadowing through automatic script preflight", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		for (const [index, tail] of [
+			`results = { first: 1 }; return results.first;`,
+			`{ const results = { first: 1 }; return results.first; }`,
+			`const alias = results; alias.first = 1; return results.first;`,
+			`if (true) results = { first: 1 }; return results.first;`,
+			`function rebind() { results = { first: 1 }; } rebind(); return results.first;`,
+		].entries()) {
+			mockPi.onCall({ output: "reviewed" });
+			const result = await makeExecutor([makeAgent("echo")]).executePublic(
+				`rebound-result-${index}`,
+				{ async: false, workflowScript: `let results = await runs.all([{ key: "first", agent: "echo", task: "Review" }]); ${tail}` },
+				new AbortController().signal, undefined, makeMinimalCtx(tempDir),
+			);
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.equal(result.details.workflow?.value, 1);
+		}
+		assert.equal(mockPi.callCount(), 5);
+	});
+
 	it("keeps array access working when runs.all child keys collide with array properties", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "length child completed", matchArgIncludes: "Length task" });
 		mockPi.onCall({ output: "map child completed", matchArgIncludes: "Map task" });
@@ -3807,7 +3865,7 @@ Answer only from the supplied synthetic text.
 
 		assert.equal(result.isError, true);
 		assert.equal(mockPi.callCount(), 0);
-		assert.match(result.content[0]?.text ?? "", /validation failed before child launch; no children launched/);
+		assert.match(result.content[0]?.text ?? "", /validation failed before run creation; no children launched/);
 		assert.match(result.content[0]?.text ?? "", /'first', 'second'.*minimum required: 2; configured: 1/);
 		assert.equal(result.details.workflow, undefined);
 	});

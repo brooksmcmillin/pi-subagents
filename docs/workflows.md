@@ -51,7 +51,7 @@ Workflow-level child controls default onto each `runs.run`/`runs.all` launch; ex
 
 Child results cross into the script as plain JSON data. Non-JSON host metadata is omitted, so use returned fields such as `runId`, `ok`, `output`, and `structuredOutput` for workflow control.
 
-Validate a script without launching children:
+Every script launch automatically runs static validation before allocating an async run, discovering agents, or launching children. This applies to inline and file-backed scripts; callers do not need a separate validation step. Dynamic values still receive runtime checks. Use `action: "validate"` only for a side-effect-free diagnostic preview:
 
 ```js
 subagent({ action: "validate", workflowScript: `
@@ -88,7 +88,7 @@ subagent({ workflow: "review", args: { task: "Review the change" } });
 subagent({ workflow: "run-ci", args: { command: "npm test" } });
 ```
 
-The host resolves the name and validates bounded plain-JSON `args` before starting the workflow. Resource provenance is recorded in workflow details and receipts for downstream permission/policy checks. Resource authority is not caller-supplied: `runs.host` is available only when the resolved resource explicitly grants the requested host key and command. Inline `workflowScript` and `workflowScriptPath` remain raw, unknown-provenance inputs, so their `runs.host` calls are unavailable through the public execution boundary. Named resources cannot be combined with `agent`, `task`, `workflowScript`, or `workflowScriptPath`; this first slice ships only the package-owned `review` and `run-ci` resources, not a user/project resource registry.
+The host resolves the name and validates bounded plain-JSON `args` before starting the workflow. Resource provenance is recorded in workflow details and receipts for downstream permission/policy checks. Resource authority is not caller-supplied: `runs.host` is available only when the resolved resource explicitly grants the requested host key and command. Inline `workflowScript` and `workflowScriptPath` remain raw, unknown-provenance inputs, so their `runs.host` calls are unavailable through the public execution boundary. Named resources cannot be combined with `agent`, `task`, `workflowScript`, or `workflowScriptPath`; package-owned `review` and `run-ci` resources are built in. Trusted extensions can register policy-owned workflows through the [workflow resource API](extension-api.md#trusted-workflow-resources).
 
 ### Opt-in bounded workflows
 
@@ -114,7 +114,7 @@ subagent({
 
 These controls are opt-in. Avoid tight hard budgets for mutation-capable workers unless the workflow has an explicit checkpoint and handoff path.
 
-The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not discover agents, launch children, or create run artifacts.
+The diagnostic result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, statically non-array `runs.all` arguments, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, and statically clear non-JSON boundary values. Suspected keyed access to a `runs.all` result is advisory: local syntax cannot prove binding identity after reassignment, shadowing, or mutation. Runtime access checks remain authoritative. Dynamic keys and other runtime-only values are accepted; dynamic spawn counts may produce advisory warnings. Validation does not discover agents, launch children, or create run artifacts.
 
 ```js
 subagent({ workflowScript: `

@@ -29,7 +29,7 @@ export interface WorkflowScriptValidationError {
 
 export interface WorkflowScriptValidationWarning {
 	message: string;
-	kind: "dynamic-spawn-count";
+	kind: "dynamic-spawn-count" | "keyed-result-access";
 }
 
 export interface WorkflowScriptValidationResult {
@@ -1763,6 +1763,7 @@ function staticWorkflowLaunchPlan(workflowBody: AstNode): { keys: string[]; dyna
 /** Parse a workflowScript and apply only rules that are decidable from its local syntax. */
 export function validateWorkflowScript(script: string, options: WorkflowScriptValidationOptions = {}): WorkflowScriptValidationResult {
 	const errors: WorkflowScriptValidationError[] = [];
+	const warnings: WorkflowScriptValidationWarning[] = [];
 	if (!script.trim()) return { ok: false, errors: [{ message: "workflowScript must not be empty." }] };
 	let root: AstNode;
 	try {
@@ -1798,6 +1799,9 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		if (directRunsCall(node, "all")) {
 			for (const entry of directRunsAllKeys(node)) if (!KEY_PATTERN.test(entry.key)) errors.push({ message: "runs.all item key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(entry.node) });
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
+			if (args.length === 0 || (astNode(args[0]) && ["ObjectExpression", "Literal", "TemplateLiteral", "FunctionExpression", "ArrowFunctionExpression"].includes(args[0].type))) {
+				errors.push({ message: "runs.all requires an array of keyed child configs, not an object map or scalar.", ...nodeLocation(node) });
+			}
 			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
 				for (const item of args[0].elements) if (astNode(item)) {
 					errors.push(...validateStaticBaseRef(item, "runs.all item"));
@@ -1838,13 +1842,13 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				for (const later of workflowBody.body.slice(statementIndex + 1)) walkAst(later, (node) => {
 					if (node.type !== "MemberExpression" || !astNode(node.object) || node.object.type !== "Identifier" || node.object.name !== name) return;
 					const property = node.computed === true ? literalString(node.property) : astNode(node.property) && node.property.type === "Identifier" ? node.property.name as string : undefined;
-					if (property && keys.has(property) && !(property in arrayResultShape)) errors.push({ message: `runs.all returns an ordered array; '${name}.${property}' is keyed access. Use an index, destructuring, or map(...).`, ...nodeLocation(node) });
+					// This local scan cannot prove binding identity after reassignment or shadowing.
+					if (property && keys.has(property) && !(property in arrayResultShape)) warnings.push({ kind: "keyed-result-access", message: `runs.all returns an ordered array; '${name}.${property}' may be keyed access. Use an index, destructuring, or map(...) unless the binding or value has changed. Runtime checks remain authoritative.`, ...nodeLocation(node) });
 				}, false);
 			}
 		}
 	}
 
-	const warnings: WorkflowScriptValidationWarning[] = [];
 	if (options.maxSubagentSpawnsPerRun !== undefined) {
 		const plan = staticWorkflowLaunchPlan(workflowBody);
 		if (plan.keys.length > options.maxSubagentSpawnsPerRun) {

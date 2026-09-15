@@ -145,7 +145,7 @@ describe("scripted workflow runtime", () => {
 		assert.equal(structural.ok, false);
 		assert.ok(structural.errors.some((error) => error.message.includes("runs.all item key")));
 		assert.ok(structural.errors.some((error) => error.message.includes("nested async functions")));
-		assert.ok(structural.errors.some((error) => error.message.includes("ordered array")));
+		assert.ok(structural.warnings?.some((warning) => warning.kind === "keyed-result-access"));
 
 		const invalidRunKey = validateWorkflowScript(`return runs.run("bad key", { agent: "worker" });`);
 		assert.equal(invalidRunKey.ok, false);
@@ -163,6 +163,18 @@ describe("scripted workflow runtime", () => {
 
 		assert.deepEqual(validateWorkflowScript(`return runs.all([{ ...{ key: "bad key" }, agent: "worker" }]);`), { ok: true, errors: [] });
 		assert.deepEqual(validateWorkflowScript(`return runs.run("same", { agent: selectedAgent });`), { ok: true, errors: [] });
+	});
+
+	it("rejects literal non-array fanout inputs while leaving dynamic arrays to runtime", () => {
+		for (const argument of ["", "{}", "null", "42", "false", '"text"', "`text`", "() => []", "function () { return []; }"]) {
+			const result = validateWorkflowScript(`return runs.all(${argument});`);
+			assert.equal(result.ok, false, argument);
+			assert.match(result.errors[0]?.message ?? "", /requires an array of keyed child configs/);
+			assert.equal(result.errors[0]?.line, 1);
+		}
+		for (const argument of ["[]", '[{ key: "first", agent: "worker" }]', "items", "items.map(makeChild)", "makeItems()", "...inputs"]) {
+			assert.deepEqual(validateWorkflowScript(`return runs.all(${argument});`), { ok: true, errors: [] });
+		}
 	});
 
 	it("reports literal child baseRef policy errors with source locations offline", () => {
@@ -383,8 +395,22 @@ describe("scripted workflow runtime", () => {
 			`const results = await runs.all([{ key: "someChild", agent: "reviewer", task: "Review" }]);`,
 			`return results.someChild;`,
 		].join("\n"));
-		assert.equal(keyed.ok, false);
-		assert.ok(keyed.errors.some((error) => error.message.includes("'results.someChild' is keyed access")));
+		assert.equal(keyed.ok, true);
+		assert.ok(keyed.warnings?.some((warning) => warning.message.includes("'results.someChild' may be keyed access")));
+	});
+
+	it("does not reject changed or shadowed runs.all result bindings", () => {
+		for (const tail of [
+			`results = { first: 1 }; return results.first;`,
+			`{ const results = { first: 1 }; return results.first; }`,
+			`const alias = results; alias.first = 1; return results.first;`,
+			`if (true) results = { first: 1 }; return results.first;`,
+			`function rebind() { results = { first: 1 }; } rebind(); return results.first;`,
+		]) {
+			const validation = validateWorkflowScript(`let results = await runs.all([{key:"first",agent:"echo",task:"Review"}]); ${tail}`);
+			assert.equal(validation.ok, true, tail);
+			assert.deepEqual(validation.errors, []);
+		}
 	});
 
 	it("rejects statically non-JSON workflow boundary values", () => {
