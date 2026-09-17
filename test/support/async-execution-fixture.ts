@@ -645,8 +645,8 @@ export function installAsyncExecutionHooks(): void {
 		});
 	}
 
-	async function readAsyncPayload(id: string): Promise<AsyncResultPayload> {
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
+	async function readAsyncPayload(id: string, timeoutMs = 10_000): Promise<AsyncResultPayload> {
+		const resultPath = await waitForAsyncResultFile(id, timeoutMs);
 		return JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 	}
 

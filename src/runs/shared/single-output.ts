@@ -243,15 +243,17 @@ function persistSingleOutput(
 		const claimError = outputClaimError(outputPath, expectedClaimPath);
 		if (claimError) return { error: claimError, fatalError: true };
 		fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-		fs.writeFileSync(outputPath, fullOutput, { encoding: "utf-8", flag: immutable ? "wx" : "w" });
-		return { savedPath: outputPath };
-	} catch (err) {
-		if (immutable && (err as NodeJS.ErrnoException).code === "EEXIST") {
+		try {
+			fs.writeFileSync(outputPath, fullOutput, { encoding: "utf-8", flag: immutable ? "wx" : "w" });
+		} catch (err) {
+			if (!immutable || (err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 			try {
 				if (!fs.lstatSync(outputPath).isSymbolicLink() && fs.readFileSync(outputPath, "utf8") === fullOutput) return { savedPath: outputPath };
 			} catch { /* Fail closed below. */ }
 			return { error: "Published file-only output differs; use a fresh output path.", fatalError: true };
 		}
+		return { savedPath: outputPath };
+	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err), ...(immutable ? { fatalError: true } : {}) };
 	}
 }
