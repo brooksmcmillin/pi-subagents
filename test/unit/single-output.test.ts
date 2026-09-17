@@ -40,6 +40,19 @@ describe("immutable file-only handoffs", () => {
 		assert.equal(fs.readFileSync(prior, "utf8"), "original");
 	});
 
+	it("preserves parent directory errors for immutable output", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-output-"));
+		tempDirs.push(dir);
+		const parent = path.join(dir, "blocked-parent");
+		fs.writeFileSync(parent, "not a directory");
+		const output = path.join(parent, "report.json");
+		const result = resolveSingleOutput(output, "report", undefined, { authoritative: true, immutable: true });
+		assert.equal(result.fatalError, true);
+		assert.match(result.saveError!, /EEXIST|ENOTDIR|not a directory/i);
+		assert.equal(result.savedPath, undefined);
+		assert.equal(fs.readFileSync(parent, "utf8"), "not a directory");
+	});
+
 	it("allows identical persistence replay but never replaces published bytes", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-output-"));
 		tempDirs.push(dir);

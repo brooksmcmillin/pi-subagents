@@ -3596,7 +3596,7 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(result.details.results, []);
 	});
 
-	it("replaces stale workflow output when a child claims its path but writes no report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("rejects a workflow child reusing a published file-only output before launch", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const sharedOutput = path.join(tempDir, "failed-review.md");
 		fs.writeFileSync(sharedOutput, "stale workflow output", "utf-8");
 		mockPi.onCall({ exitCode: 1, stderr: "review child failed before writing output" });
@@ -3624,9 +3624,10 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /review child failed before writing output/);
+		assert.match(result.content[0]?.text ?? "", /cannot reuse a published file-only output/);
+		assert.equal(mockPi.callCount(), 0);
 		const workflowOutput = fs.readFileSync(sharedOutput, "utf-8");
-		assert.match(workflowOutput, /Workflow failed:.*review child failed before writing output/s);
+		assert.match(workflowOutput, /Workflow failed:.*cannot reuse a published file-only output/s);
 		assert.doesNotMatch(workflowOutput, /stale workflow output/);
 	});
 

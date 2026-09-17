@@ -403,7 +403,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(recovery.intercomBridge, { mode: "off" });
 		assert.deepEqual(recovery.tools, ["read"]);
 		assert.equal(recovery.systemPrompt, "Base prompt");
-		const payload = await readAsyncPayload(id);
+		// Cold child startup competes with the full integration suite on CI.
+		const payload = await readAsyncPayload(id, 30_000);
 		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete" && candidate.runtimeAcknowledgedExtensions !== undefined);
 		assert.equal(payload.launchContractDigest, launch.details.launchContractDigest);
 		assert.equal(payload.results[0]?.launchContractDigest, launch.details.launchContractDigest);
