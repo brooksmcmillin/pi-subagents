@@ -1,5 +1,4 @@
 import * as nodeModule from "node:module";
-import { pathToFileURL } from "node:url";
 
 const aliases = JSON.parse(process.env.JITI_ALIAS ?? "{}");
 const nativeRunner = process.env.PI_ASYNC_NATIVE_RUNNER === "1";
@@ -11,7 +10,8 @@ if (typeof nodeModule.registerHooks === "function") {
 	nodeModule.registerHooks({
 		resolve(specifier, context, nextResolve) {
 			if ((nativeRunner ? aliases[specifier] : redirected.has(specifier) && aliases[specifier])) {
-				return nextResolve(pathToFileURL(aliases[specifier]).href, context);
+				// This hook also serves require.resolve, which cannot resolve file URLs.
+				return nextResolve(aliases[specifier], context);
 			}
 			try {
 				return nextResolve(specifier, context);

@@ -19,6 +19,13 @@ try {
 	fs.writeFileSync(path.join(root, "dep.ts"), 'export const value: string = "TS_REDIRECT";\n');
 	fs.writeFileSync(path.join(root, "target.ts"), [
 		'import { identity } from "@earendil-works/pi-tui";',
+		...(expected === "native" ? [
+			'import assert from "node:assert/strict";',
+			'import { createRequire } from "node:module";',
+			'const require = createRequire(import.meta.url);',
+			`assert.equal(require.resolve("@earendil-works/pi-tui"), ${JSON.stringify(fs.realpathSync(aliasTarget))});`,
+			'assert.equal(require("@earendil-works/pi-tui").identity, identity);',
+		] : []),
 		expected === "native" ? 'import { value } from "./dep.js";' : 'const value = "JITI";',
 		`if (identity !== "HOST_TUI_IDENTITY" || value !== ${JSON.stringify(expected === "native" ? "TS_REDIRECT" : "JITI")}) throw new Error("wrong loader identity");`,
 		`console.log(${JSON.stringify(`PASS_${expected.toUpperCase()}_LOADER`)})`,
