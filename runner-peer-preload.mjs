@@ -1,4 +1,5 @@
 import * as nodeModule from "node:module";
+import { pathToFileURL } from "node:url";
 
 const aliases = JSON.parse(process.env.JITI_ALIAS ?? "{}");
 const nativeRunner = process.env.PI_ASYNC_NATIVE_RUNNER === "1";
@@ -9,9 +10,10 @@ const redirected = new Set([
 if (typeof nodeModule.registerHooks === "function") {
 	nodeModule.registerHooks({
 		resolve(specifier, context, nextResolve) {
-			if ((nativeRunner ? aliases[specifier] : redirected.has(specifier) && aliases[specifier])) {
-				// This hook also serves require.resolve, which cannot resolve file URLs.
-				return nextResolve(aliases[specifier], context);
+			const alias = nativeRunner ? aliases[specifier] : redirected.has(specifier) && aliases[specifier];
+			if (alias) {
+				// CommonJS needs a filesystem path; ESM needs a URL on Windows.
+				return nextResolve(context.conditions.includes("require") ? alias : pathToFileURL(alias).href, context);
 			}
 			try {
 				return nextResolve(specifier, context);
@@ -23,6 +25,6 @@ if (typeof nodeModule.registerHooks === "function") {
 	});
 } else {
 	nodeModule.register(new URL("./runner-peer-loader.mjs", import.meta.url), {
-		data: { aliases },
+		data: { aliases, nativeRunner },
 	});
 }

@@ -77,7 +77,6 @@ describe("agent management config parsing", () => {
 			"aliases: capability",
 			"tools: read, grep, mcp:github/search",
 			"model: openai/gpt-5-mini",
-			"fallbackModels: openai/gpt-5-mini-fallback",
 			"async: true",
 			"timeoutMs: 123",
 			"thinking: high",
@@ -127,7 +126,7 @@ describe("agent management config parsing", () => {
 		assert.ok(row);
 		assert.equal(row.executable, true);
 		assert.deepEqual(row.tools, { ambient: false, names: ["read", "grep"], mcpDirectTools: ["github/search"], mutationTools: ["edit", "write"] });
-		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", fallbackModels: ["openai/gpt-5-mini-fallback"], thinking: "high" });
+		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", thinking: "high" });
 		assert.deepEqual(row.execution, { defaultAsync: true, timeoutMs: 123 });
 		assert.deepEqual(row.acceptance, {
 			policy: {
@@ -157,8 +156,8 @@ describe("agent management config parsing", () => {
 		assert.ok(capabilities);
 		const reviewer = capabilities.agents.find((agent) => agent.name === "reviewer");
 		assert.ok(reviewer, "reviewer builtin should be present in capability output");
-		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "bash", "inspection_shell", "contact_supervisor"]);
-		assert.match(readText(listed), /Tools: read, grep, find, ls, bash, inspection_shell, contact_supervisor/);
+		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "bash", "inspection_shell", "watchdog_diff", "contact_supervisor"]);
+		assert.match(readText(listed), /Tools: read, grep, find, ls, bash, inspection_shell, watchdog_diff, contact_supervisor/);
 		assert.equal("acceptance" in reviewer, false);
 	});
 
@@ -982,33 +981,6 @@ Advise only.
 		assert.match(readText(invalid), /config\.acceptanceRole must be 'read-only', 'writer', or false/);
 	});
 
-	it("creates agents with completion guard disabled", () => {
-		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
-		const result = handleCreate(
-			{ config: { name: "test-runner", description: "Run tests", scope: "project", tools: "read, grep, bash, ls", completionGuard: false } },
-			ctx,
-		);
-
-		assert.equal(result.isError, false);
-		const filePath = path.join(tempDir, ".pi", "agents", "test-runner.md");
-		const content = fs.readFileSync(filePath, "utf-8");
-		assert.match(content, /^completionGuard: false$/m);
-
-		const got = handleManagementAction("get", { agent: "test-runner" }, ctx);
-		assert.equal(got.isError, false);
-		assert.match(readText(got), /Completion guard: false/);
-	});
-
-	it("rejects non-boolean completion guard config", () => {
-		const result = handleCreate(
-			{ config: { name: "test-runner", description: "Run tests", scope: "project", completionGuard: "false" } },
-			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
-		);
-
-		assert.equal(result.isError, true);
-		assert.match(readText(result), /config\.completionGuard must be a boolean/);
-	});
-
 	it("creates agents with subagent-only extensions", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const result = handleCreate(
@@ -1240,7 +1212,7 @@ Drive the failing test first.
 		});
 	}
 
-	it("shows runtime agents but refuses edits without writing configuration", async () => {
+	it("shows provider-scoped runtime agent metadata but refuses edits without writing configuration", async () => {
 		const sent: Array<{ content?: string }> = [];
 		const notified: string[] = [];
 		const pi = {
@@ -1253,15 +1225,28 @@ Drive the failing test first.
 			definition: { description: "Runtime admin helper", systemPrompt: "Help at runtime." },
 		});
 		try {
+			fs.mkdirSync(path.join(tempDir, "agent-home"), { recursive: true });
+			fs.writeFileSync(path.join(tempDir, "agent-home", "settings.json"), JSON.stringify({
+				subagents: {
+					agentOverridesByProvider: {
+						custom: { "runtime-admin-helper": { model: "custom/provider-model", thinking: "high" } },
+					},
+				},
+			}));
 			await openSubagentsAdmin(pi, {
 				cwd: tempDir, hasUI: false,
 				modelRegistry: { getAvailable: () => [] },
+				model: { provider: "custom", id: "session-model" },
 			} as never, "runtime-admin-helper");
 			assert.match(sent.at(-1)?.content ?? "", /Agent: runtime-admin-helper \(runtime\)/);
+			assert.match(sent.at(-1)?.content ?? "", /Model: custom\/provider-model/);
+			assert.match(sent.at(-1)?.content ?? "", /Thinking: high/);
+			fs.rmSync(path.join(tempDir, "agent-home", "settings.json"));
 
 			await openSubagentsAdmin(pi, {
 				cwd: tempDir, hasUI: true,
 				modelRegistry: { getAvailable: () => [{ provider: "custom", id: "new-model" }] },
+				model: { provider: "custom", id: "session-model" },
 				ui: {
 					select: async () => "custom/new-model",
 					notify: (message: string) => notified.push(message),
@@ -1545,11 +1530,9 @@ Drive the failing test first.
 				agentOverrides: {
 					implementer: {
 						thinking: "high",
-						fallbackModels: ["openai/gpt-5-mini"],
 						tools: ["bash"],
 						skills: ["override-skill"],
 						defaultContext: "fork",
-						completionGuard: false,
 						toolBudget: { hard: 3 },
 					},
 				},
@@ -1558,12 +1541,10 @@ Drive the failing test first.
 		fs.writeFileSync(agentPath, `---
 name: implementer
 description: TDD implementer
-fallbackModels:
 thinking: off
 tools:
 skills:
 defaultContext:
-completionGuard: true
 toolBudget:
 ---
 
@@ -1584,12 +1565,10 @@ Drive the failing test first.
 
 		const content = fs.readFileSync(agentPath, "utf-8");
 		assert.match(content, /^description: Updated implementer$/m);
-		assert.match(content, /^fallbackModels: ?$/m);
 		assert.match(content, /^thinking: off$/m);
 		assert.match(content, /^tools: ?$/m);
 		assert.match(content, /^skills: ?$/m);
 		assert.match(content, /^defaultContext: ?$/m);
-		assert.match(content, /^completionGuard: true$/m);
 		assert.match(content, /^toolBudget: ?$/m);
 
 		const gotAfter = handleManagementAction("get", { agent: "implementer" }, ctx);
@@ -1649,21 +1628,20 @@ Drive the failing test first.
 			version: "1.2.3",
 			pi: { subagents: { agents: ["agents"] } },
 		}));
-		const writeAgent = (dir: string, name: string, model: string, thinking: string, fallback: string) => fs.writeFileSync(path.join(dir, `${name}.md`), [
+		const writeAgent = (dir: string, name: string, model: string, thinking: string) => fs.writeFileSync(path.join(dir, `${name}.md`), [
 			"---",
 			`name: ${name}`,
 			`description: ${name} model mapping`,
 			`model: ${model}`,
 			`thinking: ${thinking}`,
-			`fallbackModels: ${fallback}`,
 			"---",
 			"Model mapping test agent.",
 		].join("\n"));
-		writeAgent(path.join(packageDir, "agents"), "package-worker", "anthropic/claude-sonnet-4", "low", "openai/gpt-5-mini");
-		writeAgent(userAgentsDir, "user-worker", "gpt-5-mini", "medium", "claude-sonnet-4");
-		writeAgent(userAgentsDir, "shadowed", "openai/gpt-5-mini", "low", "anthropic/claude-sonnet-4");
-		writeAgent(projectAgentsDir, "project-worker", "anthropic/claude-sonnet-4", "high", "openai/gpt-5-mini");
-		writeAgent(projectAgentsDir, "shadowed", "openai/gpt-5-mini", "high", "anthropic/claude-sonnet-4");
+		writeAgent(path.join(packageDir, "agents"), "package-worker", "anthropic/claude-sonnet-4", "low");
+		writeAgent(userAgentsDir, "user-worker", "gpt-5-mini", "medium");
+		writeAgent(userAgentsDir, "shadowed", "openai/gpt-5-mini", "low");
+		writeAgent(projectAgentsDir, "project-worker", "anthropic/claude-sonnet-4", "high");
+		writeAgent(projectAgentsDir, "shadowed", "openai/gpt-5-mini", "high");
 		fs.writeFileSync(path.join(projectAgentsDir, "off-worker.md"), [
 			"---",
 			"name: off-worker",
@@ -1687,7 +1665,7 @@ Drive the failing test first.
 		const result = handleManagementAction("models", {}, ctx);
 		const text = readText(result);
 		assert.equal(result.isError, false);
-		assert.match(text, /package-worker\n  model:\n    anthropic\/claude-sonnet-4\n  source: package agent config\n  thinking: low\n  fallback models:\n    openai\/gpt-5-mini/);
+		assert.match(text, /package-worker\n  model:\n    anthropic\/claude-sonnet-4\n  source: package agent config\n  thinking: low/);
 		assert.match(text, /user-worker\n  model:\n    openai\/gpt-5-mini\n  source: user agent config\n  thinking: medium/);
 		assert.match(text, /project-worker\n  model:\n    anthropic\/claude-sonnet-4\n  source: project agent config\n  thinking: high/);
 		assert.match(text, /off-worker\n  model:\n    openai\/gpt-5-mini\n  source: project agent config\n  thinking: off/);

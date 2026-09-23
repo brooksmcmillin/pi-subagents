@@ -11,6 +11,17 @@ assert.ok(expected === "jiti" || expected === "native", "expected jiti or native
 const nativeCapability = Boolean(process.features.typescript) && typeof nodeModule.registerHooks === "function";
 assert.equal(nativeCapability, expected === "native");
 
+// Older registerHooks runtimes intercept require(), but not require.resolve().
+let hooksRequireResolve = false;
+if (nativeCapability) {
+	const hook = nodeModule.registerHooks({ resolve(specifier, context, nextResolve) {
+		hooksRequireResolve = true;
+		return nextResolve(specifier, context);
+	} });
+	try { nodeModule.createRequire(import.meta.url).resolve("node:fs"); }
+	finally { hook.deregister(); }
+}
+
 const source = fileURLToPath(new URL("../../", import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-loader-capability-"));
 try {
@@ -23,7 +34,7 @@ try {
 			'import assert from "node:assert/strict";',
 			'import { createRequire } from "node:module";',
 			'const require = createRequire(import.meta.url);',
-			`assert.equal(require.resolve("@earendil-works/pi-tui"), ${JSON.stringify(fs.realpathSync(aliasTarget))});`,
+			...(hooksRequireResolve ? [`assert.equal(require.resolve("@earendil-works/pi-tui"), ${JSON.stringify(fs.realpathSync(aliasTarget))});`] : []),
 			'assert.equal(require("@earendil-works/pi-tui").identity, identity);',
 		] : []),
 		expected === "native" ? 'import { value } from "./dep.js";' : 'const value = "JITI";',

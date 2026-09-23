@@ -89,6 +89,37 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("reports the observed runner exit code and signal when a killed runner left no result", () => {
+		const root = tempRoot("pi-stale-run-killed-");
+		try {
+			const asyncDir = path.join(root, "run-killed");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				lifecycleArtifactVersion: 3,
+				runId: "run-killed",
+				sessionId: "session-current",
+				mode: "single",
+				state: "running",
+				pid: 4242,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				currentStep: 0,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+			initializeProcessTerminal(asyncDir, "run-killed", "runner-killed");
+			const proof = finalizeProcessTerminal(asyncDir, "run-killed", { processInstanceId: "runner-killed", closeObservedAt: 1500, exitCode: null, signal: "SIGKILL" });
+			assert.equal(proof.state, "unknown");
+
+			reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+
+			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-killed.json"), "utf-8"));
+			assert.equal(resultJson.state, "failed");
+			assert.match(resultJson.summary, /Async runner process 4242 exited with code none \(signal SIGKILL\) before writing a result/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("repairs sessionless stale status without writing an unindexed result", () => {
 		const root = tempRoot("pi-stale-run-sessionless-");
 		try {
@@ -204,8 +235,8 @@ describe("async stale-run reconciliation", () => {
 				startedAt: 1000,
 				lastUpdate: 1000,
 				steps: [
-					{ agent: "scout", status: "running", startedAt: 1000, model: "planned-scout", attemptedModels: ["planned-scout"] },
-					{ agent: "worker", status: "running", startedAt: 1100, model: "planned-worker", attemptedModels: ["planned-worker"] },
+					{ agent: "scout", status: "running", startedAt: 1000, model: "planned-scout" },
+					{ agent: "worker", status: "running", startedAt: 1100, model: "planned-worker" },
 				],
 			});
 			const scoutSession = path.join(root, "scout.jsonl");
@@ -215,8 +246,8 @@ describe("async stale-run reconciliation", () => {
 				success: false,
 				state: "failed",
 				results: [
-					{ agent: "scout", success: true, sessionFile: scoutSession, model: "fast", attemptedModels: ["planned-scout", "fast"] },
-					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", attemptedModels: ["planned-worker", "careful"], contextOverflow: true },
+					{ agent: "scout", success: true, sessionFile: scoutSession, model: "fast" },
+					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", contextOverflow: true },
 				],
 			}, null, 2), "utf-8");
 
@@ -231,13 +262,11 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.status?.steps?.[0]?.status, "complete");
 			assert.equal(result.status?.steps?.[0]?.exitCode, 0);
 			assert.equal(result.status?.steps?.[0]?.model, "fast");
-			assert.deepEqual(result.status?.steps?.[0]?.attemptedModels, ["planned-scout", "fast"]);
 			assert.equal(result.status?.steps?.[0]?.sessionFile, scoutSession);
 			assert.equal(result.status?.steps?.[1]?.status, "failed");
 			assert.equal(result.status?.steps?.[1]?.exitCode, 1);
 			assert.equal(result.status?.steps?.[1]?.error, "boom");
 			assert.equal(result.status?.steps?.[1]?.model, "careful");
-			assert.deepEqual(result.status?.steps?.[1]?.attemptedModels, ["planned-worker", "careful"]);
 			assert.equal(result.status?.steps?.[1]?.contextOverflow, true);
 			assert.equal(result.status?.steps?.[1]?.sessionFile, workerSession);
 			assert.equal(result.status?.error, "boom");

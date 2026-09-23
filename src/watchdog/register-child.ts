@@ -21,7 +21,6 @@ export function childResolvedConfig(config: ChildWatchdogConfig): ResolvedWatchd
 		main: {
 			enabled: true,
 			...(config.model ? { model: config.model } : {}),
-			...(config.fallbackModels !== undefined ? { fallbackModels: [...config.fallbackModels] } : {}),
 			...(config.thinking !== undefined ? { thinking: config.thinking } : {}),
 		},
 		stalemateRepeats: config.stalemateRepeats,
@@ -52,11 +51,13 @@ export function registerChildWatchdog(
 	pi: ExtensionAPI,
 	childConfig: ChildWatchdogConfig | undefined,
 	writeStatus: ((event: ChildWatchdogStatusEvent) => void) | undefined,
+	structuredTerminal?: { captured: boolean },
 ): MainWatchdogRuntime | undefined {
 	if (!childConfig) return undefined;
 	if (!writeStatus) throw new Error("Child watchdog status sink is missing; the host must pass ChildRuntimeConfig.watchdogStatus.");
 	let currentContext: ExtensionContext | undefined;
 	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let agentSettled = false;
 	let seq = 0;
 	const emitStatus = (phase: ChildWatchdogPhase, reason?: string, warning?: ChildWatchdogWarningSummary): void => {
 		writeStatus({
@@ -93,7 +94,9 @@ export function registerChildWatchdog(
 		displayWarning: (details, options) => {
 			const childDetails = childWarningDetails(details, childConfig);
 			emitStatus("reviewing", undefined, { severity: childDetails.severity, importance: childDetails.importance, category: childDetails.category, summary: childDetails.summary, evidence: childDetails.evidence, recommendedAction: childDetails.recommendedAction, ...(childDetails.displayedAt ? { displayedAt: childDetails.displayedAt } : {}), addressed: false, stalemate: childDetails.state === "stalemate" });
-			pi.sendMessage(createWatchdogWarningMessage(childDetails, { display: true, details: childDetails }), options);
+			const message = createWatchdogWarningMessage(childDetails, { display: true, details: childDetails });
+			if (agentSettled) pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, childDetails);
+			else pi.sendMessage(message, options);
 		},
 		displayUserWarning: (details) => {
 			const childDetails = childWarningDetails(details, childConfig);
@@ -112,12 +115,13 @@ export function registerChildWatchdog(
 		emitStatus("idle");
 	});
 	onRuntimeEvent("before_agent_start", (event, ctx) => {
+		agentSettled = false;
 		rememberContext(ctx);
 		runtime.handleBeforeAgentStart(event, ctx);
 	});
 	onRuntimeEvent("turn_end", (event, ctx) => {
 		rememberContext(ctx);
-		runtime.handleTurnEnd(event, ctx);
+		runtime.handleTurnEnd(event, ctx, structuredTerminal?.captured === true);
 	});
 	onRuntimeEvent("tool_result", (_event, ctx) => {
 		rememberContext(ctx);
@@ -131,6 +135,9 @@ export function registerChildWatchdog(
 		if (snapshot.status === "failed") emitStatus("failed", snapshot.lastError);
 		else if (snapshot.status === "stale") emitStatus("stale", "review stale");
 		else emitStatus("idle");
+	});
+	onRuntimeEvent("agent_settled", () => {
+		agentSettled = true;
 	});
 	onRuntimeEvent("session_shutdown", () => {
 		currentContext = undefined;

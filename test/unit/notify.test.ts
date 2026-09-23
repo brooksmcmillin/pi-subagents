@@ -8,12 +8,14 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import registerSubagentNotify, {
 	buildCompletionDetails,
+	createCompletionSendRegistry,
 	formatGroupedCompletion,
 	formatSingleCompletion,
 	parseSubagentNotifyContent,
 	type RegisterSubagentNotifyOptions,
 	type SubagentNotifyDetails,
 	scheduledCompletionTriggersTurn,
+	incrementalChildCompletionTriggersTurn,
 } from "../../src/runs/background/notify.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT } from "../../src/shared/types.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
@@ -81,7 +83,11 @@ function createPi(currentSessionId = "session-1", registerOptions: RegisterSubag
 
 	// Formatting-focused tests run with batching disabled so single completions
 	// emit synchronously. Batching behavior is covered by the dedicated suite below.
-	const notifier = registerSubagentNotify(pi as never, { currentSessionId, completionOwnerId: COMPLETION_OWNER_ID }, { batchConfig: { enabled: false }, ...registerOptions });
+	const notifier = registerSubagentNotify(pi as never, { currentSessionId, completionOwnerId: COMPLETION_OWNER_ID }, {
+		batchConfig: { enabled: false },
+		sendRegistry: createCompletionSendRegistry(),
+		...registerOptions,
+	});
 
 	return { events, sent, notifier, dispose: () => notifier.dispose() };
 }
@@ -99,6 +105,7 @@ function createBatchingPi(clock: ReturnType<typeof createFakeClock>, currentSess
 		batchConfig: { enabled: true, debounceMs: 150, maxWaitMs: 1000, stragglerDebounceMs: 75, stragglerMaxWaitMs: 400, stragglerWindowMs: 2000 },
 		timers: clock.api,
 		now: clock.now,
+		sendRegistry: createCompletionSendRegistry(),
 	});
 	return { events, sent, notifier, dispose: () => notifier.dispose() };
 }
@@ -153,6 +160,124 @@ function completionResult(overrides: Record<string, unknown> = {}) {
 }
 
 describe("registerSubagentNotify", () => {
+	it("sends one async notification and turn across duplicate registrations", () => {
+		const events = createEventBus();
+		const sent: Array<{ options: unknown }> = [];
+		const registry = createCompletionSendRegistry();
+		const pi = { events, sendMessage(_message: unknown, options: unknown) { sent.push({ options }); } };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "shared-async" }));
+			assert.equal(sent.length, 1);
+			assert.deepEqual(sent[0]?.options, { triggerTurn: true });
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("sends one foreground notification across duplicate registrations", () => {
+		const events = createEventBus();
+		const sent: unknown[] = [];
+		const registry = createCompletionSendRegistry();
+		const pi = { events, sendMessage(message: unknown) { sent.push(message); } };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_FOREGROUND_COMPLETE_EVENT, completionResult({ id: "shared-foreground", source: "foreground" }));
+			assert.equal(sent.length, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("releases a failed send claim for another registration", () => {
+		const events = createEventBus();
+		const registry = createCompletionSendRegistry();
+		let attempts = 0;
+		let accepted = 0;
+		const pi = { events, sendMessage() {
+			attempts += 1;
+			if (attempts === 1) throw new Error("runtime inactive");
+			accepted += 1;
+		} };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		const second = registerSubagentNotify(pi as never, state, options);
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "retry-after-failure" }));
+			assert.equal(attempts, 2);
+			assert.equal(accepted, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("joins a re-entrant duplicate to the actual send outcome", async () => {
+		const registry = createCompletionSendRegistry();
+		const result = completionResult({ id: "reentrant-send" });
+		let reentrant: Promise<boolean> | undefined;
+		let sends = 0;
+		let second!: ReturnType<typeof registerSubagentNotify>;
+		const pi = { events: createEventBus(), sendMessage() {
+			sends += 1;
+			reentrant = second.deliver(result);
+		} };
+		const state = { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, state, options);
+		second = registerSubagentNotify(pi as never, state, options);
+		try {
+			assert.equal(await first.deliver(result), true);
+			assert.equal(await reentrant, true);
+			assert.equal(sends, 1);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("keeps identical completion ids isolated by session", async () => {
+		const registry = createCompletionSendRegistry();
+		const sent: unknown[] = [];
+		const pi = { events: createEventBus(), sendMessage(message: unknown) { sent.push(message); } };
+		const options = { batchConfig: { enabled: false }, sendRegistry: registry } as const;
+		const first = registerSubagentNotify(pi as never, { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID }, options);
+		const second = registerSubagentNotify(pi as never, { currentSessionId: "session-b", completionOwnerId: COMPLETION_OWNER_ID }, options);
+		try {
+			assert.equal(await first.deliver(completionResult({ id: "same-id", sessionId: "session-a" })), true);
+			assert.equal(await second.deliver(completionResult({ id: "same-id", sessionId: "session-b" })), true);
+			assert.equal(sent.length, 2);
+		} finally {
+			first.dispose();
+			second.dispose();
+		}
+	});
+
+	it("expires and caps completed process send claims without timers", async () => {
+		const expiring = createCompletionSendRegistry(10, 2);
+		const first = expiring.claim("first", 0);
+		first.settle?.(true);
+		assert.equal((await expiring.claim("first", 10).outcome), true);
+		assert.equal(expiring.claim("first", 11).owned, true);
+
+		const capped = createCompletionSendRegistry(10_000, 2);
+		for (const key of ["a", "b", "c"]) {
+			const claim = capped.claim(key, 0);
+			claim.settle?.(true);
+		}
+		assert.equal(capped.claim("a", 0).owned, true);
+		assert.equal(capped.claim("c", 0).owned, false);
+	});
+
 	it("keeps a successful background completion hidden while waking the originating session", () => {
 		const { events, sent } = createPi();
 
@@ -856,6 +981,8 @@ describe("completion formatting helpers", () => {
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, interrupted: true, summary: "interrupted", timestamp: 1 }).status, "paused");
 		const pausedWorkflow = buildCompletionDetails({ id: "workflow", agent: "workflow", mode: "workflow", state: "paused", results: [{ workflowKey: "failed", success: false }] });
 		assert.equal(pausedWorkflow.childOutputs?.[0]?.status, "failed");
+		const runningWorkflow = buildCompletionDetails({ id: "workflow", agent: "workflow", mode: "workflow", success: true, results: [{ workflowKey: "running", state: "running" }] });
+		assert.equal(runningWorkflow.taskInfo, " (dispatch complete; 1 child running or uncollected)");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "boom", exitCode: 1, timestamp: 1 }).status, "failed");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", exitCode: 1, processSignal: "SIGTERM", timestamp: 1 }).status, "stopped");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", results: [{ success: false, exitCode: 1, processSignal: "SIGTERM" }], timestamp: 1 }).status, "stopped");
@@ -979,6 +1106,27 @@ describe("scheduled completions", () => {
 		assert.equal(await notifier.deliver(quiet), true);
 		assert.deepEqual(sent[0]!.options, { triggerTurn: false });
 		assert.equal((sent[0]!.message as { display?: boolean }).display, true);
+	});
+
+	it("wakes once for an actionable child failure but not an ordinary running success", () => {
+		const triggerTurns: boolean[] = [];
+		const pi = {
+			sendMessage(_message: unknown, options: unknown) {
+				if ((options as { triggerTurn?: boolean }).triggerTurn === true) triggerTurns.push(true);
+			},
+		};
+		for (const notification of [
+			{ workflowRunId: "workflow-1", childKey: "ready", outcome: "completed" as const, workflowRunning: true },
+			{ workflowRunId: "workflow-1", childKey: "broken", outcome: "failed" as const, workflowRunning: true },
+		]) {
+			pi.sendMessage(notification, { triggerTurn: incrementalChildCompletionTriggersTurn(notification, undefined) });
+		}
+		assert.equal(triggerTurns.length, 1, "only the actionable child failure should trigger a provider turn");
+	});
+
+	it("keeps a terminal child settlement as the workflow barrier", () => {
+		const terminal = { workflowRunId: "workflow-2", childKey: "last", outcome: "completed" as const, workflowRunning: false };
+		assert.equal(incrementalChildCompletionTriggersTurn(terminal, undefined), true);
 	});
 
 	it("still wakes the session when a quiet scheduled run fails, stops, or pauses", async () => {

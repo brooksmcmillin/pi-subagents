@@ -2,29 +2,171 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Async status now reports a subagent's actual context limit once its session starts, including a window raised by an extension, instead of the parent registry's value. Thanks to [@johnhenaot](https://github.com/johnhenaot) for [#2448](https://github.com/nicobailon/pi-subagents/pull/2448).
+- TypeBox is now a host-provided peer instead of a bundled dependency, so Pi no longer warns about the manifest and the extension, children, and background runners all use Pi's TypeBox copy. Thanks to [@felipemm](https://github.com/felipemm) for [#2454](https://github.com/nicobailon/pi-subagents/issues/2454) and [#2455](https://github.com/nicobailon/pi-subagents/pull/2455).
+- `fast: true` now accepts any native `openai-codex/*` model instead of a fixed list of two model IDs, so newer Codex models no longer fail before launch. Other providers are still rejected. Thanks to [@jtabke](https://github.com/jtabke) for [#2452](https://github.com/nicobailon/pi-subagents/issues/2452).
+- Worktree naming labels stay within the 256-byte limit when truncated at a multi-byte UTF-8 boundary, so async status remains readable. Thanks to [@chenhaoxiang](https://github.com/chenhaoxiang) for [#2446](https://github.com/nicobailon/pi-subagents/pull/2446).
+
+## [0.71.0] - 2026-09-23
+
 ### Highlights
-- Workflow scripts accept `args`, so one script can be reused with different inputs, including from schedules.
-- Subagents can run on another computer through a saved Herdr machine.
-- Async children can be asked to checkpoint before their deadline instead of being killed mid-task.
-- Slow local models no longer time out at five minutes in the detached runner; Pi's `httpIdleTimeoutMs` now applies.
-- Delegation is opt-in again: the parent owns the work by default, and the bundled skill only guides delegation when the operator asks for it.
-- Watchdog findings carry an explicit importance; only high findings reach the model.
-- Background children now need Pi 0.85.1 or newer; the workaround for Pi 0.85.0's missing `pi-server` dependency is gone.
+
+- Other extensions can read subagent spend and follow async workflow progress as data, without scraping terminal output.
+- Workflow status can now confirm that every child process has actually exited.
+- Child sessions keep readable names such as `worker: fix auth refresh` in `/resume` and Herdr.
+- The full `subagent` tool loads only when a request needs it, which keeps unrelated prompts smaller.
+- Background runners, reviewers, and Bun, pnpm, and symlinked installs are more reliable.
 
 ### Added
 
-- Expose the requested model and cached-exclusion skips in foreground results and async status, so audits can distinguish an intended primary from the fallback that actually ran. Thanks to [@mxp7064](https://github.com/mxp7064) for the report and design in #2245.
-- Accept bounded plain-JSON `args` for inline, file-backed, validated, and scheduled workflow scripts. Scripts receive deeply frozen arguments; schedules retain normalized values for replay, and workflow evidence binds them to a canonical digest (#2233).
+- In-process RPC `cost` method. It returns the same parent-plus-child spend that `/subagent-cost` shows, as versioned data (`{ version: 1, parent, children, childTotal, total, unresolvedAsyncChildren }`). `ping.capabilities.cost` advertises `{ version: 1 }`. `/subagent-cost` output is unchanged. Thanks to [@raymondtri](https://github.com/raymondtri) for [#2378](https://github.com/nicobailon/pi-subagents/pull/2378).
+- Async `workflowScript` runs and the children they launch now emit public lifecycle events, so companion UIs can follow them without scraping terminal output. Thanks to [@navidemad](https://github.com/navidemad) for [#2382](https://github.com/nicobailon/pi-subagents/pull/2382).
+- Status for an async workflow now includes `details.workflowTerminalProof`. It reports `observed`, with each child's exit evidence, only after the workflow has stopped launching children and every async child has exited or failed to start. Otherwise it reports `pending` or `unknown` with a reason, including when the saved child list is missing. A finished workflow frees its capacity slot using the same check, so the two always agree. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2436](https://github.com/nicobailon/pi-subagents/issues/2436) and [#2442](https://github.com/nicobailon/pi-subagents/pull/2442).
+
+### Changed
+
+- Packaged `worker` agents now start with fresh context instead of forking the parent's conversation. You can still request fork context per call or set it globally. Thanks to [@eduardopicolo-cb](https://github.com/eduardopicolo-cb) for [#2384](https://github.com/nicobailon/pi-subagents/issues/2384).
+- The full `subagent` tool stays hidden until a request activates it through the small `subagents_enable` loader, which keeps unrelated prompt context smaller. Direct commands, RPC, the TUI, and nested children work as before. Thanks to [@Knimoms](https://github.com/Knimoms) for [#2380](https://github.com/nicobailon/pi-subagents/pull/2380).
+- Child sessions keep a readable name (for example `worker: fix auth refresh`) in session lists, `/resume`, and Herdr while the intercom bridge is active. Nested children now reach their supervisor through the child's intercom ID instead of its session name. This needs a pi-intercom version that supports the `intercom:session-identity` claim; with an older pi-intercom, children keep the previous naming so routing still works. Thanks to [@Q-xuan](https://github.com/Q-xuan) for raising the problem in [#2432](https://github.com/nicobailon/pi-subagents/pull/2432).
+- The optional `@earendil-works/pi-ai` peer dependency now requires 0.86.1 or later, matching the oldest supported Pi host. Thanks to [@samuela](https://github.com/samuela) for [#2373](https://github.com/nicobailon/pi-subagents/issues/2373).
+- When a child's `structured_output` call is rejected, the result now includes a short summary of the validation errors. The missing-structured-output error is used only when the child never called the tool. Thanks to [@rtbe](https://github.com/rtbe) for [#2407](https://github.com/nicobailon/pi-subagents/issues/2407).
+
+### Fixed
+
+- `subagent` is available again after switching from an inactive session branch to one where it was activated.
+- Background runners and external CLI agents no longer inherit Git's repository variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, and the rest of `git rev-parse --local-env-vars`). When Pi was started from a Git hook or with `git --git-dir`, these made a child's Git commands act on the parent's repository instead of the child's working directory. Other variables such as `GIT_AUTHOR_*` still pass through, and an external agent's explicit environment allowlist is unchanged. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2437](https://github.com/nicobailon/pi-subagents/issues/2437) and [#2440](https://github.com/nicobailon/pi-subagents/pull/2440).
+- Retained background runs no longer time out while the packaged runner is still starting. Thanks to [@muermaru](https://github.com/muermaru) for [#2403](https://github.com/nicobailon/pi-subagents/issues/2403), and to [@qsgy-edge](https://github.com/qsgy-edge) for the independent diagnosis and timing evidence in [#2415](https://github.com/nicobailon/pi-subagents/pull/2415).
+- When a background runner exits without writing a result, the failure notice now includes its exit code and signal. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2423](https://github.com/nicobailon/pi-subagents/issues/2423).
+- A child that produced valid structured output keeps it as evidence when a later provider error or abort fails the run. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2411](https://github.com/nicobailon/pi-subagents/issues/2411).
+- Completion notifications are no longer sent twice when the extension is registered more than once for the same session. Thanks to [@hongchu098](https://github.com/hongchu098) for [#2389](https://github.com/nicobailon/pi-subagents/issues/2389).
+- The bundled reviewer works in directories without Git: `watchdog_diff` reports that no baseline is available instead of failing the review. Thanks to [@matthewmathistrellys](https://github.com/matthewmathistrellys) for [#2422](https://github.com/nicobailon/pi-subagents/issues/2422).
+- The bundled reviewer's `watchdog_diff` counts as read-only, so a reviewer given a single output path returns its full report for the runtime to save, as introduced in [#426](https://github.com/nicobailon/pi-subagents/issues/426), with thanks to Alexander Gerdes ([@Avg8888](https://github.com/Avg8888)). Thanks to [@riskywhat](https://github.com/riskywhat) for [#2405](https://github.com/nicobailon/pi-subagents/issues/2405).
+- Watchdog reviews and permission checks work again on the Pi 0.86.1 package layout. Thanks to [@zieglar](https://github.com/zieglar) for the reproduction and version comparison in [#2377](https://github.com/nicobailon/pi-subagents/issues/2377).
+- A workflow child with no `agent` now fails with an error that names it (`Workflow child 'r1' has no agent…`) instead of the generic "Provide exactly one mode" message. Thanks to [@matthewmathistrellys](https://github.com/matthewmathistrellys) for raising the confusing error in [#2422](https://github.com/nicobailon/pi-subagents/issues/2422).
+- `/prompt-workflow` finds prompt files that are symlinks (as installed by dotfile managers such as GNU Stow or homeshick) and skips broken links instead of failing. Thanks to [@nietaki](https://github.com/nietaki) for [#2430](https://github.com/nicobailon/pi-subagents/issues/2430).
+- Completed retained agents can resume even when their own list of allowed child agents excludes them. Parent authority and that restriction both still apply; older retained children without the needed recovery data fail closed. Thanks to [@riskywhat](https://github.com/riskywhat) for [#2379](https://github.com/nicobailon/pi-subagents/issues/2379), building on the allowlist work in [#2338](https://github.com/nicobailon/pi-subagents/pull/2338) credited to [@shkrabov](https://github.com/shkrabov).
+- Guidance now says the list of retained workflow children is not complete: when you know a run's exact id, check its status and try resuming it before falling back to a labeled agent with the same role. Thanks to [@riskywhat](https://github.com/riskywhat) for [#2406](https://github.com/nicobailon/pi-subagents/issues/2406).
+- Skills marked `disable-model-invocation: true` are no longer shown to child agents, even when requested by name, and are no longer suggested to the model. Thanks to [@toRolex](https://github.com/toRolex) for [#2400](https://github.com/nicobailon/pi-subagents/pull/2400).
+- Pi hosts compiled with Bun are found from Pi's package directory or its bundled `share/pi-coding-agent` layout, while unrelated extension dependencies still cannot turn on dynamic tools. Thanks to [@fmoda3](https://github.com/fmoda3) for [#2417](https://github.com/nicobailon/pi-subagents/issues/2417).
+- pnpm installs follow npm-hosted peer aliases through their symlinks to the real package, so the package is not loaded twice. Thanks to [@henriquebastos](https://github.com/henriquebastos) for [#2409](https://github.com/nicobailon/pi-subagents/pull/2409).
+- npm and git installs detect dynamic tool support from the running Pi installation and keep the compact `subagents_enable` loader instead of an always-loaded `subagent` tool. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2398](https://github.com/nicobailon/pi-subagents/pull/2398).
+- MCP direct tool names now match what pi-mcp-adapter registers, including servers whose tool names already start with the server name, the adapter's `mcp` prefix mode, and per-server `toolPrefix`. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2395](https://github.com/nicobailon/pi-subagents/pull/2395).
+- Logs from running and failed external CLI agents can be viewed in Fleet, tool status, and the TUI. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for [#2375](https://github.com/nicobailon/pi-subagents/issues/2375).
+- Structured delegation updates report cumulative usage and no longer count missing provider cache numbers as zero. Thanks to [@bioShaun](https://github.com/bioShaun) for [#2374](https://github.com/nicobailon/pi-subagents/pull/2374).
+- Forked sessions keep Pi 0.87 context edits, including replaced content and signed Anthropic thinking blocks.
+## [0.70.1] - 2026-09-20
+
+### Highlights
+
+- Delegated tasks no longer fail solely because they finish without editing files.
+- Runtime-added agents now honor configured model, provider, and thinking preferences.
+- Foreground children launch reliably when Pi is installed outside the extension's own dependency tree.
+- Pi 0.86.1 support improves watchdog checks, provider-backed summaries, packaging, and standalone use.
+
+### Changed
+
+- Stop guessing whether task wording requires file edits. Successful tasks now follow their process result and explicitly configured output and acceptance checks. The `completionGuard` setting and `PI_SUBAGENTS_LLM_INTENT_ARBITER` switch have been removed. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for the reproduction that led to this change in [#2351](https://github.com/nicobailon/pi-subagents/issues/2351).
+- Clarify that a custom agent file fully replaces a bundled agent with the same name. Custom implementation agents must declare `acceptanceRole: writer` to receive writer acceptance defaults.
+- Update delegation guidance so large changes are split only when they contain independently testable parts.
+
+### Fixed
+
+- Apply `subagents.defaultModel`, `defaultProvider`, `defaultThinking`, and model-tier overrides to runtime-registered agents. Thanks to [@bioShaun](https://github.com/bioShaun) for [#2368](https://github.com/nicobailon/pi-subagents/pull/2368).
+- Show each workflow child's resolved model and thinking level in parent status output. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2364](https://github.com/nicobailon/pi-subagents/pull/2364).
+- Preserve watchdog working-directory context and authenticated provider behavior for pruned-fork overflow summaries on Pi 0.86.1. Thanks to [@chem](https://github.com/chem) for [#2362](https://github.com/nicobailon/pi-subagents/issues/2362).
+- Launch the packaged inspector bootstrap from its compiled JavaScript instead of an absent TypeScript source. Thanks to [@pablog12](https://github.com/pablog12) for [#2360](https://github.com/nicobailon/pi-subagents/issues/2360).
+- Resolve the host `pi-coding-agent` package and its exports from the Pi installation that owns the session, so foreground children work across npm-hosted layouts without loading a second SDK instance. Thanks to [@nazerim](https://github.com/nazerim) for [#2348](https://github.com/nicobailon/pi-subagents/issues/2348).
+- Show an actionable expand shortcut when a host cannot provide its configured keybinding label.
+- Stop test-only background runners when their owning test process exits, and isolate test temporary data to reduce filesystem and Spotlight load.
+
+## [0.70.0] - 2026-09-19
+
+### Highlights
+
+- Control which extensions children load and which agents descendants may launch without widening their permissions.
+- Background workflows remain visible and recoverable through detaches, interruptions, restarts, and supervisor handoffs.
+- Invalid workflows, unsafe worktree launches, and blocked tool budgets now fail earlier with clearer results.
+- Linked worktrees, Windows supervisor polling, source-layout runners, and Orca progress tabs are more reliable.
+
+### Added
+
+- Add `subagents.defaultSubagentOnlyExtensions` for loading shared child-only extensions without disabling ambient extension discovery. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for #2284.
+- Allow agent frontmatter and `subagents.agentOverrides.<name>.allowedAgents` to restrict which canonical agents a child may launch without granting delegation or widening capability ceilings. Thanks to [@shkrabov](https://github.com/shkrabov) for #2312.
+
+### Changed
+
+- Document `/subagent-cost` as the combined accounting view for parent and asynchronous child usage. Thanks to [@swarajban](https://github.com/swarajban) for #2313.
+
+### Fixed
+
+- Wake root `bg_wait` calls when an owned nested child is waiting on `contact_supervisor`. Thanks to [@geril07](https://github.com/geril07) for #2344.
+- Keep explicitly detached workflow children visible, preserve their result lookup after the coordinator exits, and avoid treating launch receipts as completed results. Thanks to [@shaharmor](https://github.com/shaharmor) for #2299.
+- Settle interrupted, stopped, or timed-out background runs even when child session creation hangs. Thanks to [@onorua](https://github.com/onorua) for #2320.
+- Prevent concurrent workflow observers from overwriting retained-session startup confirmation and stranding resumed children. Thanks to [@luigiplr](https://github.com/luigiplr) for #2292.
+- Let children use the tools declared by their own agent configuration instead of incorrectly narrowing them to the parent's `--tools` selection. Thanks to [@carlesba](https://github.com/carlesba) for #2289.
+- Report foreground hard tool-budget blocks as `tool_budget_exhausted`, including calls blocked before execution starts. Thanks to [@kylerberry](https://github.com/kylerberry) for #2302.
+- Keep permission forwarding scoped to the validated launch parent instead of sharing an identity between independent root sessions. Thanks to [@kasumikira](https://github.com/kasumikira) for #2321.
+- Reject malformed inline and file-backed workflow scripts before creating asynchronous run state or launching children. Thanks to [@rtbe](https://github.com/rtbe) for #2309.
+- Reject direct asynchronous managed-worktree launches from a dirty source before creating run state or returning a receipt. Thanks to [@rtbe](https://github.com/rtbe) for #2311.
+- Avoid rejecting keyed property access after a mutable `runs.all(...)` result binding is reassigned.
+- Report useful rooted field paths for failed structured-output `if`/`then`/`else` schemas while preserving root `$defs`. Thanks to [@peedrr](https://github.com/peedrr) for #2317.
+- Give the bundled reviewer a bounded, read-only view of staged, unstaged, and untracked working-tree changes from its launch `HEAD`. Thanks to [@nateberkopec](https://github.com/nateberkopec) for #2306.
+- Show the correct child transcript when inspecting an indexed asynchronous workflow step. Thanks to [@swarajban](https://github.com/swarajban) for #2304.
+- Reconcile foreground and background child usage from terminal session messages when live usage events are missing or incomplete. Thanks to [@riique](https://github.com/riique) for #2295 and #2296.
+- Keep project-scoped agent memory stable across linked Git worktrees. Thanks to [@freezscholte](https://github.com/freezscholte) for #2293.
+- Keep Fleet workflow coverage stable during heartbeat, counter, and token updates without resetting an unchanged layout. Thanks to [@swarajban](https://github.com/swarajban) for #2305.
+- Continue supervisor polling on Windows when a temporary channel directory disappears during a scan. Thanks to [@asher-aqi](https://github.com/asher-aqi) for #2303.
+- Keep source-layout asynchronous runners on native Node TypeScript when child extensions are configured, with consistent peer-module resolution. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2314.
+- Make Orca progress tabs work under `fish`. Thanks to [@yourfriendaaron](https://github.com/yourfriendaaron) for #2294.
+- Prevent publishing the TypeScript source checkout directly to npm; only the compiled package is publishable. Thanks to [@niko-operal](https://github.com/niko-operal) for #2300.
+
+## [0.69.0] - 2026-09-18
+
+### Highlights
+- Gates can now return a JSON verdict. Point `gate` at a script that prints JSON, and its output becomes the child's structured output, so workflows can branch on a post-run check without the parent reading the child's report.
+- Ghostty detection no longer misfires inside terminals like cmux that embed Ghostty, so you stop seeing AppleScript `-1728`/`-2741` errors or the wrong window being targeted.
+- Hosts without `npm` start up quietly instead of printing `npm: command not found`.
+
+### Added
+
+- Typed gates: `gate` accepts `{ command, output: "json", schema?, timeoutMs? }` alongside the plain string form. When the command passes, its JSON stdout becomes the child's `structuredOutput` (validated against `schema` when given). Empty, truncated, or invalid output fails the gate rather than silently dropping the verdict. Typed gates always run (they are never cached), and a run cannot combine one with an `outputSchema`. See `docs/` for using command-runner agents as typed workflow steps and `examples/typed-gate` for a runnable example.
+
+### Fixed
+
+- The Ghostty inspector only activates when the macOS host bundle id identifies the standalone Ghostty app. Terminals that embed Ghostty (such as cmux) set `TERM_PROGRAM=ghostty` too, which previously targeted an unrelated Ghostty window or emitted `-1728`/`-2741` AppleScript errors; those hosts now fall back to the `inspector.command` hint. Thanks to [@wangpi26](https://github.com/wangpi26) for #2281.
+- Hosts without `npm` no longer print `/bin/sh: npm: command not found` during startup; global package-root discovery is optional and now stays silent when the package manager is missing. Thanks to [@PhrZer](https://github.com/PhrZer) for #2287.
+- Fixed `docs/tool-reference.md`, which claimed a default `maxOutput` cap of 200 KB / 5,000 lines. The cap applies only when `maxOutput` is set.
+
+## [0.68.0] - 2026-09-15
+
+### Highlights
+- Run Pi, Claude Code, Codex, and Cursor subagents on saved remote machines through Herdr.
+- Reuse workflow scripts with different JSON inputs, including scheduled runs.
+- Start npm-installed children much faster and let slow local models use Pi's configured HTTP timeout.
+- Keep local foreground children on the same extension-provided models as their parent without sharing provider state between sessions.
+- Ask async agents to checkpoint before a hard deadline, giving long-running work a chance to return useful progress instead of being killed.
+
+### Added
+
+- Accept bounded JSON `args` for inline, file-backed, validated, and scheduled workflow scripts. Scripts receive immutable arguments, and schedules retain them for later runs (#2233).
 - Left-click the async widget header in mouse-enabled Pi fullscreen mode to fold it into a live status summary and unfold it again, independently of global tool expansion. Progress updates preserve the fold state; run execution and notifications are unchanged. Thanks to [@pstanton237](https://github.com/pstanton237) for #2235.
 - Allow agents to declare an inline JSON Schema `outputSchema` default, with launch objects overriding it and explicit `false` opting out. Thanks to [@peedrr](https://github.com/peedrr) for #2180.
 - Add `PI_SUBAGENT_CACHE_RETENTION` to set a prompt-cache retention tier for child sessions only, so a parent on the 1h tier can keep children on the cheaper-to-write 5m tier they are too short-lived to benefit from. Unset by default, leaving children on the parent's retention. Spawned children take it through the launch environment; in-process children pin it per request on their own session rather than on shared process state. Thanks to [@johnwards](https://github.com/johnwards) for #2190.
-- Add a session-scoped public host API for required native-child extension module paths. Required extensions survive agent overrides and detached/nested launches, appear by safe host ID in launch evidence, and fail closed when denied or unable to load before model resolution. Thanks to [@gkoreli](https://github.com/gkoreli) for #2153.
+- Add a session-scoped host API for extensions that every native child must load. Required extensions survive agent overrides and nested launches, and child startup fails clearly when one is denied or cannot load. Thanks to [@gkoreli](https://github.com/gkoreli) for #2153.
 - Run Pi, Claude Code, Codex, and Cursor subagents on another computer by setting `machine` to a saved Herdr machine.
-- Add `checkpointBeforeDeadlineMs` for async single-agent runs (call param, with a global config default): the runner requests that the child "checkpoint and stop" that many milliseconds before its run deadline. This best-effort handoff request uses the normal steering lifecycle at the child's next tool boundary, so its receipt appears in status and events; the ordinary `timeoutMs` kill still applies. Absent option keeps the current behavior. Thanks to [@freezscholte](https://github.com/freezscholte) for #2141.
-- Add `subagents.agentExcludeDirs` to prune directory subtrees from agent discovery, including nested plugin sources, without disabling ordinary legacy agents. Exclusions respect symlink aliases and apply to explicit/package roots, diagnostics, and agent cache fingerprints. Thanks to [@xarillian](https://github.com/xarillian) for #2131.
+- Add `checkpointBeforeDeadlineMs` for async single-agent runs. It asks the child to checkpoint and stop before the hard `timeoutMs` deadline; without it, timeout behavior is unchanged. Thanks to [@freezscholte](https://github.com/freezscholte) for #2141.
+- Add `subagents.agentExcludeDirs` to exclude directory trees from agent discovery, including nested plugin sources and symlink aliases. Thanks to [@xarillian](https://github.com/xarillian) for #2131.
+
+### Changed
+
+- Add `inspectorOpen` and `projectOpen` to `authorityPolicy`. Inspector opening remains automatic by default, while project opening now asks for confirmation because it starts Herdr and opens another Pi session. Set `"projectOpen": "auto"` to restore unprompted project opening. The Fleet TUI is unchanged. Thanks to [@kevthedawg](https://github.com/kevthedawg) for #2269.
+- Ship compiled JavaScript in the npm package so Pi no longer transpiles the extension and detached runner when they load. On the reported cold-start path, the extension entry loaded in about 226 ms instead of 2,831 ms. Thanks to [@821869798](https://github.com/821869798) for #2248.
 
 ### Removed
 
+- Remove `fallbackModels`, all same-launch model switching (including read-only HTTP 429 continuation), and persistent model exclusions. Retry another model only with a later explicit launch; guarded retained-session compaction recovery may continue once on the already resolved model.
 - Drop the bundled `@earendil-works/pi-server` copy that filled in the dependency Pi 0.85.0 forgot to ship. Background children on a Pi 0.85.0 host now fail to launch with a clear error; upgrade to Pi 0.85.1 or newer, which ships the package itself. Foreground children on 0.85.0 are unaffected.
 
 ### Fixed
@@ -35,38 +177,45 @@
 - Add the ambient-extension rule to Pi's model-not-found error when a child's model comes from an extension-registered provider that was not loaded for it: a foreground child now reports that agents needing a provider extension's models must run as background children (`async: true`) or load the extension explicitly through `subagentOnlyExtensions`/`extensions`, and a background child launched without the ambient extensions gets the matching remedies. When `capabilityCeiling.denyExtensions` blocks every extension, both hosts report the policy instead of remedies the ceiling discards. The core error, exit code, and failure detection are unchanged. Thanks to [@pwguler](https://github.com/pwguler) for #2240.
 - Retry an unused fallback model after a provider stream closes before its terminal event. These transient failures do not create a cached model exclusion. Thanks to [@ghostwriternr](https://github.com/ghostwriternr) for #2256.
 - Remote Herdr bridge discovery no longer blocks the parent session while waiting for the remote Pi to start.
+- Fail managed worktree setup before child launch when a required shared `node_modules` link cannot be created and verified, while preserving absent sources and preexisting destinations (#2283).
+- Allow checked writers to explicitly preserve a host-bound staged index while still rejecting child-created index changes (#2280).
 
+- Preserve the main watchdog's user scope across session compaction while clearing temporary activity state. Thanks to [@nimeetshah0](https://github.com/nimeetshah0) for #2263.
+- Resolve provider-extension models in local, in-process foreground children. Such a child never loads the parent's ambient extensions, so its model runtime only knew Pi's built-in providers and every model from an extension-registered provider failed with `Model "…" not found`; the child now inherits the providers registered in the parent session before resolving its model. Pane-native remote foreground children continue to use the remote machine's provider discovery and configuration. Builtin agents on such a model no longer need `async: true`. Thanks to [@lallenlowe](https://github.com/lallenlowe) for #2274.
+- Preserve a readable async result when result indexing or archiving fails, then retry saving it without delivering it twice. Thanks to [@shaharmor](https://github.com/shaharmor) for #2267 and #2266.
+- Honor `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` for background children, fixing launches from wrapper installs and other non-standard Pi layouts. Thanks to [@Yaphet2015](https://github.com/Yaphet2015) for #2254.
+- Keep a foreground child's report available when acceptance rejects saved output instead of replacing it with only a file reference. Thanks to [@pgoodjohn](https://github.com/pgoodjohn) for #2255.
+- Add the ambient-extension rule to Pi's model-not-found error when a child's model comes from an extension-registered provider that was not loaded for it: a foreground child now reports that agents needing a provider extension's models must run as background children (`async: true`) or load the extension explicitly through `subagentOnlyExtensions`/`extensions`, and a background child launched without the ambient extensions gets the matching remedies. When `capabilityCeiling.denyExtensions` blocks every extension, both hosts report the policy instead of remedies the ceiling discards. The core error, exit code, and failure detection are unchanged. Thanks to [@pwguler](https://github.com/pwguler) for #2240.
+- Remote Herdr bridge discovery no longer blocks the parent session while waiting for the remote Pi to start.
 - Recognize Windows Bun virtual entrypoints when launching standalone background children, retaining the existing Linux and npm paths. Windows coverage remains experimental; see `docs/standalone-background.md`. Thanks to [@JohnsonRan](https://github.com/JohnsonRan) for #2241.
-- Keep non-reply supervisor progress updates out of parent model turns while continuing to consume their request files; decisions and structured interviews still wake and wait for replies. Thanks to [@moofone](https://github.com/moofone) for #2229 and [@dajiaohuang](https://github.com/dajiaohuang) for #2230.
-- Start result-index cleanup, wait-subscription reconciliation, and retention timers only when a session starts, and clear them during shutdown. Thanks to [@freezscholte](https://github.com/freezscholte) for #2244.
+- Keep supervisor progress updates out of parent model turns while still waking for decisions and structured questions. Thanks to [@moofone](https://github.com/moofone) for #2229 and [@dajiaohuang](https://github.com/dajiaohuang) for #2230.
+- Keep routine successful child updates out of parent model turns, and wake the parent when saving an async workflow result fails. Thanks to [@moofone](https://github.com/moofone) for #2262.
+- Start background cleanup, wait reconciliation, and retention timers with the session and clear them during shutdown. Thanks to [@freezscholte](https://github.com/freezscholte) for #2244.
 - Apply Pi's `httpIdleTimeoutMs` setting to the detached async runner's HTTP dispatcher on both the Node and standalone binary host launch paths (project `.pi/settings.json` over `~/.pi/agent/settings.json`, `0` disables; an invalid value warns and falls back to 300s). The runner previously kept undici's 300s header/body defaults, so async children against a slow local model were cut at about five minutes while foreground children waited as configured. Thanks to [@JordiPosthumus](https://github.com/JordiPosthumus) for the incident analysis in #2199.
-- Restore direct parent ownership as the default and require operator authorization before invoking the bundled delegation skill's child/workflow guidance; complexity and recipe fit no longer trigger delegation or writer/challenge/review ceremony by themselves. Technical async, safety, isolation, review, and workflow guidance remains available when requested. Thanks to [@AlexDochioiu](https://github.com/AlexDochioiu) for #2216.
-- Drain the full Git fingerprint process tree before a stopped external run settles, preventing a blocked fsmonitor descendant from retaining a Windows fixture or worktree after cancellation (#2207 recurrence).
-- Report each agent's declared acceptance policy and acceptance role in `capabilities: true` list rows and `details.agentCapabilities`, so callers see the policy `action: "get"` already reported instead of having to inspect every candidate agent individually. Thanks to [@Alice39s](https://github.com/Alice39s) for #2210.
-- Re-anchor a stale parent workflow process cwd before worker construction so a checkout directory that was removed no longer fails the launch before any child starts; healthy launches validate the requested anchor without changing the process cwd. Thanks to [@trewwwsec](https://github.com/trewwwsec) for #2211.
-- Cache child-launch provisioning failures (npm install into a child prefix, preflight, helper bootstrap) with a 15 minute exclusion instead of the default 24h, so a transient bootstrap failure cannot keep excluding a healthy model for a full day. Thanks to [@rnavarro](https://github.com/rnavarro) for #2204.
-- Keep revival startup waits non-blocking and reject runners that exit before proceed. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2219.
-- Prefer exact canonical agent names over packaged local-name fallbacks, and never reinterpret home-level user agent directories as project configuration. This prevents a plain `scout` launch from becoming ambiguous with `code-analysis.scout` and keeps Windows tests from leaking project fixtures into `~/.pi/agents`. Thanks to [@ton77v](https://github.com/ton77v) for #2214.
+- Restore direct parent ownership as the default. The bundled skill delegates only when the operator asks; complexity alone no longer starts child workflows. Thanks to [@AlexDochioiu](https://github.com/AlexDochioiu) for #2216.
+- Stop external runs from leaving Windows worktrees locked by Git fsmonitor processes after cancellation (#2207 recurrence).
+- Include each agent's acceptance policy and role in `capabilities: true` results. Thanks to [@Alice39s](https://github.com/Alice39s) for #2210.
+- Recover when a parent workflow's previous checkout directory was removed before another child starts. Thanks to [@trewwwsec](https://github.com/trewwwsec) for #2211.
+- Keep resumed-run startup non-blocking and fail clearly when the runner exits before it is ready. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2219.
+- Prefer exact agent names over packaged short-name matches, and never treat home-level agent directories as project configuration. This prevents names such as `scout` and `code-analysis.scout` from becoming ambiguous. Thanks to [@ton77v](https://github.com/ton77v) for #2214.
 - Avoid Jiti for native async runner startup on supported Node versions. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2220.
 - Stop registering and advertising a default global `Ctrl+Alt+F` Fleet shortcut; `/subagents-fleet` and FleetView remain available. Thanks to [@miaomiaozii](https://github.com/miaomiaozii) for #2196.
-- Require explicit low/medium/high importance on watchdog findings: low and medium now persist in user-only transcript entries and are excluded from model context and parent-facing child results, while high findings retain model-visible delivery. Severity continues to govern blocker acceptance independently (#2201).
-- Let headless parent and nested coordinator sessions answer blocking child supervisor requests without deadlocking their final background-work drain. Thanks to [@ProDrifterDK](https://github.com/ProDrifterDK) for #2185.
+- Require low, medium, or high importance on watchdog findings. Low and medium stay visible to the user without entering model context; high findings still reach the model (#2201).
+- Let headless parents and nested coordinators answer blocking child questions without deadlocking shutdown. Thanks to [@ProDrifterDK](https://github.com/ProDrifterDK) for #2185.
 - Keep nested stop, interrupt, and timeout propagation inside the issuing run's descendant subtree while preserving root-wide controls. Thanks to [@freezscholte](https://github.com/freezscholte) for #2243.
-- Keep inferred read-only reviews free of implementation acceptance requirements when their topic includes release, migration, or security; explicit acceptance and actual write tasks retain their gates. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2191.
-- Include retention-managed async, output-artifact, and structured-output retrieval paths in native completion notices. Thanks to [@peedrr](https://github.com/peedrr) for #2181.
-- Remove workflow-owned one-shot result payloads together with their child-local result indexes after successful consumption. Thanks to [@peedrr](https://github.com/peedrr) for #2182.
+- Keep read-only reviews free of implementation acceptance requirements when their topic mentions releases, migrations, or security. Explicit acceptance and write tasks are unchanged. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2191.
+- Include async result, output, and structured-output paths in completion notices. Thanks to [@peedrr](https://github.com/peedrr) for #2181.
+- Remove one-shot workflow result files and their indexes after successful consumption. Thanks to [@peedrr](https://github.com/peedrr) for #2182.
 - Show runtime-registered agents in `/subagents` while keeping their extension-owned definitions read-only and rejecting collisions with disabled configured agents. Thanks to [@mystery4f](https://github.com/mystery4f) for #2169.
-- Persist pretty JSON to explicitly bound background output artifacts when a successful child returns structured output without final prose. Thanks to [@rtbe](https://github.com/rtbe) for #2163.
+- Save readable JSON to configured background output files when a successful child returns structured output without final prose. Thanks to [@rtbe](https://github.com/rtbe) for #2163.
 - Surface the provider error text of a failed watchdog review in `/subagents-watchdog status` `Last error` (bounded to 600 chars). Previously only `stop reason 'error'` was recorded, so a watchdog failing every review (rate limit, rejected model, auth) was indistinguishable from a clean one. Thanks to [@freezscholte](https://github.com/freezscholte) for #2166.
-- Allow whole-run stop to safely seal paused async runs only after exact runner-terminal proof, while retaining capacity and resumability until that proof exists. Thanks to [@neruok](https://github.com/neruok) for #2170.
+- Finalize paused async runs after the runner has actually stopped, while keeping them resumable until then. Thanks to [@neruok](https://github.com/neruok) for #2170.
 - Keep explicitly stopped aggregate children non-resumable while allowing completed siblings to resume. Thanks to [@freezscholte](https://github.com/freezscholte) for #2242.
-- Group materialized workflow children under their RPC status lanes without duplicate work items, and derive safe end times for completed lanes. Thanks to [@niko-operal](https://github.com/niko-operal) for #2168.
-- Refresh external-step activity from live stdout, stderr, and newly observed local Git HEAD/worktree changes without polling Git on the steady-state watchdog path. Thanks to [@DeLuke84](https://github.com/DeLuke84) for #2167.
-- Clear polled partial and rejected async jobs from the widget after terminal retention while preserving live nested descendants. Thanks to [@ashlineldridge](https://github.com/ashlineldridge) for #2159.
+- Group workflow children under their status rows without duplicate entries and show reliable completion times. Thanks to [@niko-operal](https://github.com/niko-operal) for #2168.
+- Refresh external-run activity from stdout, stderr, and Git changes without repeatedly polling Git. Thanks to [@DeLuke84](https://github.com/DeLuke84) for #2167.
+- Remove expired partial and rejected jobs from the widget while preserving live nested children. Thanks to [@ashlineldridge](https://github.com/ashlineldridge) for #2159.
 - Reject unsupported bare acceptance strings at the provider schema boundary while preserving shorthand levels and JSON-encoded acceptance objects. Thanks to [@vrolok](https://github.com/vrolok) for #2152.
-- Keep canonical empty child responses eligible for same-launch model fallback without persisting them as 24-hour model exclusions. Thanks to [@rochecompaan](https://github.com/rochecompaan) for #2154.
-- Let Pi continue threshold and overflow compactions without an extra extension resume, while preserving manual re-drive for active async work. Thanks to [@mxp7064](https://github.com/mxp7064) for #2144.
-- Allow an explicit model request when a cached unavailable-model exclusion is contradicted by the current model registry, while preserving live health, auth, quota, and rate-limit exclusions. Thanks to [@xz-dev](https://github.com/xz-dev) for identifying the stale explicit-request cache symptom in #2145.
+- Let Pi finish automatic compaction without an extra extension resume while preserving manual continuation for active async work. Thanks to [@mxp7064](https://github.com/mxp7064) for #2144.
 - Preserve wrapped Pi core tools and explicitly requested non-core tools in child launches. Core slots still respect host availability; non-core tools are validated in the child's runtime after ceilings and exclusions (#2132, #2133, #2134, #2135, #2140). Thanks to [@carlesba](https://github.com/carlesba) for #2137 and [@clementprevot](https://github.com/clementprevot) for #2138.
 
 ## [0.67.0] - 2026-09-10

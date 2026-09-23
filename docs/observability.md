@@ -27,6 +27,12 @@ subagent({ action: "status", id: "..." })      // one run
 
 Or ask naturally: "Show me the current async runs."
 
+### Usage and cost accounting
+
+Run `/subagent-cost` for the parent session's combined parent and child token usage and cost. It includes completed async workflow children when their persisted receipts and metadata remain available. Missing child metadata is reported as unavailable when the receipt identifies that child. If the workflow receipt itself is missing, unreadable, invalid, or non-terminal, affected children can be omitted from the total without an unavailable count, so treat the result as a lower bound when run artifacts are unavailable.
+
+Pi's built-in session totals do not automatically include child usage delivered only by an async completion notification. Those notifications are custom messages, and Pi's public custom-message API does not carry accounted usage. `/subagent-cost` is therefore the supported accounting view for async child usage; do not infer child totals from Pi's footer or `/session` alone. Other extensions can read the same report as data through the in-process RPC `cost` method (see [extension-api.md](extension-api.md#in-process-event-bus-rpc)) instead of scraping the slash output.
+
 The under-editor async widget gives a short view while work runs. Its expand key follows your Pi keybinding:
 
 ```text
@@ -40,7 +46,7 @@ async subagent worker · background
 
 To inspect one background child in text, use `subagent({ action: "status", id: "...", view: "transcript" })`; add `index` for a specific child in a parallel or chain run.
 
-In Pi fullscreen mode with mouse dispatch (verified with Pi TUI 0.85.1), left-click
+In Pi fullscreen mode with mouse dispatch, left-click
 anywhere on the async widget's header row to fold it into a live one-line status
 summary. Click again to restore the usual layout. No knowledge of extension commands
 or keyboard shortcuts is needed. The summary counts the widget's tracked runs,
@@ -187,7 +193,6 @@ Async runs write machine-readable lifecycle artifacts for observability and work
 - `status.json` powers the widget and `subagent({ action: "status" })` output.
 - `events.jsonl` contains wrapper events plus child Pi JSON events annotated with run and step metadata, including correlated `subagent.steer.requested`, `scheduled`, `routed`, `queued`, `delivered`, `failed`, and `recovered` events plus failure/partial/recovery notices.
 - `output-<n>.log` is a live human-readable tail.
-- Fallback information is persisted so background runs are debuggable after completion.
 
 For a top-level async run, `details.asyncDir` points at that directory; the final summary is written to Pi's subagent results directory as `<runId>.json`. Nested async runs use the same shape under the nested async root and are discoverable through status projections that read the nested-run registry. These files are append/update artifacts only; interactive foreground behavior is unchanged.
 
@@ -201,22 +206,26 @@ Nested fanout status is stored as compact sidecar event/registry metadata and me
 
 Consumers should read these JSON files instead of scraping terminal output. Unknown fields and event types should be ignored for forward compatibility.
 
-RPC hosts that need low-latency child-stop UI hints can subscribe to the
-`subagent:child-status` event advertised by RPC `ping` as `events.childStatus`.
-The payload uses `type: "subagent.child-status"`, `version: 1`, `runId`,
-`childId`, `status` (`"stopping"` or `"stopped"`), `ts`, and optional child
-metadata such as `stepIndex`, `agent`, `childRunId`, `workflowKey`, `phase`, and
-`label`. These events are observer hints only. They can duplicate across RPC and
-async replay paths, and they are not replayed after a host restart. Status
-snapshots remain authoritative for recovery and final state. Child stop control
-still uses the normal `stop` request with `childId`; there is no separate child
-stop API.
+Companion UIs and RPC hosts that need low-latency child lifecycle hints can
+subscribe to the `subagent:child-status` event advertised by RPC `ping` as
+`events.childStatus`. The payload uses `type: "subagent.child-status"`,
+`version: 1`, `runId`, `childId`, `status` (`"started"`, `"stopping"`, or
+`"stopped"`), `ts`, and optional child metadata such as `asyncDir`, `stepIndex`,
+`agent`, `childRunId`, `workflowKey`, `phase`, and `label`. Async
+`workflowScript` roots emit `"started"` once the keyed child has a concrete
+launch identity; `childId` and `workflowKey` are the stable workflow key, while
+`stepIndex` is only a convenience projection for the current status snapshot.
+These events are observer hints only. They can duplicate across the live event
+bus and async replay paths, and they are not replayed after a host restart.
+Status snapshots remain authoritative for recovery and final state. Child stop
+control still uses the normal `stop` request with `childId`; there is no separate
+child stop API.
 
 ### Status and result fields
 
-The status/result fields are: `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`requestedModel`/`skippedModels`/`attemptedModels`/`modelAttempts`, `toolCount`, `turnCount`, optional `launchResolvedExtensions`, optional `runtimeAcknowledgedExtensions`, and nested `children` when a child is allowed to launch subagents.
+The status/result fields are: `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`requestedModel`, `toolCount`, `turnCount`, optional `launchResolvedExtensions`, optional `runtimeAcknowledgedExtensions`, and nested `children` when a child is allowed to launch subagents.
 
-`requestedModel` records the launch's requested model (the explicit `--model` override, else the agent's configured model) before candidate filtering. `skippedModels` records candidates dropped by a cached exclusion before the first attempt, with the exclusion reason and expiry when the cache has one; it is omitted when no candidate was skipped.
+`requestedModel` records the launch's requested model (the explicit `--model` override, else the agent's configured model) before registry normalization.
 
 `launchResolvedExtensions` is parent-resolved launch intent only: it reports opaque extension identifiers and whether ambient extensions were disabled, without exposing raw extension paths or claiming the child runtime acknowledged that those extensions loaded.
 
@@ -281,7 +290,7 @@ Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi/subagents/ar
 - `{runId}_{agent}.jsonl`
 - `{runId}_{agent}_meta.json`
 
-Metadata records timing, usage, exit code, final model, attempted models, fallback attempt outcomes, and the resolved acceptance ledger with its parsed child report.
+Metadata records timing, usage, exit code, the resolved model, and the resolved acceptance ledger with its parsed child report. A strictly guarded retained-session recovery after a verified compaction abort may continue once on that same model; it never selects another model.
 
 For npm package projects, project-scoped artifacts need a `.npmignore` rule (or `.gitignore` when no `.npmignore` exists) or a `files` allowlist that does not include `.pi/subagents/`. pi-subagents warns at launch when these package settings can include the artifacts. Use `artifactDir: "session"` or `"temp"` to keep them outside the package worktree.
 
@@ -302,7 +311,7 @@ Async events:
 - `subagent:async-started`
 - `subagent:async-complete`
 
-The `subagent:async-started` payload includes `task`, the backwards-compatible first child task truncated to 50 characters, and `goal`, the workflow-level caller task truncated to 120 characters (falling back to the first child task). Companion UI extensions can combine `goal`, `workflowGraph`, and the live lifecycle artifacts under `asyncDir` without scraping terminal output.
+For regular async starts, the `subagent:async-started` payload includes redacted `task` and `goal` prompt fields. Async `workflowScript` roots emit the same event with `mode: "workflow"` after their initial `status.json` is durable; workflow roots can omit `task`, and any included prompt fields are redacted. Their keyed children are then announced dynamically through `subagent:child-status`. Companion UI extensions can combine those hints with the authoritative live lifecycle artifacts under `asyncDir` without scraping terminal output.
 
 Intercom delivery events:
 
