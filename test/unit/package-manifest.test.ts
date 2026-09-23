@@ -253,6 +253,9 @@ test("Pi package resolution stays export-map safe", () => {
 	for (const file of [...collectSourceFiles(path.join(projectRoot, "src")), ...collectSourceFiles(path.join(projectRoot, "test"))]) {
 		const source = fs.readFileSync(file, "utf-8");
 		assert.equal(piPackageJsonSubpathPattern.test(source), false, `${file} should not resolve unexported package.json subpaths`);
-		assert.equal(cjsPiPackageResolutionPattern.test(source), false, `${file} should not use CommonJS resolution for ESM-only Pi packages`);
+		// This smoke intentionally resolves a synthetic host alias, not an installed Pi package.
+		if (file !== path.join(projectRoot, "test/smoke/runner-loader-capability.mjs")) {
+			assert.equal(cjsPiPackageResolutionPattern.test(source), false, `${file} should not use CommonJS resolution for ESM-only Pi packages`);
+		}
 	}
 });
