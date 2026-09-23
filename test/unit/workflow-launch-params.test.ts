@@ -24,9 +24,8 @@ describe("workflow launch params", () => {
 			outputMode: "file-only",
 			savedOutputPath: "/tmp/review.md",
 			outputReference: { path: "/tmp/review.md", authoritative: true },
-			model: "provider/fallback",
+			model: "provider/primary",
 			requestedModel: "provider/primary",
-			skippedModels: [{ model: "provider/primary", reason: "cached rate limit", expiresAt: 123 }],
 			structuredOutput: { verdict: "pass" },
 			messages: [{ role: "assistant", content: "large" }],
 			toolCalls: [{ name: "read", args: {}, text: "read", expandedText: "large" }],
@@ -37,9 +36,8 @@ describe("workflow launch params", () => {
 		const compact = compactSuccessfulFileOnlyWorkflowResult(result);
 		assert.equal(compact.task, "[prompt redacted]");
 		assert.equal(compact.savedOutputPath, "/tmp/review.md");
-		assert.equal(compact.model, "provider/fallback");
+		assert.equal(compact.model, "provider/primary");
 		assert.equal(compact.requestedModel, "provider/primary");
-		assert.deepEqual(compact.skippedModels, result.skippedModels);
 		assert.equal(compact.structuredOutput, undefined);
 		assert.equal(compact.usage, undefined);
 		assert.equal(compact.messages, undefined);
@@ -390,6 +388,21 @@ describe("workflow launch params", () => {
 				workflowParentRunId: "workflow-run",
 				workflowKey: "gated",
 				acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
+			},
+		);
+	});
+
+	it("projects an object gate into a typed verify command", () => {
+		const gate = { command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 };
+		assert.deepEqual(
+			prepareWorkflowLaunchParams({}, { agent: "reviewer", task: "Review", gate }, "workflow-run", "typed"),
+			{
+				agent: "reviewer",
+				task: "Review",
+				workflowAwaitAsync: true,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "typed",
+				acceptance: { level: "verified", verify: [{ id: "gate", command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 }] },
 			},
 		);
 	});

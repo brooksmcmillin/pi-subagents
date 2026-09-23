@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { Worker } from "node:worker_threads";
-import { resolvePiLaunchToolPlan } from "../../src/runs/shared/child-tool-plan.ts";
+import { formatChildToolDiagnostic } from "../../src/runs/shared/tool-availability.ts";
 import { formatWorkflowJsonPreview, previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError } from "../../src/workflows/scripted-workflow.ts";
 import { workflowChildSummary } from "../../src/workflows/workflow-child-summary.ts";
 import { preflightWorkflowWorktrees } from "../../src/runs/foreground/subagent-executor.ts";
@@ -411,6 +411,7 @@ describe("scripted workflow runtime", () => {
 			assert.equal(validation.ok, true, tail);
 			assert.deepEqual(validation.errors, []);
 		}
+
 	});
 
 	it("rejects statically non-JSON workflow boundary values", () => {
@@ -944,26 +945,25 @@ describe("scripted workflow runtime", () => {
 		assert.equal(launches, 0);
 	});
 
-	it("classifies a review-lane missing tool contract as a failed child, not a completed review", async () => {
+	it("classifies a review lane whose child registry lacks repository tools as failed, not completed", async () => {
 		await assert.rejects(
 			runWorkflowScript({
 				script: `return await runs.run("review", { agent: "reviewer", task: "Review the diff" });`,
-				async launch(key) {
-					resolvePiLaunchToolPlan({
-						agentName: "reviewer",
-						tools: ["read", "grep", "find", "ls"],
-						hostAvailableBuiltins: [],
-					});
-					return { key, ok: true, output: "Unable to inspect the repository.", artifactPaths: [] };
+				async launch() {
+					throw new Error(formatChildToolDiagnostic({
+						agent: "reviewer",
+						required: ["read", "grep", "find", "ls"],
+						available: ["contact_supervisor"],
+						missing: ["read", "grep", "find", "ls"],
+					}));
 				},
 				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
 			}),
 			(error: unknown) => {
 				assert.ok(error instanceof WorkflowScriptError);
-				assert.match(error.message, /Run 'review' failed: Agent 'reviewer': tool contract could not be satisfied/);
-				assert.match(error.message, /lane infrastructure failure, not a completed review\/scout result/);
+				assert.match(error.message, /Run 'review' failed: Agent 'reviewer' requested unavailable child tools: read, grep, find, ls\./);
 				assert.equal(error.partial.children[0]?.ok, false);
-				assert.match(error.partial.children[0]?.error ?? "", /tool contract could not be satisfied/);
+				assert.match(error.partial.children[0]?.error ?? "", /requested unavailable child tools/);
 				assert.equal(error.partial.trace.find((entry) => entry.key === "review" && entry.state === "failed")?.state, "failed");
 				const summary = workflowChildSummary({
 					parentToolCallId: "tool-call",
@@ -1030,6 +1030,56 @@ describe("scripted workflow runtime", () => {
 			}),
 			(error: unknown) => error instanceof WorkflowScriptError && /gate cannot be combined with acceptance/.test(error.message),
 		);
+	});
+
+	it("accepts an object gate with json output and rejects malformed object gates", async () => {
+		const launches: Record<string, unknown>[] = [];
+		const gate = { command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 };
+		await runWorkflowScript({
+			script: `return runs.run("typed", { agent: "reviewer", gate: ${JSON.stringify(gate)} });`,
+			async launch(key, params) { launches.push(params); return { key, ok: true, output: "done", artifactPaths: [] }; },
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		assert.deepEqual(launches[0]?.gate, gate);
+		for (const [bad, pattern] of [
+			[`{ command: "x", output: "yaml" }`, /gate\.output must be "json"/],
+			[`{ command: "x", schema: {} }`, /gate\.schema requires gate\.output/],
+			[`{ command: "x", cwd: "." }`, /gate\.cwd is not supported/],
+			[`{ output: "json" }`, /non-empty command string/],
+		] as const) {
+			await assert.rejects(
+				runWorkflowScript({
+					script: `return runs.run("invalid", { agent: "reviewer", gate: ${bad} });`,
+					async launch(key) { return { key, ok: true, output: "done", artifactPaths: [] }; },
+					async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+				}),
+				(error: unknown) => error instanceof WorkflowScriptError && pattern.test(error.message),
+				bad,
+			);
+		}
+	});
+
+	it("lanes block on a verdict supplied through a typed gate", async () => {
+		const launched: string[] = [];
+		const result = await runWorkflowScript({
+			script: `
+				const board = await runs.lanes([{ key: "pr", stages: [
+					{ key: "review", agent: "reviewer", gate: { command: "classify.sh", output: "json" } },
+					{ key: "land", agent: "worker", task: "Land it" }
+				] }]);
+				return board[0].stages.map((stage) => [stage.key, stage.state, stage.verdict ?? "none"]);
+			`,
+			async launch(key, params) {
+				launched.push(key);
+				// The runtime bridges a passing json gate into structuredOutput; the workflow only sees the result.
+				return key === "pr.review"
+					? { key, ok: true, output: "", structuredOutput: { verdict: "blocked", action: "writer-fix" }, artifactPaths: [] }
+					: { key, ok: true, output: "done", artifactPaths: [] };
+			},
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		assert.deepEqual(launched, ["pr.review"]);
+		assert.deepEqual(result.value, [["review", "blocked", "blocked"], ["land", "skipped", "none"]]);
 	});
 
 	it("reuses a gated key when acceptance false is explicit", async () => {
@@ -3054,6 +3104,26 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(children.map((child) => child.key), ["a", "b", "c"]);
 		assert.ok(children.every((child) => child.ok), "every child should still report success");
 		assert.equal(result.children.filter((child) => !child.ok).length, 0);
+	});
+
+	it("returns running launch receipts without failure or child-settlement notifications", async () => {
+		const notifications: unknown[] = [];
+		let launches = 0;
+		const result = await runWorkflowScript({
+			workflowRunId: "dispatch-only",
+			script: `const first = await runs.run("a", { agent: "worker", async: true });
+				const reused = await runs.run("a", { agent: "worker", async: true });
+				const batch = await runs.all([{ key: "b", agent: "worker", async: true }]);
+				return [first, reused, ...batch];`,
+			onChildSettled: (notice) => notifications.push(notice),
+			async launch(key) { launches++; return { key, ok: false, state: "running", runId: `${key}-run`, output: "", asyncDir: `/tmp/${key}`, artifactPaths: [`/tmp/${key}`] }; },
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		assert.equal(launches, 2);
+		assert.deepEqual(notifications, []);
+		assert.equal(result.children.length, 2);
+		assert.ok(result.children.every((child) => child.state === "running" && child.error === undefined && !child.ok));
+		assert.equal(result.trace.some((entry) => entry.state === "completed" || entry.state === "failed"), false);
 	});
 
 	it("notifies onChildSettled for each child as it completes while workflow runs", async () => {

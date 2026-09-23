@@ -274,7 +274,7 @@ export class MainWatchdogRuntime {
 		return this.getSnapshot();
 	}
 
-	reset(_reason = "reset", options: { clearReviewInputSignature?: boolean; resetChangeSignature?: boolean; clearLspLedger?: boolean; clearScope?: boolean } = {}): void {
+	reset(_reason = "reset", options: { clearReviewInputSignature?: boolean; resetChangeSignature?: boolean; clearLspLedger?: boolean; clearScope?: boolean; clearActivity?: boolean } = {}): void {
 		this.activeReviewAbortController?.abort();
 		this.abortActiveAgentEnd();
 		this.epoch++;
@@ -296,10 +296,8 @@ export class MainWatchdogRuntime {
 			this.lspLedger.reset();
 			this.lastLspSnapshot = undefined;
 		}
-		if (options.clearScope) {
-			this.scope.reset();
-			this.clearActivity();
-		}
+		if (options.clearScope) this.scope.reset();
+		if (options.clearScope || options.clearActivity) this.clearActivity();
 		if (options.clearReviewInputSignature) this.lastReviewInputSignature = undefined;
 		if (options.resetChangeSignature) this.resetRepoChangeBaseline({ reviewed: true });
 		this.guard.reset();
@@ -347,7 +345,7 @@ export class MainWatchdogRuntime {
 		this.resetRepoChangeBaseline();
 	}
 
-	handleTurnEnd(event: unknown, ctx: ContextLike): void {
+	handleTurnEnd(event: unknown, ctx: ContextLike, structuredTerminal = false): void {
 		if (this.disposed) return;
 		this.refreshConfig(ctx.cwd);
 		if (!this.isEnabled()) return;
@@ -364,6 +362,7 @@ export class MainWatchdogRuntime {
 				includeUserPrompt: this.includeUserPromptInNextDelta,
 				userPrompt: this.userPrompt,
 				events: [event],
+				structuredTerminal,
 			});
 			this.includeUserPromptInNextDelta = false;
 			this.enqueueDelta(delta);

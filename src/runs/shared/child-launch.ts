@@ -23,7 +23,7 @@ import type { StructuredOutputRuntime } from "./structured-output.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { RuntimeAcknowledgedChildExtensions } from "../../shared/types.ts";
 import { encodeExtensionBindings, PI_SUBAGENT_EXTENSION_BINDINGS_ENV, type ExtensionBindings } from "./extension-bindings.ts";
-import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "./capability-ceiling.ts";
+import { intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "./capability-ceiling.ts";
 import {
 	isSubagentRuntimeExtensionPath,
 	projectLaunchResolvedChildExtensions,
@@ -35,7 +35,6 @@ import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { createCapturedChildHooks, withChildSessionErrorReporting } from "./child-hooks.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
-import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
 import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
@@ -99,7 +98,6 @@ export interface BuildInProcessChildLaunchInput {
 	structuredOutput?: StructuredOutputRuntime;
 	fileHandoffPath?: string;
 	fast?: boolean;
-	modelCandidates?: readonly string[];
 	toolBudget?: ResolvedToolBudget;
 	permissionRules?: PermissionRules;
 	permissionAuditPath?: string;
@@ -108,6 +106,7 @@ export interface BuildInProcessChildLaunchInput {
 	waitToolEnabled?: boolean;
 	waitToolDefaultTimeoutMs?: number;
 	allowNestedSubagents?: boolean;
+	descendantAllowedAgents?: string[];
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	thinkingCeiling?: ThinkingLevel;
 	maxSubagentDepth?: number;
@@ -121,17 +120,9 @@ export interface BuildInProcessChildLaunchInput {
 	 * them and exposes the child environment external extensions read.
 	 */
 	host: "parent" | "runner";
-	/**
-	 * Pi core tool names the host runtime provides. When set, child tool plans
-	 * intersect known core slots with this set; declared non-core names remain
-	 * for child startup validation. Review/scout lanes fail closed when a requested,
-	 * still-permitted repository inspection tool is missing from that set.
-	 */
-	hostAvailableBuiltins?: readonly string[];
 }
 
 export interface InProcessChildCapture {
-	completionIntentContext?(): ArbiterModelContext | undefined;
 	structuredOutput(): { called: boolean; value?: unknown; acceptanceReport?: unknown; acceptanceReportProvided: boolean };
 	toolDiagnostic(): ChildToolDiagnostic | undefined;
 	runtimeAcknowledgedExtensions(): RuntimeAcknowledgedChildExtensions | undefined;
@@ -192,6 +183,13 @@ function childStorage(input: BuildInProcessChildLaunchInput): ChildSessionStorag
 
 export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput): InProcessChildLaunch {
 	const requiredExtensions = input.requiredExtensions ?? input.inherited?.requiredExtensions ?? resolveRequiredChildExtensions(input.parentSessionId);
+	const agentCapabilityCeiling: ResolvedSubagentCapabilityCeiling | undefined = input.descendantAllowedAgents === undefined
+		? undefined
+		: { version: 1, allowedAgents: [...input.descendantAllowedAgents], denyExtensions: false, sources: [`agent:${input.childAgentName}`] };
+	const inheritedCeiling = inheritedCapabilityCeiling(input.inherited);
+	const capabilityCeilingForPlanning = agentCapabilityCeiling && !input.capabilityCeiling && !inheritedCeiling
+		? { version: 1 as const, denyExtensions: false, sources: [] }
+		: input.capabilityCeiling;
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: input.tools,
 		excludeTools: input.excludeTools,
@@ -205,14 +203,16 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		structuredOutput: Boolean(input.structuredOutput),
 		fast: input.fast,
 		model: input.model,
-		modelCandidates: input.modelCandidates,
-		capabilityCeiling: input.capabilityCeiling,
-		inheritedCapabilityCeiling: inheritedCapabilityCeiling(input.inherited),
+		capabilityCeiling: capabilityCeilingForPlanning,
+		inheritedCapabilityCeiling: inheritedCeiling,
 		agentName: input.childAgentName,
 		permissionRules: input.permissionRules,
 		runtimeSnapshotHost: input.runtimeSnapshotHost,
-		hostAvailableBuiltins: input.hostAvailableBuiltins,
 	});
+	toolPlan.capabilityCeiling = intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling, agentCapabilityCeiling);
+	if (toolPlan.capabilityAudit && toolPlan.capabilityCeiling) {
+		toolPlan.capabilityAudit = { ...toolPlan.capabilityAudit, ceiling: toolPlan.capabilityCeiling };
+	}
 
 	const inherited = input.inherited;
 	const fanout = toolPlan.fanoutAuthorized;
@@ -241,8 +241,10 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	let structuredAcceptanceReport: unknown;
 	let structuredCalled = false;
 	let structuredAcceptanceProvided = false;
+	const structuredTerminalState = { captured: false };
 
 	const config: ChildRuntimeConfig = {
+		cwd: input.cwd,
 		...(input.runId ? { runId: input.runId } : {}),
 		agent: input.childAgentName,
 		childIndex: input.childIndex,
@@ -277,6 +279,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 			? {
 				structuredOutput: {
 					schema: input.structuredOutput.schema,
+					terminalState: structuredTerminalState,
 					...(input.structuredOutput.acceptanceReportPath
 						? { acceptanceReport: input.structuredOutput.acceptanceReportRequired ? "required" as const : "optional" as const }
 						: {}),
@@ -285,6 +288,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 						structuredValue = value;
 						structuredAcceptanceProvided = acceptanceReport !== undefined;
 						structuredAcceptanceReport = acceptanceReport;
+						structuredTerminalState.captured = true;
 					},
 				},
 			}
@@ -293,7 +297,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(toolPlan.effectiveMcpTools.length > 0 ? { mcpDirectTools: toolPlan.effectiveMcpTools } : {}),
 		fast: input.fast === true,
 	};
-	const capturedHooks = createCapturedChildHooks(config, input.host === "runner");
+	const capturedHooks = createCapturedChildHooks(config);
 
 	const extensionPaths = toolPlan.extensionArgs.filter((extensionPath) => !isSubagentRuntimeExtensionPath(extensionPath));
 	const ambientExtensions = input.host === "runner" && !toolPlan.disableAmbientExtensions;
@@ -333,7 +337,6 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		config,
 		session,
 		capture: {
-			completionIntentContext: capturedHooks.completionIntentContext,
 			structuredOutput: () => ({ called: structuredCalled, value: structuredValue, acceptanceReport: structuredAcceptanceReport, acceptanceReportProvided: structuredAcceptanceProvided }),
 			toolDiagnostic: capturedHooks.toolDiagnostic,
 			runtimeAcknowledgedExtensions: capturedHooks.runtimeAcknowledgedExtensions,

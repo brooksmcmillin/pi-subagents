@@ -9,9 +9,10 @@ const redirected = new Set([
 if (typeof nodeModule.registerHooks === "function") {
 	nodeModule.registerHooks({
 		resolve(specifier, context, nextResolve) {
-			if ((nativeRunner ? aliases[specifier] : redirected.has(specifier) && aliases[specifier])) {
+			const alias = nativeRunner ? aliases[specifier] : redirected.has(specifier) && aliases[specifier];
+			if (alias) {
 				// This hook also serves require.resolve, which cannot resolve file URLs.
-				return nextResolve(aliases[specifier], context);
+				return nextResolve(alias, context);
 			}
 			try {
 				return nextResolve(specifier, context);
@@ -23,6 +24,6 @@ if (typeof nodeModule.registerHooks === "function") {
 	});
 } else {
 	nodeModule.register(new URL("./runner-peer-loader.mjs", import.meta.url), {
-		data: { aliases },
+		data: { aliases, nativeRunner },
 	});
 }

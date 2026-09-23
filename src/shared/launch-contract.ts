@@ -50,12 +50,12 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		inheritSkills: agent.inheritSkills,
 		model: agent.model,
 		modelProvider: agent.modelProvider,
-		fallbackModels: agent.fallbackModels,
 		fast: agent.fast,
 		thinking: agent.thinking,
 		tools: agent.tools,
 		excludeTools: agent.excludeTools,
 		allowNestedSubagents: agent.allowNestedSubagents,
+		allowedAgents: agent.allowedAgents,
 		mcpDirectTools: agent.mcpDirectTools,
 		extensions: agent.extensions,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions,
@@ -73,7 +73,6 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		acceptanceRole: agent.acceptanceRole,
 		interactive: agent.interactive,
 		maxSubagentDepth: agent.maxSubagentDepth,
-		completionGuard: agent.completionGuard,
 		toolBudget: agent.toolBudget,
 		memory: agent.memory,
 	};
@@ -89,7 +88,6 @@ export interface LaunchBindingInput {
 	/** Caller task; runtime acceptance/output task annotations are explicitly outside the preflight-known subset. */
 	task?: string;
 	model?: string;
-	modelCandidates?: string[];
 	fast?: boolean;
 	thinking?: string;
 	systemPrompt?: string | null;
@@ -115,9 +113,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		version: LAUNCH_BINDING_PROJECTION_VERSION,
 		definitionDigest: input.definitionDigest,
 		taskDigest: input.task === undefined ? undefined : stableJsonDigest(input.task),
-		// The ordered candidate set already contains each attempted model; keeping only
-		// this set makes retries correlate to the same preflight binding.
-		modelCandidates: input.modelCandidates,
+		model: input.model,
 		fast: input.fast,
 		thinking: input.thinking,
 		systemPromptDigest: input.systemPrompt === undefined || input.systemPrompt === null ? undefined : stableJsonDigest(input.systemPrompt),
@@ -156,7 +152,7 @@ export type LaunchBindingSource = LaunchBindingIdentity
 	& Pick<LaunchBindingInput, "fast" | "thinking" | "skills" | "outputPath" | "outputMode" | "structuredOutputSchema" | "extensionBindings">
 	& {
 		task: string;
-		modelCandidates: string[];
+		model?: string;
 		/** Effective child system prompt before runtime acceptance prose. */
 		systemPrompt: string;
 		toolPlan: Pick<PiLaunchToolPlan, "effectiveToolAllowlist" | "excludeTools" | "extensionArgs" | "effectiveMcpTools">;
@@ -184,7 +180,7 @@ export function resolveLaunchBinding(source: LaunchBindingSource): LaunchBinding
 		launchContractDigest: launchBindingDigest({
 			...identity,
 			task: source.task,
-			modelCandidates: source.modelCandidates,
+			model: source.model,
 			fast: source.fast,
 			thinking: source.thinking || undefined,
 			systemPrompt: source.systemPrompt,

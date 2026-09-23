@@ -12,8 +12,8 @@ export const KNOWN_FIELDS = new Set([
 	"tools",
 	"excludeTools",
 	"allowNestedSubagents",
+	"allowedAgents",
 	"model",
-	"fallbackModels",
 	"fast",
 	"thinking",
 	"systemPromptMode",
@@ -40,7 +40,6 @@ export const KNOWN_FIELDS = new Set([
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
-	"completionGuard",
 	"toolBudget",
 	"permission",
 	"permissions",
@@ -80,10 +79,11 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
 		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
 	}
+	if (config.allowedAgents !== undefined || preserve("allowedAgents")) {
+		lines.push(`allowedAgents: ${joinComma(config.allowedAgents) ?? ""}`);
+	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
-	const fallbackModelsValue = joinComma(config.fallbackModels);
-	if (fallbackModelsValue || preserve("fallbackModels")) lines.push(`fallbackModels: ${fallbackModelsValue ?? ""}`);
 	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
 	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
 		lines.push(`thinking: ${config.thinking ?? ""}`);
@@ -142,9 +142,6 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	const maxSubagentDepth = config.maxSubagentDepth;
 	if (typeof maxSubagentDepth === "number" && Number.isInteger(maxSubagentDepth) && maxSubagentDepth >= 0) {
 		lines.push(`maxSubagentDepth: ${maxSubagentDepth}`);
-	}
-	if (config.completionGuard === false || preserve("completionGuard")) {
-		lines.push(`completionGuard: ${config.completionGuard === undefined ? "" : config.completionGuard ? "true" : "false"}`);
 	}
 	if (config.toolBudget || preserve("toolBudget")) {
 		lines.push(`toolBudget: ${config.toolBudget ? JSON.stringify(config.toolBudget) : ""}`);

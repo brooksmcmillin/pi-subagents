@@ -49,6 +49,7 @@ interface AsyncRunStepSummary {
 	structured?: boolean;
 	status: AsyncJobStep["status"];
 	runner?: AsyncJobStep["runner"];
+	externalProcess?: AsyncJobStep["externalProcess"];
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -68,8 +69,6 @@ interface AsyncRunStepSummary {
 	contextLimit?: number;
 	thinking?: string;
 	requestedModel?: string;
-	skippedModels?: import("../../shared/types.ts").SkippedModel[];
-	attemptedModels?: string[];
 	sessionFile?: string;
 	transcriptPath?: string;
 	error?: string;
@@ -351,6 +350,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.structured ? { structured: step.structured } : {}),
 			status: step.status,
 			...(step.runner ? { runner: step.runner } : {}),
+			...(step.externalProcess ? { externalProcess: step.externalProcess } : {}),
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
@@ -370,9 +370,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.contextLimit !== undefined ? { contextLimit: step.contextLimit } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.thinkingCeiling ? { thinkingCeiling: step.thinkingCeiling } : {}),
-			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
 			...(step.requestedModel ? { requestedModel: step.requestedModel } : {}),
-			...(step.skippedModels ? { skippedModels: step.skippedModels } : {}),
 			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			...(step.transcriptPath ? { transcriptPath: step.transcriptPath } : {}),
 			...(step.error ? { error: step.error } : {}),
@@ -550,6 +548,14 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		try {
+			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
+			if (options.sessionId !== undefined) {
+				const stored = readStatus(asyncDir);
+				if (stored && stored.sessionId !== options.sessionId) {
+					observeStatus?.(stored);
+					continue;
+				}
+			}
 			const reconciliation = options.reconcile === false
 				? undefined
 				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);

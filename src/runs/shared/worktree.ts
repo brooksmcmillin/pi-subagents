@@ -439,9 +439,14 @@ function shortWorktreeHash(value: string): string {
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
-	if (Buffer.byteLength(value, "utf-8") <= maxBytes) return value;
-	const truncated = Buffer.from(value, "utf-8").subarray(0, maxBytes).toString("utf-8");
-	return /[\uD800-\uDFFF]$/u.test(truncated) ? truncated.slice(0, -1) : truncated;
+	const bytes = Buffer.from(value, "utf-8");
+	if (bytes.length <= maxBytes) return value;
+	// Back off to a code-point boundary before decoding: cutting mid-sequence
+	// emits U+FFFD (3 bytes per dangling byte), which can push the re-encoded
+	// result beyond maxBytes (e.g. a 256-byte cap yields a 258-byte string).
+	let end = maxBytes;
+	while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+	return bytes.subarray(0, end).toString("utf-8");
 }
 
 /** Convert an arbitrary label to a single safe filesystem/branch component. */
@@ -743,13 +748,35 @@ export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, inde
 function linkNodeModulesIfPresent(toplevel: string, worktreePath: string): boolean {
 	const nodeModulesPath = path.join(toplevel, "node_modules");
 	const nodeModulesLinkPath = path.join(worktreePath, "node_modules");
-	if (!fs.existsSync(nodeModulesPath) || fs.existsSync(nodeModulesLinkPath)) return false;
+	const hasDirectoryEntry = (candidate: string): boolean => {
+		try { fs.lstatSync(candidate); return true; }
+		catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+	};
 	try {
-		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath);
+		if (hasDirectoryEntry(nodeModulesLinkPath)) return false;
+		let sourceRealPath: string;
+		try {
+			if (!fs.statSync(nodeModulesPath).isDirectory()) throw new Error("source node_modules is not a directory");
+			sourceRealPath = fs.realpathSync.native(nodeModulesPath);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+		fs.symlinkSync(nodeModulesPath, nodeModulesLinkPath, process.platform === "win32" ? "junction" : "dir");
+		if (!fs.lstatSync(nodeModulesLinkPath).isSymbolicLink()
+			|| fs.realpathSync.native(nodeModulesLinkPath) !== sourceRealPath) {
+			throw new Error("created link does not resolve to the source node_modules");
+		}
 		return true;
-	} catch {
-		// Symlink creation is optional (e.g., unsupported filesystems on CI runners).
-		return false;
+	} catch (error) {
+		const code = error instanceof Error && "code" in error && typeof error.code === "string" ? `${error.code}: ` : "";
+		throw new Error(
+			`failed to link node_modules from ${nodeModulesPath} to ${nodeModulesLinkPath}: ${code}${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
 	}
 }
 

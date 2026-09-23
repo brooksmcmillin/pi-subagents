@@ -52,7 +52,6 @@ interface AgentConfig {
 	defaultContext?: "fresh" | "fork";
 	systemPrompt?: string;
 	model?: string;
-	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -70,7 +69,6 @@ interface AgentConfig {
 	toolBudget?: { soft?: number; hard: number; block?: string[] | "*" };
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
