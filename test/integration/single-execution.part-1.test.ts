@@ -16,6 +16,7 @@ import {
 	mockAssistantMessage, readCall, readCallArgs, readAllCallArgs, makeExecutor,
 	installSingleExecutionHooks,
 } from "../support/single-execution-fixture.ts";
+import { waitForAsyncResultFile, waitForAsyncState } from "../support/async-execution-fixture.ts";
 import assert from "node:assert/strict";
 import fsDefault, * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -34,6 +35,7 @@ import { discoverAgents } from "../../src/agents/agents.ts";
 import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { INTERCOM_BRIDGE_MARKER, resolveIntercomSessionTarget } from "../../src/intercom/intercom-bridge.ts";
 import { stableJsonDigest } from "../../src/shared/launch-contract.ts";
+import { cleanupOldArtifacts } from "../../src/shared/artifacts.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import {
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -951,11 +953,9 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(forwarded?.args, { task: "nightly review" });
 	});
 
-	it("rejects a static spawn-budget mismatch before discovering or launching children", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("rejects a static spawn-budget mismatch before launching children", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const before = fs.readdirSync(tempDir).sort();
-		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
-			throw new Error("spawn-budget validation must not discover or launch agents");
-		});
+		const executor = makeExecutor([makeAgent("echo")]);
 		const script = [
 			`const results = await runs.all([`,
 			`  { key: "a", agent: "echo", task: "A" },`,
@@ -987,14 +987,13 @@ Answer only from the supplied synthetic text.
 
 	it("rejects invalid scripts before async allocation without an explicit validate call", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const asyncJobs: SubagentState["asyncJobs"] = new Map();
-		const executor = makeExecutor([makeAgent("echo")], {}, true, undefined, true, asyncJobs, undefined, undefined, createEventBus(), () => {
-			throw new Error("invalid scripts must not discover or launch agents");
-		});
+		const executor = makeExecutor([makeAgent("echo")], {}, true, undefined, true, asyncJobs);
 		const scripts = [
 			"{",
 			`return runs.run("bad key", { agent: "echo", task: "Never launch" });`,
 			`return runs.all({ first: { agent: "echo", task: "Wrong fanout syntax" } });`,
 			`const lane = async () => runs.run("child", { agent: "echo" }); return lane();`,
+			`await runs.run("first", { agent: "echo" }); return runs.run("typo", { agent: "echp" });`,
 		];
 		for (const [index, script] of scripts.entries()) {
 			const scriptPath = path.join(tempDir, `invalid-${index}.js`);
@@ -1014,7 +1013,7 @@ Answer only from the supplied synthetic text.
 					assert.equal(typeof payload.errors?.[0]?.line, "number");
 					assert.equal(result.details.asyncId, undefined);
 					assert.equal(result.details.asyncDir, undefined);
-					assert.equal(result.details.workflow, undefined);
+					assert.deepEqual(result.details.workflow, { failureKind: "validation", trace: [], emits: [], console: [] });
 					assert.equal(asyncJobs.size, 0);
 					assert.equal(mockPi.callCount(), 0);
 					assert.deepEqual(fs.readdirSync(tempDir, { recursive: true }).sort(), before);
@@ -1026,9 +1025,7 @@ Answer only from the supplied synthetic text.
 
 	it("validates workflow scripts without launching children or creating artifacts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const before = fs.readdirSync(tempDir).sort();
-		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
-			throw new Error("validate must not discover or launch agents");
-		});
+		const executor = makeExecutor([makeAgent("echo")]);
 
 		const result = await executor.executePublic(
 			"offline-validation",
@@ -1473,13 +1470,14 @@ Answer only from the supplied synthetic text.
 		);
 		assert.ok(failed.details.asyncDir);
 		const failedStatusPath = path.join(failed.details.asyncDir!, "status.json");
-		let failedStatus: { state?: string; workflowGraph?: { nodes?: Array<{ hostStep?: { state?: string; reasonCode?: string; exitCode?: number | null } }> } } = {};
+		let failedStatus: Partial<Pick<AsyncStatus, "state" | "workflow" | "workflowGraph">> = {};
 		for (let attempt = 0; attempt < 100; attempt += 1) {
 			failedStatus = JSON.parse(fs.readFileSync(failedStatusPath, "utf8"));
 			if (failedStatus.state === "complete" || failedStatus.state === "failed") break;
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 		assert.equal(failedStatus.state, "failed");
+		assert.equal(failedStatus.workflow?.failureKind, "script");
 		assert.deepEqual(failedStatus.workflowGraph?.nodes?.map((node) => node.hostStep && { state: node.hostStep.state, reasonCode: node.hostStep.reasonCode, exitCode: node.hostStep.exitCode }), [{ state: "error", reasonCode: "command_failed", exitCode: 3 }]);
 		const failedReceipt = JSON.parse(fs.readFileSync(path.join(failed.details.asyncDir!, "workflow-receipt.json"), "utf8")) as { state?: string; hostSteps?: Array<{ state?: string; reasonCode?: string; exitCode?: number | null }> };
 		assert.equal(failedReceipt.state, "failed");
@@ -1493,8 +1491,9 @@ Answer only from the supplied synthetic text.
 		const requestCwd = path.join(tempDir, "request-cwd");
 		fs.mkdirSync(requestCwd);
 		fs.writeFileSync(path.join(requestCwd, "workflow.js"), `return runs.run("bad key", { agent: "echo" });`);
-		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), () => {
-			throw new Error("validate must not discover or launch agents");
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), (cwd) => {
+			assert.equal(cwd, requestCwd);
+			return [makeAgent("echo")];
 		});
 
 		const result = await executor.executePublic(
@@ -1649,13 +1648,12 @@ Answer only from the supplied synthetic text.
 		assert.match(result.content[0]?.text ?? "", /Preflight: v1 · complete · 1 lane/);
 		assert.match(result.content[0]?.text ?? "", /Async workflow/);
 		assert.doesNotMatch(result.content[0]?.text ?? "", /argument-sentinel-2233/);
-		const statusPath = path.join(result.details.asyncDir!, "status.json");
-		let status: { runId?: string; toolCallId?: string; cwd?: string; sessionRoot?: string; state?: string; preflight?: unknown; steps?: Array<{ agent?: string; sessionName?: string; label?: string; phase?: string; workflowKey?: string; parentWorkflowRunId?: string; async?: boolean }>; workflow?: { value?: unknown; args?: Record<string, unknown>; argsDigest?: string; emits?: unknown[]; trace?: Array<{ key?: string; agent?: string; label?: string; phase?: string; state?: string }> } } = {};
-		for (let attempt = 0; attempt < 300; attempt++) {
-			status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-			if (status.state === "complete" || status.state === "failed") break;
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
+		type WorkflowStatus = { runId?: string; toolCallId?: string; cwd?: string; sessionRoot?: string; state?: string; preflight?: unknown; steps?: Array<{ agent?: string; sessionName?: string; label?: string; phase?: string; workflowKey?: string; parentWorkflowRunId?: string; async?: boolean }>; workflow?: { value?: unknown; args?: Record<string, unknown>; argsDigest?: string; emits?: unknown[]; trace?: Array<{ key?: string; agent?: string; label?: string; phase?: string; state?: string }> } };
+		const status = await waitForAsyncState(
+			workflowRunId,
+			(candidate) => ["complete", "failed", "partial", "paused", "stopped", "rejected"].includes(candidate.state ?? ""),
+			60_000,
+		) as WorkflowStatus;
 		assert.equal(status.state, "complete");
 		assert.equal(status.runId, workflowRunId);
 		assert.equal(status.toolCallId, toolCallId);
@@ -2233,24 +2231,15 @@ Answer only from the supplied synthetic text.
 		const { asyncId: workflowRunId, asyncDir } = result.details;
 		assert.ok(workflowRunId);
 		assert.ok(asyncDir);
-		const statusPath = path.join(asyncDir, "status.json");
 		const eventsPath = path.join(asyncDir, "events.jsonl");
 		const resultPath = path.join(DIRS.results, `${workflowRunId}.json`);
-		let liveStatus: AsyncStatus | undefined;
-		const activityDeadline = Date.now() + 5_000;
-		while (Date.now() < activityDeadline) {
-			if (fs.existsSync(statusPath)) {
-				const candidate = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatus;
-				if (candidate.activityState === "needs_attention" && !candidate.steps?.[0]?.currentTool
-					&& controlPayloads.some((payload) => payload.event?.type === "needs_attention")) {
-					liveStatus = candidate;
-					break;
-				}
-			}
-			await new Promise((resolve) => setTimeout(resolve, 50));
-		}
+		const liveStatus = await waitForAsyncState(
+			workflowRunId,
+			(candidate) => candidate.activityState === "needs_attention" && !candidate.steps?.[0]?.currentTool
+				&& controlPayloads.some((payload) => payload.event?.type === "needs_attention"),
+			60_000,
+		) as AsyncStatus;
 
-		assert.ok(liveStatus, "expected workflow status to expose idle child attention");
 		assert.equal(liveStatus.activityState, "needs_attention");
 		assert.equal(liveStatus.steps?.[0]?.activityState, "needs_attention");
 		assert.equal(liveStatus.steps?.[0]?.workflowKey, "stalled-review");
@@ -2284,11 +2273,7 @@ Answer only from the supplied synthetic text.
 
 		assert.equal(fs.existsSync(resultPath), false, "child must remain live until attention is observed");
 		fs.writeFileSync(releasePath, "release");
-		const completionDeadline = Date.now() + 5_000;
-		while (!fs.existsSync(resultPath)) {
-			if (Date.now() > completionDeadline) assert.fail("Timed out waiting for async workflow completion");
-			await new Promise((resolve) => setTimeout(resolve, 50));
-		}
+		await waitForAsyncResultFile(workflowRunId, 60_000);
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 		fs.rmSync(resultPath, { force: true });
 	});
@@ -2505,10 +2490,7 @@ Answer only from the supplied synthetic text.
 		assert.ok(childRunId);
 		const childDir = path.join(DIRS.async, childRunId);
 		const childResultPath = path.join(DIRS.results, `${childRunId}.json`);
-		for (let attempt = 0; attempt < 200 && !fs.existsSync(childResultPath); attempt++) {
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-		assert.equal(fs.existsSync(childResultPath), true);
+		await waitForAsyncResultFile(childRunId, 60_000);
 		assert.equal(fs.existsSync(path.join(childDir, "workflow-result.json")), false);
 		fs.rmSync(childDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 		fs.rmSync(childResultPath, { force: true });
@@ -3641,6 +3623,7 @@ Answer only from the supplied synthetic text.
 		assert.match(result.content[0]?.text ?? "", /workflowScript validation failed before run creation; no children launched/);
 		assert.match(result.content[0]?.text ?? "", /does not support nested async functions/);
 		assert.deepEqual(result.details.results, []);
+		assert.equal(result.details.workflow?.failureKind, "validation");
 	});
 
 	it("rejects a workflow child reusing a published file-only output before launch", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -3923,6 +3906,97 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(result.details.workflow?.value, ["first child completed", "second child completed"]);
 	});
 
+	it("cuts an oversized foreground workflow return, keeps the call trace, and saves the full result", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "scan done" });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"scripted-workflow-large-return",
+			{ async: false, workflowScript: `await runs.run("scan", { agent: "echo", task: "Scan" }); return "x".repeat(210000);` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const text = result.content[0]?.text ?? "";
+		assert.equal(result.isError, undefined, text);
+		assert.ok(Buffer.byteLength(text, "utf-8") < 210_000);
+		assert.match(text.slice(-500), /Call trace:\n- run scan: started\n- run scan: completed/);
+		const savedPath = /\[TRUNCATED: .* - full output at (.+)\]/.exec(text)?.[1];
+		assert.ok(savedPath, text.slice(0, 500));
+		assert.ok(!savedPath.includes(`${path.sep}outputs${path.sep}`), `full result must not share the child outputs tree: ${savedPath}`);
+		assert.ok(fs.readFileSync(savedPath, "utf-8").includes(`Return:\n${"x".repeat(210000)}`));
+		// Age-based artifact retention must remove the saved full result like other run artifacts.
+		const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+		fs.utimesSync(savedPath, old, old);
+		fs.rmSync(path.join(TEMP_ARTIFACTS_DIR, ".last-cleanup"), { force: true });
+		cleanupOldArtifacts(TEMP_ARTIFACTS_DIR, 1);
+		assert.equal(fs.existsSync(savedPath), false);
+	});
+
+	it("marks cut async workflow return previews and points to the full value", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const result = await executor.execute("scripted-workflow-large-async-return", { async: true, workflowScript: `return "y".repeat(2000);` }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const workflowRunId = result.details.asyncId!;
+		const statusPath = path.join(result.details.asyncDir!, "status.json");
+		let status: { state?: string } = {};
+		for (let attempt = 0; attempt < 300; attempt++) {
+			status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			if (status.state === "complete" || status.state === "failed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(status.state, "complete");
+		const resultPath = path.join(DIRS.results, `${workflowRunId}.json`);
+		const summary = (JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { summary?: string }).summary ?? "";
+		assert.ok(summary.includes(`Return: ${"y".repeat(1000)}… (truncated; full return value and emits: ${statusPath} (workflow.value, workflow.emits))`), summary);
+		const statusText = (await executor.execute("status-large-return", { action: "status", id: workflowRunId }, new AbortController().signal, undefined, makeMinimalCtx(tempDir))).content[0]?.text ?? "";
+		assert.match(statusText, /Return: "y{239}…/);
+		assert.ok(statusText.includes(`Full return value and emits: ${statusPath} (workflow.value, workflow.emits)`), statusText);
+		fs.rmSync(result.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+	});
+
+	it("bounds a large child error in the workflow call trace", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ exitCode: 1, stderr: "c".repeat(300000) });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"scripted-workflow-large-child-error",
+			{ async: false, workflowScript: `try { await runs.run("scan", { agent: "echo", task: "Scan" }); } catch {} return "done";` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const text = result.content[0]?.text ?? "";
+		assert.ok(Buffer.byteLength(text, "utf-8") < 50_000, `${Buffer.byteLength(text, "utf-8")} bytes`);
+		assert.match(text, /- run scan: failed [\s\S]*c… \(\+\d+ chars\)/);
+		const savedPath = /\[TRUNCATED: trace errors shortened - full output at (.+)\]/.exec(text)?.[1];
+		assert.ok(savedPath && fs.readFileSync(savedPath, "utf-8").includes("c".repeat(300000)), text.slice(-400));
+	});
+
+	it("caps an oversized thrown workflow error in foreground text and async summaries", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const workflowScript = `throw new Error("e".repeat(300000));`;
+		const foreground = await executor.execute("scripted-workflow-large-error", { async: false, workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const text = foreground.content[0]?.text ?? "";
+		assert.equal(foreground.isError, true);
+		assert.ok(Buffer.byteLength(text, "utf-8") < 300_000);
+		const savedPath = /\[TRUNCATED: .* - full output at (.+)\]/.exec(text)?.[1];
+		assert.ok(savedPath && fs.readFileSync(savedPath, "utf-8").includes("e".repeat(300000)), text.slice(0, 500));
+
+		const started = await executor.execute("scripted-workflow-large-async-error", { async: true, workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const statusPath = path.join(started.details.asyncDir!, "status.json");
+		let status: { state?: string; error?: string } = {};
+		for (let attempt = 0; attempt < 300; attempt++) {
+			status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			if (status.state === "failed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(status.state, "failed");
+		assert.ok(status.error?.includes("e".repeat(300000)));
+		const resultPath = path.join(DIRS.results, `${started.details.asyncId}.json`);
+		const summary = (JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { summary?: string }).summary ?? "";
+		assert.ok(summary.length < 2_000 && summary.includes(`… (truncated; full error: ${statusPath} (error))`), summary.slice(0, 300));
+		fs.rmSync(started.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+	});
+
 	it("rejects an over-limit runs.all batch before launching any workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor([makeAgent("echo")], { maxSubagentSpawnsPerRun: 1 });
 
@@ -3944,7 +4018,29 @@ Answer only from the supplied synthetic text.
 		assert.equal(mockPi.callCount(), 0);
 		assert.match(result.content[0]?.text ?? "", /validation failed before run creation; no children launched/);
 		assert.match(result.content[0]?.text ?? "", /'first', 'second'.*minimum required: 2; configured: 1/);
-		assert.equal(result.details.workflow, undefined);
+		assert.deepEqual(result.details.workflow, { failureKind: "validation", trace: [], emits: [], console: [] });
+	});
+
+	it("rejects an unknown literal agent before launching any workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("reviewer")]);
+		const workflowScript = `const scan = await runs.run("scan", { agent: "reviewer", task: "Scan" });\nreturn runs.run("review", { agent: "reviwer", task: scan.output });`;
+
+		const result = await executor.execute("scripted-workflow-unknown-agent", { async: false, workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(result.isError, true);
+		assert.equal(mockPi.callCount(), 0);
+		assert.match(result.content[0]?.text ?? "", /no children launched\. line 2:\d+: runs\.run: Unknown agent 'reviwer'\. Did you mean 'reviewer'\?/);
+		assert.equal(result.details.workflow?.failureKind, "validation");
+
+		const validation = await executor.execute("scripted-workflow-unknown-agent-validate", { action: "validate", workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(validation.isError, true);
+		assert.deepEqual(JSON.parse(validation.content[0]?.text ?? "").errors.map((error: { kind?: string; line?: number }) => ({ kind: error.kind, line: error.line })), [{ kind: "agent", line: 2 }]);
+	});
+
+	it("checks literal agents with the parent model's provider-specific discovery", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), (_cwd, provider) => provider === "openai-codex" ? [makeAgent("reviewer")] : []);
+		const ctx = { ...makeMinimalCtx(tempDir), model: { provider: "openai-codex", id: "gpt-test" } };
+		const validation = await executor.execute("provider-agent-validate", { action: "validate", workflowScript: `return runs.run("review", { agent: "reviewer", task: "Review" });` }, new AbortController().signal, undefined, ctx as ReturnType<typeof makeMinimalCtx>);
+		assert.equal(validation.isError, undefined, validation.content[0]?.text);
 	});
 
 	it("lets an explicit workflow spawn override exceed config", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

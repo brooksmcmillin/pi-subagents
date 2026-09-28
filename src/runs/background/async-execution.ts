@@ -81,6 +81,7 @@ import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal
 import { persistRunnerStartupFailure } from "./runner-startup-failure.ts";
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
+import { currentPidNamespaceScope } from "./pid-namespace.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveLaunchBinding } from "../../shared/launch-contract.ts";
@@ -175,6 +176,8 @@ interface AsyncExecutionContext {
 	permissions?: PermissionConfig;
 	currentModelProvider?: string;
 	currentModel?: ParentModel;
+	/** Scoped-model snapshot captured with currentModel; drives the `scoped` allow token. */
+	scopedModelIds?: string[];
 	/** Optional model-scope enforcement resolved from subagent settings. */
 	modelScope?: ModelScopeConfig;
 	modelResponseAliases?: Record<string, string[]>;
@@ -817,6 +820,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			writePrivateAtomicJson(initialStatusPath, {
 				...initialStatus,
 				pid: proc.pid,
+				pidNamespaceScope: currentPidNamespaceScope(),
 				processTerminal: { version: 1, state: "pending", runId: initialStatus.runId, runnerProcessInstanceId },
 			});
 			// Aggregate waits must see the launch before the runner's first status update.
@@ -1050,7 +1054,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const taskText = `${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`;
 		const task = namespaceOutputPath ? taskText : injectSingleOutputInstruction(taskText, outputPath, a);
 
-		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel);
+		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel, ctx.scopedModelIds);
 		const modelOrigin = resolveModelOrigin({ explicitModel: s.model, agentModel: a.model, parentModel: ctx.currentModel });
 		const primaryModelFromParent = modelOrigin === "inherited";
 		const primaryModel = externalRunner ? undefined : resolveEffectiveSubagentModel(
@@ -1821,7 +1825,7 @@ export function executeAsyncSingle(
 		? `[Read from: ${readPaths.join(", ")}]\n\n`
 		: "";
 	const taskText = readsInstruction + taskWithOutputInstruction;
-	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel);
+	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel, ctx.scopedModelIds);
 	const modelOrigin = resolveModelOrigin({
 		fromParent: params.modelOverrideFromParent,
 		storedOrigin: params.modelOrigin,
