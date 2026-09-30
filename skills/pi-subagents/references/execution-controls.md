@@ -257,6 +257,17 @@ subagent({ action: "doctor" })
 
 A failure in the subagent workflow, child launch, prompt runtime, extension loading, or child tooling setup is a lane infrastructure blocker, not permission to silently change execution mode. Stop and report the exact failure, run/status, and repo/cwd/worktree/branch/ref state. Retry or fix the `subagent` path only through a clear same-protocol retry; before retrying or asking the owner, verify the worktree is clean or capture the partial diff. For backlog lanes and other subagent-governed workflows, switching to `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external mode requires explicit owner approval. Pi core may print a generic `pi -ne` extension-load hint; that hint is outside this package and is not protocol-approved. A verified compaction abort may continue the retained child session once on the same resolved model; provider failures never select another model automatically.
 
+### Report-format recovery
+
+A report-format mismatch alone is not a task blocker. Inspect the supported report and its source artifacts before repeating work:
+
+- If it contains the required evidence, normalize it in the parent, preserving source references, uncertainties, and blocked findings. Retain the original artifact and identify the derived report; do not rewrite the child's recorded run status or claim a schema-invalid run succeeded.
+- If evidence is missing, request only the missing information using the supported schema. Retained file-only reports need a new explicit `output` path; task prose cannot change the runtime schema or output binding.
+- Same-protocol format recovery within existing authority needs no user approval. Do not repeat the investigation just to rename fields. Escalate unresolved evidence conflicts or decisions about scope, authority, or product behavior—not JSON field names.
+- Normalization does not satisfy a failed acceptance gate, erase contradictions, or grant permission for mutations or execution-mode changes. Required evidence and authorization remain strict.
+
+For example, a scout's `files` entries can become an `evidence` list containing each `path:line`, `fact`, and `why`; retain `risks`, `blockedReason`, and the original report alongside that projection rather than silently dropping them.
+
 ### External terminal work
 
 Use native `subagent` runs for unattended implementation, review, and gate work that needs managed isolation, durable artifacts, and process controls. Use `interactive_shell` for visible terminal work, alternate CLIs, trust prompts, or recovery only when the user explicitly requests that mode or the task is outside the governed subagent protocol; it is not an implicit replacement for a failed `subagent` lane.

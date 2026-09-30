@@ -251,7 +251,8 @@ const result = await resolveSubagentLaunchContract({
 if (!result.ok) {
   // missing_agent, ambiguous_agent, missing_skill, denied_required_tool,
   // invalid_artifact_dir, invalid_cwd, unsupported_mode, restricted_agent,
-  // thinking_ceiling, invalid_extension_bindings, or invalid_intercom_bridge
+  // thinking_ceiling, invalid_extension_bindings, invalid_intercom_bridge,
+  // or invalid_output_schema
   throw new Error(result.message);
 }
 
@@ -261,6 +262,7 @@ console.log(result.contract.digest, result.contract.tools.effectiveAllowlist);
 Preflight covers ordinary single-agent launch resolution:
 
 - Selected agent identity and shadowed candidates.
+- Contract v4 exposes `structuredOutput`: `{ source: "override" | "agent", schema }` when enabled, or `{ source: "disabled" | "none" }` without a schema. Explicit `outputSchema` replaces the agent default; `false` disables it; omission inherits it. This is the same resolved schema bound into `launchContractDigest` and used by execution. Inspect it before launch rather than assuming an agent supports a particular report shape. Non-object schemas return `invalid_output_schema`; external runners that cannot support structured output return `unsupported_mode`, never a silent fallback. Schema compilation and output-value validation still occur in the structured-output runtime.
 - A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields. Runtime overlays such as the Intercom bridge never change it.
 - Fresh/fork context, effective model and thinking, skill and tool resolution, direct MCP selections, runtime/configured extensions.
 - Model scope allow lists accept the reserved tokens `inherit` and `scoped`; `scoped` expands to the caller-supplied `scopedModelIds` snapshot, degrading to `inherit` when it is omitted. Callers whose `modelScope.allow` uses `scoped` must pass `scopedModelIds` (the session's `/scoped-models` snapshot) alongside `parentModel`, otherwise preflight resolves it as `inherit` and may reject models the actual launch allows.
