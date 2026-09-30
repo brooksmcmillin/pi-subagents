@@ -955,6 +955,35 @@ export default function() {
 		assert.match(payload.results[0]?.error ?? "", /Missing structured_output call/);
 	});
 
+	it("workflow children preserve a shared explicit schema over agent defaults", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const schema = { type: "object", additionalProperties: false, required: ["evidence"], properties: { evidence: { type: "string" } } };
+		const expected = { evidence: "verified" };
+		const executor = makeAsyncExecutor([
+			makeAgent("untyped"),
+			{ ...makeAgent("typed"), outputSchema: { type: "object", required: ["files"], properties: { files: { type: "array" } } } },
+		]);
+		mockPi.onCall({ output: "", structuredOutput: expected });
+		mockPi.onCall({ output: "", structuredOutput: expected });
+		const result = await executor.execute("workflow-schema-override", {
+			async: false,
+			workflowScript: `const schema = ${JSON.stringify(schema)}; return await runs.all([
+				{ key: "untyped", agent: "untyped", task: "Return evidence", async: true, output: "untyped.json", outputMode: "file-only", outputSchema: schema, acceptance: false },
+				{ key: "typed", agent: "typed", task: "Return evidence", async: true, output: "typed.json", outputMode: "file-only", outputSchema: schema, acceptance: false }
+			]);`,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(result.isError, undefined, JSON.stringify(result.content));
+		const children = result.details.workflow?.value as Array<{ runId: string }>;
+		assert.equal(children.length, 2);
+		for (const child of children) {
+			const payload = await readAsyncPayload(child.runId);
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.deepEqual(payload.results[0]?.structuredOutput, expected);
+			const recovery = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, child.runId, "recovery-descriptor.json"), "utf8"));
+			assert.deepEqual(recovery.structuredOutputSchema, schema);
+		}
+		assert.equal(mockPi.callCount(), 2);
+	});
+
 	it("workflow acceptance uses inherited schemas and rejects a false opt-out", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const agentDir = path.join(tempDir, ".pi", "agents");
 		fs.mkdirSync(agentDir, { recursive: true });

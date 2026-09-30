@@ -779,17 +779,45 @@ Project prompt.
 		assert.equal(inherited.ok, true);
 		if (!inherited.ok) return;
 		assert.deepEqual(inherited.contract.tools.internalTools, ["structured_output"]);
+		assert.deepEqual(inherited.contract.structuredOutput, { source: "agent", schema: { type: "object", required: ["ok"] } });
+		const schema = { type: "object", required: ["evidence"], properties: { evidence: { type: "string" } } };
+		const overridden = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect", outputSchema: schema });
+		assert.equal(overridden.ok, true);
+		if (!overridden.ok) return;
+		assert.deepEqual(overridden.contract.structuredOutput, { source: "override", schema });
+		assert.notEqual(overridden.contract.launchContractDigest, inherited.contract.launchContractDigest);
+		const same = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect", outputSchema: { type: "object", required: ["ok"] } });
+		assert.equal(same.ok, true);
+		if (!same.ok) return;
+		assert.equal(same.contract.structuredOutput.source, "override");
+		assert.equal(same.contract.launchContractDigest, inherited.contract.launchContractDigest);
 		const disabled = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect", outputSchema: false });
 		assert.equal(disabled.ok, true);
 		if (!disabled.ok) return;
 		assert.deepEqual(disabled.contract.tools.internalTools, []);
+		assert.deepEqual(disabled.contract.structuredOutput, { source: "disabled" });
 		assert.notEqual(inherited.contract.launchContractDigest, disabled.contract.launchContractDigest);
+
+		writeAgent(path.join(cwd, ".pi", "agents", "untyped.md"), `---\nname: untyped\ndescription: Untyped\n---\nPrompt.\n`);
+		const untyped = await resolveSubagentLaunchContract({ agent: "untyped", cwd });
+		assert.equal(untyped.ok, true);
+		if (!untyped.ok) return;
+		assert.deepEqual(untyped.contract.structuredOutput, { source: "none" });
+		for (const invalid of [true, null, [], "schema.json"]) {
+			const rejected = await resolveSubagentLaunchContract({ agent: "typed", cwd, outputSchema: invalid as never });
+			assert.equal(rejected.ok, false);
+			if (rejected.ok) continue;
+			assert.equal(rejected.code, "invalid_output_schema");
+		}
 
 		writeAgent(path.join(cwd, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\noutputSchema: {"type":"object"}\nrunner:\n  type: external-cli\n  command: ${JSON.stringify(process.execPath)}\n---\nPrompt.\n`);
 		const rejected = await resolveSubagentLaunchContract({ agent: "external", cwd });
 		assert.equal(rejected.ok, false);
 		assert.equal(rejected.code, "unsupported_mode");
 		assert.equal((await resolveSubagentLaunchContract({ agent: "external", cwd, outputSchema: false })).ok, true);
+		const unsupportedOverride = await resolveSubagentLaunchContract({ agent: "external", cwd, outputSchema: schema });
+		assert.equal(unsupportedOverride.ok, false);
+		if (!unsupportedOverride.ok) assert.equal(unsupportedOverride.code, "unsupported_mode");
 	});
 
 	it("projects per-agent tool exclusions and binds them into launch identity", async () => {

@@ -27,10 +27,10 @@ import { resultFilePath } from "../runs/background/result-files.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 import { resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
+import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
 
-// v3: the contract reports the resolved Intercom bridge state and binds its
-// prompt and tools into launchContractDigest, matching execution (#2127).
-export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 3 as const;
+// v4 exposes the effective structured-output schema and its selection source.
+export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 4 as const;
 
 /** Stands in for the parent session target when the host does not supply one; only custom templates that name the session read it. */
 const PREFLIGHT_ORCHESTRATOR_TARGET = "preflight";
@@ -46,7 +46,8 @@ export type SubagentLaunchContractReasonCode =
 	| "restricted_agent"
 	| "thinking_ceiling"
 	| "invalid_extension_bindings"
-	| "invalid_intercom_bridge";
+	| "invalid_intercom_bridge"
+	| "invalid_output_schema";
 
 export type SubagentLaunchContractDiagnosticCode = SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning" | "workspace_scope_authority";
 
@@ -186,6 +187,9 @@ export interface SubagentLaunchContract {
 	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills: SubagentLaunchContractSkills;
+	structuredOutput:
+		| { source: "override" | "agent"; schema: JsonSchemaObject }
+		| { source: "disabled" | "none" };
 	tools: SubagentLaunchContractTools;
 	intercomBridge: SubagentLaunchContractIntercomBridge;
 	roots: SubagentLaunchContractRoots;
@@ -350,6 +354,16 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		...(input.model !== undefined ? { model: input.model } : {}),
 		...(input.outputSchema !== undefined ? { outputSchema: input.outputSchema } : {}),
 	});
+	if (behavior.outputSchema !== undefined) {
+		try {
+			assertJsonSchemaObject(behavior.outputSchema);
+		} catch (error) {
+			return { ok: false, code: "invalid_output_schema", message: error instanceof Error ? error.message : String(error), diagnostics };
+		}
+	}
+	const structuredOutput: SubagentLaunchContract["structuredOutput"] = behavior.outputSchema !== undefined
+		? { source: input.outputSchema !== undefined ? "override" : "agent", schema: behavior.outputSchema }
+		: { source: input.outputSchema === false ? "disabled" : "none" };
 	const requestedSkills = behavior.skills === false ? [] : behavior.skills;
 	const resolvedSkills = resolveSkillsWithFallback(
 		requestedSkills,
@@ -484,6 +498,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritGlobalContext: agent.inheritGlobalContext,
 		inheritSkills: agent.inheritSkills,
+		structuredOutput,
 		skills: {
 			requested: requestedSkills,
 			resolved: resolvedSkills.resolved.map((skill) => ({ name: skill.name, path: skill.path, source: skill.source })),
