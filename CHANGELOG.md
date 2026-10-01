@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Background subagents failed to start on Pi 1.0.0 with "does not provide @earendil-works/pi-agent-core/node", because that Pi release no longer ships the module. Background launches now skip it when the installed Pi does not offer it, and still fail when Pi offers it but the file is missing. Thanks to [@albertgwo](https://github.com/albertgwo) for [#2634](https://github.com/nicobailon/pi-subagents/pull/2634).
 - Compaction-triggered child aborts now recover when Pi reports `compaction_start` after `agent_settled`. Thanks to [@jiuai233](https://github.com/jiuai233) for [#2537](https://github.com/nicobailon/pi-subagents/pull/2537).
 - Machine-generated worktree patches now use explicit `a/` and `b/` prefixes instead of Git's newer `--default-prefix` option, so diff capture works on older Git releases while still overriding `diff.noprefix`. Thanks to [@quifox](https://github.com/quifox) for [#2527](https://github.com/nicobailon/pi-subagents/pull/2527).
 - Dynamic tool activation now works in hosts that run Pi in-process, such as pi-web. pi-subagents no longer tries to read the host Pi version from disk before enabling `subagents_enable`, so those hosts no longer print "Could not locate the running Pi installation" and keep `subagent` always loaded; Pi 0.86.1 is already the oldest supported host. Thanks to [@q107580018](https://github.com/q107580018) for [#2526](https://github.com/nicobailon/pi-subagents/issues/2526).
