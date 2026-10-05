@@ -110,7 +110,13 @@ interface MinimalCtx {
 	model?: { provider: string; id?: string };
 }
 
-export function makeMinimalCtx(cwd: string): MinimalCtx {
+export function makeMinimalCtx(
+	cwd: string,
+	models: Array<{ provider: string; id: string }> = [
+		{ provider: "mock", id: "test-model" },
+		{ provider: "mock", id: "model" },
+	],
+): MinimalCtx {
 	return {
 		cwd,
 		hasUI: false,
@@ -120,7 +126,7 @@ export function makeMinimalCtx(cwd: string): MinimalCtx {
 			getSessionFile: () => null,
 		},
 		modelRegistry: {
-			getAvailable: () => [],
+			getAvailable: () => models,
 		},
 	};
 }

@@ -1472,7 +1472,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 				{ agent: "echo", task: "Nested task" },
 				new AbortController().signal,
 				undefined,
-				makeMinimalCtx(tempDir),
+				makeMinimalCtx(tempDir, [{ provider: "openai", id: "gpt-5-mini" }]),
 			);
 
 			assert.equal(result.isError, undefined);
@@ -1996,7 +1996,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			},
 			new AbortController().signal,
 			undefined,
-			makeMinimalCtx(tempDir),
+			makeMinimalCtx(tempDir, [{ provider: "mock", id: "test-model" }, { provider: "openai-codex", id: "gpt-5.6-luna" }]),
 		);
 
 		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
@@ -2585,7 +2585,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			{ agent: "echo", task: "Task", async: false, acceptance: false },
 			new AbortController().signal,
 			undefined,
-			makeMinimalCtx(tempDir),
+			makeMinimalCtx(tempDir, [{ provider: "openai", id: "gpt-5-mini" }]),
 		);
 
 		assert.equal(result.isError, true);

@@ -1038,7 +1038,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 					: { action: "resume", id: runId, index: 1, message: "What did b find?" },
 				new AbortController().signal,
 				undefined,
-				makeMinimalCtx(tempDir),
+				makeMinimalCtx(tempDir, [{ provider: "anthropic", id: "claude-sonnet-4" }]),
 			);
 
 			assert.equal(result.isError, undefined, result.content[0]?.text);
@@ -1196,7 +1196,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				{ action: "resume", id: runId, message: "Continue safely." },
 				new AbortController().signal,
 				undefined,
-				makeMinimalCtx(tempDir),
+				makeMinimalCtx(tempDir, [{ provider: "anthropic", id: "claude-sonnet-4" }]),
 			);
 
 			assert.equal(result.isError, undefined);
