@@ -1,4 +1,5 @@
 import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import type { AgentConfig } from "../../agents/agents.ts";
 import { checkModelScope, SCOPED_PATTERN, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 
 export type { AvailableModelInfo };
@@ -231,7 +232,7 @@ function resolveSubagentModelCandidate(
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
 ): string | undefined {
-	if (!availableModels || availableModels.length === 0) return model;
+	if (!availableModels) return model;
 	const resolvedWhole = resolveBaseModelCandidate(model, availableModels, preferredProvider);
 	if (resolvedWhole) return resolvedWhole;
 	const { baseModel, thinkingSuffix } = splitThinkingSuffix(model);
@@ -254,16 +255,19 @@ function suggestAlternateProviderModel(
 	return `${suggestion}${thinkingSuffix}`;
 }
 
+export class UnavailableSubagentModelError extends Error {}
+
 function resolveRequiredSubagentModelCandidate(
 	model: string,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
+	configurationSource = "launch override",
 ): string {
 	const resolved = resolveSubagentModelCandidate(model, availableModels, preferredProvider);
 	if (resolved) return resolved;
 	const suggestion = suggestAlternateProviderModel(model, availableModels);
-	throw new Error(
-		`Unknown subagent model '${model}' in the active Pi model registry.${suggestion ? ` Did you mean '${suggestion}'?` : ""}`,
+	throw new UnavailableSubagentModelError(
+		`Unknown subagent model '${model}' in the active Pi model registry (source: ${configurationSource}).${suggestion ? ` Did you mean '${suggestion}'?` : ""}`,
 	);
 }
 
@@ -395,6 +399,19 @@ export interface ResolveModelSelectionOptions {
 	primaryModelFromParent?: boolean;
 	/** How the model was selected. */
 	origin?: ModelOrigin;
+	configurationSource?: string;
+}
+
+export function formatModelConfigurationSource(agent: AgentConfig, parentModel?: ParentModel, explicitModel?: string | boolean): string {
+	if (explicitModel !== undefined) return "launch override";
+	if (agent.override?.fields?.includes("model")) {
+		const scopes = agent.override.fieldScopes?.model;
+		const scope = scopes?.includes("project") ? "project" : scopes?.includes("user") ? "user" : agent.override.scope;
+		return `${scope} override`;
+	}
+	if (agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model) return `${agent.modelSource.scope} defaultModel`;
+	if (agent.model && agent.model !== INHERIT_MODEL) return `${agent.source} agent config`;
+	return parentModel ? "inherits current session model" : "inherit requested, but no current session model is available";
 }
 
 export function resolveModelOrigin(input: {
@@ -432,13 +449,13 @@ export function resolveModelSelection(
 	const requestedModel = origin === "inherited" ? undefined : model;
 	const scopes = configuredScopes(options?.scope);
 	if (origin === "explicit" && model) {
-		const normalized = resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider);
+		const normalized = resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider, options?.configurationSource ?? "launch override");
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		model = normalized;
 	}
 	const resolved = model && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
 		? model.trim()
-		: model ? resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider) : undefined;
+		: model ? resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider, options?.configurationSource ?? "configured model") : undefined;
 	if (resolved && scopes.some((scope) => scope.enforce === true && scope.strict === true)) {
 		enforceModelScopes(resolved, scopes, "inherited", options?.onWarn);
 	}

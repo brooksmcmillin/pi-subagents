@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { discoverAgentSnapshot, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryAllResult, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
-import { inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-resolution.ts";
+import { UnavailableSubagentModelError, formatModelConfigurationSource, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
 import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
 import { buildEffectiveSystemPrompt } from "../runs/shared/effective-system-prompt.ts";
@@ -47,7 +47,8 @@ export type SubagentLaunchContractReasonCode =
 	| "thinking_ceiling"
 	| "invalid_extension_bindings"
 	| "invalid_intercom_bridge"
-	| "invalid_output_schema";
+	| "invalid_output_schema"
+	| "unavailable_model";
 
 export type SubagentLaunchContractDiagnosticCode = SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning" | "workspace_scope_authority";
 
@@ -381,27 +382,37 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (externalRunner && behavior.outputSchema) {
 		return { ok: false, code: "unsupported_mode", message: `Agent '${agent.name}' uses runner.type='${agent.runner?.type}' and does not support: structured output.`, diagnostics };
 	}
-	const availableModels = normalizeAvailableModels(input.availableModels);
+	const availableModels = input.availableModels === undefined ? undefined : normalizeAvailableModels(input.availableModels);
 	const preferredProvider = agent.modelProvider ?? input.preferredProvider ?? input.parentModel?.provider;
 	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel, input.scopedModelIds);
 	const modelOrigin = resolveModelOrigin({ explicitModel: input.model, agentModel: agent.model, parentModel: input.parentModel });
-	const primaryModel = externalRunner
-		? undefined
-		: resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, {
-			scope: modelScopes,
-			source: modelOrigin === "explicit" ? "explicit" : "inherited",
-		});
 	const effectiveThinkingConfig = input.thinking !== undefined ? input.thinking : agent.thinking;
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		discovered.maxThinking,
 		input.thinkingCeiling,
 		input.inheritedThinkingCeiling,
 	);
-	const model = externalRunner ? undefined : applyThinkingSuffix(resolveModelSelection(primaryModel, availableModels, preferredProvider, {
-			scope: modelScopes,
-			primaryModelFromParent: modelOrigin === "inherited" || inheritsParentModel(input.model, agent.model, input.parentModel),
-			origin: modelOrigin,
-		}).model, effectiveThinkingConfig, input.thinking !== undefined);
+	let model: string | undefined;
+	if (!externalRunner) {
+		const configurationSource = formatModelConfigurationSource(agent, input.parentModel, input.model);
+		try {
+			const primaryModel = resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, {
+				scope: modelScopes,
+				source: modelOrigin === "explicit" ? "explicit" : "inherited",
+			});
+			model = applyThinkingSuffix(resolveModelSelection(primaryModel, availableModels, preferredProvider, {
+				scope: modelScopes,
+				primaryModelFromParent: modelOrigin === "inherited" || inheritsParentModel(input.model, agent.model, input.parentModel),
+				origin: modelOrigin,
+				configurationSource,
+			}).model, effectiveThinkingConfig, input.thinking !== undefined);
+		} catch (error) {
+			if (!(error instanceof UnavailableSubagentModelError)) throw error;
+			const message = error.message;
+			diagnostics.push({ code: "unavailable_model", severity: "error", message });
+			return { ok: false, code: "unavailable_model", message, diagnostics };
+		}
+	}
 	if (!externalRunner) {
 		try {
 			assertThinkingWithinCeiling({ model, configThinking: effectiveThinkingConfig, ceiling: thinkingCeiling, agent: agent.name, runId });

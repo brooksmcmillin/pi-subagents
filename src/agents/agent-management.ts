@@ -29,7 +29,7 @@ import {
 } from "./proactive-skills.ts";
 import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { resolveEffectiveThinking, toModelInfos } from "../shared/model-info.ts";
-import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
+import { formatModelConfigurationSource, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
@@ -45,8 +45,8 @@ type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delet
 type ManagementScope = "user" | "project";
 type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
 
-function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string): AgentDiscoveryAllResult {
-	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider);
+function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string, settingsScope?: AgentScope): AgentDiscoveryAllResult {
+	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider, settingsScope ? { settingsScope } : undefined);
 }
 
 interface ManagementParams {
@@ -821,17 +821,35 @@ function agentCapabilityTools(agent: AgentConfig): AgentCapabilityRow["tools"] {
 	};
 }
 
-function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictionSources?: string[] }): AgentCapabilityRow {
+type ModelAvailability = NonNullable<AgentCapabilityRow["model"]>;
+
+function agentModelAvailability(agent: AgentConfig, ctx: ManagementContext, models: ReturnType<typeof toModelInfos>): ModelAvailability | undefined {
+	if (agent.runner && agent.runner.type !== "pi") return undefined;
+	const source = formatModelConfigurationSource(agent, ctx.model);
+	try {
+		const preferredProvider = agent.modelProvider ?? ctx.model?.provider;
+		const primary = resolveEffectiveSubagentModel(undefined, agent.model, ctx.model, models, preferredProvider);
+		const { model } = resolveModelSelection(primary, models, preferredProvider, {
+			origin: resolveModelOrigin({ agentModel: agent.model, parentModel: ctx.model }),
+			configurationSource: source,
+		});
+		return { value: agent.model, thinking: agent.thinking, effective: model, source, available: true };
+	} catch (error) {
+		return { value: agent.model, thinking: agent.thinking, source, available: false, unavailableReason: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictionSources?: string[]; modelAvailability?: Map<AgentConfig, ModelAvailability | undefined> }): AgentCapabilityRow {
 	return {
 		name: agent.name,
 		description: previewDisplayText(agent.description, 1000),
 		source: agent.source,
-		executable: options.executable,
+		executable: options.executable && options.modelAvailability?.get(agent)?.available !== false,
 		restrictionSources: options.executable ? undefined : options.restrictionSources ?? [],
 		aliases: agent.aliases ? [...agent.aliases] : undefined,
 		runner: agentCapabilityRunner(agent, options.providerNames, options.externalCliAvailability),
 		tools: agentCapabilityTools(agent),
-		model: presentDetails({ value: agent.model, thinking: agent.thinking }),
+		model: options.modelAvailability?.get(agent) ?? presentDetails({ value: agent.model, thinking: agent.thinking }),
 		execution: presentDetails({ defaultAsync: agent.defaultAsync, timeoutMs: agent.defaultTimeoutMs }),
 		acceptance: presentDetails({ policy: agent.defaultAcceptance, role: agent.acceptanceRole }),
 		output: presentDetails({ path: agent.output, mode: agent.outputMode }),
@@ -839,11 +857,11 @@ function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; 
 	};
 }
 
-function agentCapabilitiesSnapshot(input: { agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[] }): AgentCapabilitiesSnapshot {
+function agentCapabilitiesSnapshot(input: { agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[]; modelAvailability?: Map<AgentConfig, ModelAvailability | undefined> }): AgentCapabilitiesSnapshot {
 	return {
 		agents: [
-			...input.agents.map((agent) => agentCapabilityRow(agent, { executable: true, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability })),
-			...input.restrictedAgents.map((agent) => agentCapabilityRow(agent, { executable: false, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, restrictionSources: input.restrictedSources })),
+			...input.agents.map((agent) => agentCapabilityRow(agent, { executable: true, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, modelAvailability: input.modelAvailability })),
+			...input.restrictedAgents.map((agent) => agentCapabilityRow(agent, { executable: false, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, restrictionSources: input.restrictedSources, modelAvailability: input.modelAvailability })),
 		],
 		restrictedCount: input.restrictedAgents.length,
 		...(input.restrictedSources?.length ? { capabilityCeilingSources: [...input.restrictedSources] } : {}),
@@ -877,7 +895,7 @@ function appendAgentDiagnosticLines(lines: string[], diagnostics: AgentDiscovery
 	);
 }
 
-function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[] }): Partial<Details> | undefined {
+function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[]; modelAvailability?: Map<AgentConfig, ModelAvailability | undefined> }): Partial<Details> | undefined {
 	if (!input.capabilityMode) return undefined;
 	return {
 		agentCapabilities: jsonDetails(agentCapabilitiesSnapshot({
@@ -886,6 +904,7 @@ function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentC
 			providerNames: input.providerNames,
 			externalCliAvailability: input.externalCliAvailability,
 			restrictedSources: input.restrictedSources,
+			modelAvailability: input.modelAvailability,
 		})),
 	};
 }
@@ -971,7 +990,8 @@ function formatAgentDetail(agent: AgentConfig): string {
 
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
-	const d = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
+	const capabilityMode = params.capabilities === true;
+	const d = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider, capabilityMode ? scope : undefined);
 	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
 	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
@@ -987,15 +1007,19 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	});
 	const providerStatus = registeredExternalJobProviderStatus();
 	const providerNameSet = providerNames(providerStatus);
-	const capabilityMode = params.capabilities === true;
+	const models = capabilityMode ? toModelInfos(ctx.modelRegistry.getAvailable()) : [];
+	const modelAvailability = capabilityMode ? new Map(visibleAgents.map((agent) => [agent, agentModelAvailability(agent, ctx, models)])) : undefined;
+	const unavailableAgents = agents.filter((agent) => modelAvailability?.get(agent)?.available === false);
+	const executableAgents = agents.filter((agent) => modelAvailability?.get(agent)?.available !== false);
 	const externalCliAvailability = capabilityMode ? externalCliAvailabilityForAgents([...agents, ...restrictedAgents]) : undefined;
 	const formatLine = capabilityMode
 		? (agent: AgentConfig, names: Set<string> | undefined) => formatAgentCapabilitiesLine(agent, names, externalCliAvailability)
 		: formatAgentListLine;
 	const lines = [
 		capabilityMode ? "Executable agents (capabilities):" : "Executable agents:",
-		...formatAgentListSections(agents, providerNameSet, formatLine),
+		...formatAgentListSections(executableAgents, providerNameSet, formatLine),
 	];
+	if (unavailableAgents.length) lines.push("", "Unavailable agents (model preflight):", ...unavailableAgents.map((agent) => `- ${agent.name}: ${modelAvailability!.get(agent)!.unavailableReason}`));
 	appendRestrictedAgentLines({ lines, agents: restrictedAgents, sources: restrictedSources, providerNames: providerNameSet, formatLine });
 	appendExternalJobRegistryLine(lines, [...agents, ...restrictedAgents], providerStatus);
 	appendAgentDiagnosticLines(lines, d.agentDiagnostics);
@@ -1007,20 +1031,11 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 		providerNames: providerNameSet,
 		externalCliAvailability: externalCliAvailability ?? new Map(),
 		restrictedSources,
+		modelAvailability,
 	}));
 }
 
-function formatModelSource(agent: AgentConfig, currentModel: ParentModel | undefined): string {
-	if (agent.override && agent.model !== agent.override.base.model) {
-		return `${agent.override.scope} override`;
-	}
-	if (agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model) {
-		return `${agent.modelSource.scope} defaultModel`;
-	}
-	if (agent.model) return `${agent.source} agent config`;
-	if (currentModel) return "inherits current session model";
-	return "inherit requested, but no current session model is available";
-}
+const formatModelSource = formatModelConfigurationSource;
 
 function handleModels(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const requestedAgent = params.agent?.trim();

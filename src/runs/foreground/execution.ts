@@ -71,6 +71,7 @@ import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTr
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	formatSubagentModelVerificationError,
+	formatModelConfigurationSource,
 	isContextOverflow,
 	resolveModelSelection,
 } from "../shared/model-resolution.ts";
@@ -1764,6 +1765,7 @@ async function runSyncCompletionInner(
 			scope: options.modelScope,
 			primaryModelFromParent: options.modelOverrideFromParent,
 			origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
+			configurationSource: options.modelOrigin === "explicit" || options.modelOrigin === "inherited" || options.modelOverrideFromParent ? undefined : formatModelConfigurationSource(agent),
 		},
 	);
 	try {

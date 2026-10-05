@@ -35,6 +35,7 @@ import {
 } from "../support/async-execution-fixture.ts";
 
 const WATCH_TIMEOUT_MS = 30_000;
+const mockModelRegistry = { getAvailable: () => [{ provider: "mock", id: "test-model" }] };
 
 // A runner that never starts or never settles must fail this test by name, not stall the whole CI step.
 function watchTimeoutMessage(what: string, asyncDir: string, extra?: () => string): string {
@@ -1404,6 +1405,7 @@ export default function() {
 		});
 		const context = makeMinimalCtx(tempDir);
 		context.sessionManager.getSessionId = () => "session-workflow-parent-model";
+		context.modelRegistry = { ...context.modelRegistry, getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] };
 		context.model = { provider: "router", id: "openai-personal" };
 		context.sessionManager.getSessionFile = () => {
 			context.model = undefined;
@@ -1525,6 +1527,7 @@ export default function() {
 		const sessionId = "resume-allowlist-session";
 		const ctx = {
 			...makeMinimalCtx(tempDir),
+			modelRegistry: mockModelRegistry,
 			sessionManager: {
 				getSessionId: () => sessionId,
 				getSessionFile: () => parentSessionFile,
@@ -1600,7 +1603,7 @@ export default function() {
 	it("revives a current workflow child from persisted parent admission authority", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const agents = [makeAgent("planner", { allowedAgents: ["researcher"] }), makeAgent("researcher")];
 		const parentAuthority = { version: 1 as const, allowedAgents: ["planner", "researcher"], denyExtensions: false, sources: ["workflow-parent"] };
-		const ctx = makeMinimalCtx(tempDir);
+		const ctx = { ...makeMinimalCtx(tempDir), modelRegistry: mockModelRegistry };
 		const executor = createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined, sendMessage() {} },
 			state: { baseCwd: tempDir, currentSessionId: "session-123", asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
@@ -1680,6 +1683,7 @@ export default function() {
 		fs.writeFileSync(sessionFile, `${header}\n`);
 		const ctx = {
 			...makeMinimalCtx(tempDir),
+			modelRegistry: mockModelRegistry,
 			sessionManager: {
 				getSessionId: () => "startup-control-session",
 				getSessionFile: () => parentSessionFile,
@@ -1761,6 +1765,7 @@ syncBuiltinESMExports();
 		fs.writeFileSync(forkedSessionFile, `${JSON.stringify(childHeader)}\n`, "utf-8");
 		const ctx = {
 			...makeMinimalCtx(parentCwd),
+			modelRegistry: mockModelRegistry,
 			sessionManager: {
 				getSessionId: () => "session-cross-cwd",
 				getSessionFile: () => parentSessionFile,
@@ -2464,7 +2469,7 @@ if (process.argv.some((arg) => arg.endsWith("subagent-runner-bootstrap.ts"))) pr
 				{ action: "resume", id: sourceId, message: "Continue" },
 				new AbortController().signal,
 				undefined,
-				makeMinimalCtx(tempDir),
+				{ ...makeMinimalCtx(tempDir), modelRegistry: mockModelRegistry },
 			) as AsyncExecutionResult;
 		} finally {
 			if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
