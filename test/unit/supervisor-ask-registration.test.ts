@@ -113,7 +113,7 @@ function hookRuntime(launch: ChildSessionLaunch, platform: NodeJS.Platform, sign
 	}> };
 	const owner = randomUUID();
 	const sessionFile = path.join(launch.cwd, `${owner}.jsonl`);
-	const ctx = { ...makeCtx(owner, sessionFile), cwd: launch.cwd, ui: {}, modelRegistry: { getAvailable: () => [] } };
+	const ctx = { ...makeCtx(owner, sessionFile), cwd: launch.cwd, ui: {}, modelRegistry: { getAvailable: () => [{ provider: "mock", id: "test-model" }] } };
 	const registered = new Map<string, Tool>();
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const subscribers = new Set<(event: ChildSessionEvent) => void>();

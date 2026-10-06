@@ -2998,6 +2998,6 @@ export function discoverAgents(cwd: string, scope: AgentScope, preferredModelPro
 	return buildEffectiveDiscovery(sources, scope);
 }
 
-export function discoverAgentsAll(cwd: string, preferredModelProvider?: string, options: AgentDiscoveryOptions = {}): AgentDiscoveryAllResult {
-	return discoverAgentSnapshot(cwd, "both", preferredModelProvider, options).all;
+export function discoverAgentsAll(cwd: string, preferredModelProvider?: string, options: AgentDiscoveryOptions & { settingsScope?: AgentScope } = {}): AgentDiscoveryAllResult {
+	return discoverAgentSnapshot(cwd, options.settingsScope ?? "both", preferredModelProvider, options).all;
 }

@@ -342,14 +342,14 @@ model: fast
 Project prompt.
 `);
 
-		await assert.rejects(
-			resolveSubagentLaunchContract({
-				agent: "worker",
-				cwd,
-				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
-			}),
-			/Unknown subagent model 'fast'/,
-		);
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker", cwd,
+			availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+		});
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.code, "unavailable_model");
+		assert.match(result.message, /Unknown subagent model 'fast'.*source: project agent config/);
 	});
 
 	it("rejects an explicit per-call unknown model before launch", async () => {
@@ -363,15 +363,14 @@ model: test/primary
 Project prompt.
 `);
 
-		await assert.rejects(
-			resolveSubagentLaunchContract({
-				agent: "worker",
-				cwd,
-				model: "test/unknown",
-				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
-			}),
-			/Unknown subagent model 'test\/unknown'/,
-		);
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker", cwd, model: "test/unknown",
+			availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+		});
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.code, "unavailable_model");
+		assert.match(result.message, /Unknown subagent model 'test\/unknown'.*source: launch override/);
 	});
 
 	it("trusts an inherited parent model outside the host registry", async () => {

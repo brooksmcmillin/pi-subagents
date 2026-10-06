@@ -589,7 +589,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			{ agent: "worker", task: "test" },
 			new AbortController().signal,
 			undefined,
-			makeCtx(manager),
+			{ ...makeCtx(manager), modelRegistry: { getAvailable: () => [{ provider: "anthropic", id: "claude-sonnet-4-5" }] } },
 		);
 
 		assert.equal(result.isError, undefined);
@@ -1323,7 +1323,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			{ agent: "echo", task, cwd: "worktree" },
 			new AbortController().signal,
 			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
+			{ ...makeCtx(makeSessionManagerRecorder().manager), modelRegistry: { getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }] } },
 		);
 
 		assert.equal(result.isError, undefined);

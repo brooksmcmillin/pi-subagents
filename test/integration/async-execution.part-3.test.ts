@@ -1404,6 +1404,7 @@ export default function() {
 		});
 		const context = makeMinimalCtx(tempDir);
 		context.sessionManager.getSessionId = () => "session-workflow-parent-model";
+		context.modelRegistry = { ...context.modelRegistry, getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] };
 		context.model = { provider: "router", id: "openai-personal" };
 		context.sessionManager.getSessionFile = () => {
 			context.model = undefined;

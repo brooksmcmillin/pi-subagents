@@ -298,7 +298,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "bash-1", toolName: "bash", isError: true, content: [{ type: "text", text: blockedMessage }] } },
 					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false, content: [{ type: "text", text: "ordinary notes" }] } },
 				] },
-				{ jsonl: [events.assistantMessage("I could not read the required canary because bash was blocked.")] },
+				{ jsonl: [events.assistantMessage("I could not read the required canary because bash was blocked.", "mock/model")] },
 			],
 		});
 		const request: SubagentDelegationRequest = {
@@ -348,7 +348,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "bash-1", toolName: "bash", isError: false, content: [{ type: "text", text: quoted }] } },
 					{ type: "tool_execution_end", toolName: "bash" },
 				] },
-				{ jsonl: [events.assistantMessage("The phrase appears in a log; nothing was blocked.")] },
+				{ jsonl: [events.assistantMessage("The phrase appears in a log; nothing was blocked.", "mock/model")] },
 			],
 		});
 		const request: SubagentDelegationRequest = {
@@ -1884,7 +1884,7 @@ Answer only from the supplied synthetic text.
 			{ workflowScript: `await runs.run("work", { agent: "helper", label: "Review current diff", phase: "Review", task: "Review the current diff" }); return { ok: true };` },
 			new AbortController().signal,
 			undefined,
-			makeMinimalCtx(tempDir),
+			makeMinimalCtx(tempDir, [{ provider: "mock", id: "test-model" }, { provider: "openai-codex", id: "gpt-5.6-luna" }]),
 		);
 
 		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");

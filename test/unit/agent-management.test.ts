@@ -4,8 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { editableAgentConfig, handleCreate, handleList, handleManagementAction, handleUpdate } from "../../src/agents/agent-management.ts";
-import { EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
+import { discoverAgentsAll, EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
 import { registerAgent } from "../../src/api/agents.ts";
+import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
@@ -112,7 +113,7 @@ describe("agent management config parsing", () => {
 		const capabilityRequest = { agentScope: "project", capabilities: true };
 		const listed = handleManagementAction("list", capabilityRequest, {
 			cwd: tempDir,
-			modelRegistry: { getAvailable: () => [] },
+			modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] },
 		});
 		assert.equal(listed.isError, false);
 		const text = readText(listed);
@@ -126,7 +127,7 @@ describe("agent management config parsing", () => {
 		assert.ok(row);
 		assert.equal(row.executable, true);
 		assert.deepEqual(row.tools, { ambient: false, names: ["read", "grep"], mcpDirectTools: ["github/search"], mutationTools: ["edit", "write"] });
-		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", thinking: "high" });
+		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", thinking: "high", effective: "openai/gpt-5-mini", source: "project agent config", available: true });
 		assert.deepEqual(row.execution, { defaultAsync: true, timeoutMs: 123 });
 		assert.deepEqual(row.acceptance, {
 			policy: {
@@ -143,6 +144,93 @@ describe("agent management config parsing", () => {
 		assert.deepEqual(row.output, { path: "report.md", mode: "file-only" });
 		assert.deepEqual(row.extensions, { names: ["github"], subagentOnly: ["surf"], skills: ["typescript-code"] });
 		assert.equal(JSON.stringify(capabilities).includes("SYSTEM_PROMPT_SENTINEL"), false);
+	});
+
+	for (const [source, scope] of [["role", "project"], ["override", "project"], ["default", "project"], ["override", "user"], ["default", "user"]] as const) {
+		it(`replays unavailable and valid models consistently from ${scope} ${source} without live provider work`, async () => {
+			const agentsDir = path.join(tempDir, ".pi", "agents");
+			fs.mkdirSync(agentsDir, { recursive: true });
+			const invalid = "openai-codex/gpt-6.0-luna";
+			const valid = "openai-codex/fixture-valid";
+			const agentScope = scope === "user" ? "both" : "project";
+			const availableModels = [{ provider: "openai-codex", id: "fixture-valid", fullId: valid }];
+			for (const model of [invalid, valid]) {
+				const agentPath = path.join(agentsDir, "fixture-worker.md");
+				const settingsPath = scope === "user" ? path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json") : path.join(tempDir, ".pi", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(agentPath, `---\nname: fixture-worker\ndescription: Fixture worker\n${source === "role" ? `model: ${model}\n` : ""}---\nInspect fixtures.\n`);
+				fs.writeFileSync(path.join(agentsDir, "valid-worker.md"), `---\nname: valid-worker\ndescription: Valid worker\nmodel: ${valid}\n---\nInspect fixtures.\n`);
+				fs.writeFileSync(settingsPath, JSON.stringify({ subagents: source === "override" ? { agentOverrides: { "fixture-worker": { model } } } : source === "default" ? { defaultModel: model } : {} }));
+				const before = [agentPath, settingsPath].map((file) => fs.readFileSync(file, "utf8"));
+				const parentModel = { provider: "openai-codex", id: "fixture-parent-runtime" };
+				const listed = handleList({ agentScope, capabilities: true }, {
+					cwd: tempDir, model: parentModel, modelRegistry: { getAvailable: () => availableModels },
+					discoverAgentsAll: (cwd, provider, options) => discoverAgentsAll(cwd, provider, options),
+				});
+				const row = listed.details!.agentCapabilities!.agents.find((agent) => agent.name === "fixture-worker")!;
+				const launch = await resolveSubagentLaunchContract({ agent: "fixture-worker", cwd: tempDir, agentScope, parentModel, availableModels });
+				const expectedSource = source === "role" ? "project agent config" : source === "override" ? `${scope} override` : `${scope} defaultModel`;
+				assert.equal(row.model?.source, expectedSource);
+				assert.equal(row.executable, model === valid);
+				assert.equal(launch.ok, model === valid);
+				assert.equal(listed.details!.agentCapabilities!.agents.find((agent) => agent.name === "valid-worker")!.executable, true);
+				if (launch.ok) {
+					assert.equal(launch.contract.model, valid);
+					assert.equal(row.model?.effective, valid);
+				} else {
+					assert.equal(launch.code, "unavailable_model");
+					assert.equal(launch.message, row.model?.unavailableReason);
+					assert.ok(launch.message.includes(expectedSource));
+					assert.match(readText(listed), /Unavailable agents \(model preflight\):/);
+				}
+				assert.deepEqual([agentPath, settingsPath].map((file) => fs.readFileSync(file, "utf8")), before);
+				const override = await resolveSubagentLaunchContract({ agent: "fixture-worker", cwd: tempDir, agentScope, parentModel, availableModels, model: valid });
+				assert.equal(override.ok, true);
+				if (scope === "user") {
+					const projectOnly = handleList({ agentScope: "project", capabilities: true }, { cwd: tempDir, model: parentModel, modelRegistry: { getAvailable: () => availableModels } });
+					const projectRow = projectOnly.details!.agentCapabilities!.agents.find((agent) => agent.name === "fixture-worker")!;
+					const projectLaunch = await resolveSubagentLaunchContract({ agent: "fixture-worker", cwd: tempDir, agentScope: "project", parentModel, availableModels });
+					assert.equal(projectLaunch.ok, true);
+					assert.equal(projectRow.executable, true);
+					assert.equal(projectRow.model?.source, "inherits current session model");
+					if (projectLaunch.ok) assert.equal(projectLaunch.contract.model, projectRow.model?.effective);
+				}
+			}
+		});
+	}
+
+	it("attributes the model field rather than unrelated later overrides or value differences", async () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		const userSettings = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.mkdirSync(path.dirname(userSettings), { recursive: true });
+		const missing = "openai-codex/gpt-6.0-luna";
+		fs.writeFileSync(path.join(agentsDir, "mixed-worker.md"), `---\nname: mixed-worker\ndescription: Mixed worker\nmodel: ${missing}\n---\nInspect fixtures.\n`);
+		fs.writeFileSync(userSettings, JSON.stringify({ subagents: { agentOverrides: { "mixed-worker": { model: missing } } } }));
+		fs.writeFileSync(path.join(tempDir, ".pi", "settings.json"), JSON.stringify({ subagents: { agentOverrides: { "mixed-worker": { thinking: "high" } } } }));
+		const availableModels = [{ provider: "openai-codex", id: "fixture-valid", fullId: "openai-codex/fixture-valid" }];
+		const listed = handleList({ agentScope: "both", capabilities: true }, { cwd: tempDir, modelRegistry: { getAvailable: () => availableModels } });
+		const row = listed.details!.agentCapabilities!.agents.find((agent) => agent.name === "mixed-worker")!;
+		assert.equal(row.executable, false);
+		assert.equal(row.model?.source, "user override");
+		const launch = await resolveSubagentLaunchContract({ agent: "mixed-worker", cwd: tempDir, availableModels });
+		assert.equal(launch.ok, false);
+		if (!launch.ok) assert.equal(launch.message, row.model?.unavailableReason);
+	});
+
+	it("preserves an inherited parent runtime model outside the registry", async () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "inherited-worker.md"), "---\nname: inherited-worker\ndescription: Inherited worker\n---\nInspect fixtures.\n");
+		const parentModel = { provider: "runtime", id: "parent" };
+		const listed = handleList({ agentScope: "project", capabilities: true }, { cwd: tempDir, model: parentModel, modelRegistry: { getAvailable: () => [] } });
+		const row = listed.details!.agentCapabilities!.agents.find((agent) => agent.name === "inherited-worker")!;
+		assert.equal(row.executable, true);
+		assert.equal(row.model?.effective, "runtime/parent");
+		assert.equal(row.model?.source, "inherits current session model");
+		const launch = await resolveSubagentLaunchContract({ agent: "inherited-worker", cwd: tempDir, parentModel, availableModels: [] });
+		assert.equal(launch.ok, true);
+		if (launch.ok) assert.equal(launch.contract.model, row.model?.effective);
 	});
 
 	it("reports bundled reviewer inspection and supervisor tools in capabilities", () => {

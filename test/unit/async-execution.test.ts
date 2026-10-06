@@ -175,6 +175,33 @@ describe("async runner execution", () => {
 		assert.equal(result.steps[0]?.waitToolEnabled, false);
 		assert.deepEqual(result.steps[1]?.toolBudget, { hard: 2, block: ["grep"] });
 	});
+	it("rejects unavailable configured and launch models before producing runner steps", () => {
+		const valid = "openai-codex/fixture-valid";
+		const missing = "openai-codex/gpt-6.0-luna";
+		const availableModels = [{ provider: "openai-codex", id: "fixture-valid", fullId: valid }];
+		for (const explicit of [false, true]) {
+			const build = () => buildAsyncRunnerSteps("missing-model", {
+				chain: [{ agent: "worker", task: "Do not start", ...(explicit ? { model: missing } : {}) }],
+				agents: [{ ...agent("worker"), model: explicit ? valid : missing }],
+				availableModels, ctx, asyncDir: path.join(process.cwd(), ".tmp-missing-model"), maxSubagentDepth: 1,
+			});
+			if (explicit) {
+				assert.throws(build, /Unknown subagent model 'openai-codex\/gpt-6.0-luna'.*source: launch override/);
+			} else {
+				const result = build();
+				assert.ok("error" in result);
+				assert.equal(result.steps, undefined);
+				assert.match(result.error, /Unknown subagent model 'openai-codex\/gpt-6.0-luna'.*source: project agent config/);
+			}
+		}
+		const validResult = buildAsyncRunnerSteps("valid-model", {
+			chain: [{ agent: "worker", task: "Prepare fixtures" }], agents: [{ ...agent("worker"), model: valid }],
+			availableModels, ctx, asyncDir: path.join(process.cwd(), ".tmp-valid-model"), maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in validResult);
+		assert.equal(validResult.steps[0]?.model, valid);
+	});
+
 	it("carries the resolved model context window into async runner steps", () => {
 		const result = buildAsyncRunnerSteps("context-limit-run", {
 			chain: [{ agent: "worker", task: "inspect context" }],

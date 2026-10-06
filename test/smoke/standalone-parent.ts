@@ -41,6 +41,9 @@ export default function registerSmoke(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const timeout = setTimeout(() => { console.error("Standalone smoke timed out waiting for parent completion"); process.exit(1); }, 45_000);
 		try {
+			// Native provider registration refreshes the synchronous availability snapshot asynchronously.
+			await ctx.modelRegistry.refresh({ allowNetwork: false });
+			assert.ok(ctx.modelRegistry.getAvailable().some(model => model.provider === "standalone-smoke" && model.id === "local"));
 			assert.ok(tool, "the real extension must register its public subagent tool");
 			const mode = process.env.PI_STANDALONE_SMOKE_MODE ?? "single";
 			assert.ok(["single", "workflow", "targeted-controls", "steer", "interrupt", "stop", "child-stop", "child-timeout", "run-timeout", "tool-timeout", "sdk-init-failure", "persistence-failure", "authorization-failure", "missing-bootstrap", "revival", "shared-run", "parallel-stop"].includes(mode), `unimplemented parent smoke mode: ${mode}`);
