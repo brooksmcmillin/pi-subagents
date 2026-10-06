@@ -57,6 +57,7 @@ describe("workflow launch params", () => {
 		} as unknown as SingleResult);
 		const results = workflowChildResults([{
 			key: "first",
+			runId: "first-run",
 			ok: true,
 			output: "Saved output: /tmp/review.md",
 			structuredOutput: { verdict: "pass" },
@@ -64,11 +65,12 @@ describe("workflow launch params", () => {
 			results: [compact("first-agent")],
 		}, {
 			key: "second",
+			runId: "second-run",
 			ok: true,
 			output: "Saved output: /tmp/review.md",
 			structuredOutput: { verdict: "warn" },
 			artifactPaths: ["/tmp/review.md"],
-			results: [compact("second-agent")],
+			results: [{ ...compact("second-agent"), runId: "retained-run", workflowKey: "retained-key" }],
 		}], new Map([
 			["second", [{ ...compact("second-agent"), structuredOutput: { verdict: "warn" } }]],
 			["first", [{ ...compact("first-agent"), structuredOutput: { verdict: "pass" } }]],
@@ -77,6 +79,10 @@ describe("workflow launch params", () => {
 		assert.deepEqual(results[0]?.structuredOutput, { verdict: "pass" });
 		assert.deepEqual(results[1]?.structuredOutput, { verdict: "warn" });
 		assert.equal(results.filter((result) => result.structuredOutput !== undefined).length, 2);
+		assert.equal(results[0]?.runId, "first-run");
+		assert.equal(results[0]?.workflowKey, "first");
+		assert.equal(results[1]?.runId, "retained-run");
+		assert.equal(results[1]?.workflowKey, "retained-key");
 	});
 
 	it("retains complete failed file-only workflow results for diagnosis", () => {

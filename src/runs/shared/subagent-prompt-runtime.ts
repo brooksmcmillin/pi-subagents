@@ -23,6 +23,7 @@ import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL
 import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
+import { MODEL_ONLY_TOOL } from "../../shared/extension-context.ts";
 import {
 	childSupervisorMetadata,
 	evaluateChildToolDiagnostic,
@@ -198,8 +199,8 @@ export function stripSubagentOrchestrationSkill(prompt: string): string {
 
 function stripChildBoundaryInstructions(prompt: string): string {
 	let rewritten = prompt;
-	for (const boundary of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS]) {
-		rewritten = rewritten.split(boundary).join("");
+	for (const instructions of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS, STRUCTURED_OUTPUT_INSTRUCTIONS]) {
+		rewritten = rewritten.split(`\n\n${instructions}`).join("").split(instructions).join("");
 	}
 	return rewritten.replace(/^(?:[ \t]*\r?\n)+/, "");
 }
@@ -222,7 +223,8 @@ export function rewriteSubagentPrompt(
 	rewritten = stripChildBoundaryInstructions(rewritten);
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
 	const structured = options.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
-	return `${boundary}${structured}\n\n${rewritten}`;
+	// Pi's base prompt stays first so providers that recognize it by its opening still do.
+	return `${rewritten}\n\n${boundary}${structured}`;
 }
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
@@ -267,17 +269,22 @@ export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEven
 	return { ...payload, prompt_cache_key: key };
 }
 
-function portableToolId(id: string): string {
+function portableToolId(id: string, preserveBoundedCompositeToolIds = false): string {
 	if (PORTABLE_TOOL_ID_PATTERN.test(id) && id.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return id;
+	// Codex splits call_id|item_id on replay; each wire ID must remain portable and bounded.
+	if (preserveBoundedCompositeToolIds) {
+		const parts = id.split("|");
+		if (parts.length === 2 && parts.every((part) => PORTABLE_TOOL_ID_PATTERN.test(part) && part.length <= MAX_PORTABLE_TOOL_ID_LENGTH)) return id;
+	}
 	const encoded = `tool_${Buffer.from(id).toString("base64url") || "empty"}`;
 	if (encoded.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return encoded;
 	return `tool_${createHash("sha256").update(id).digest("base64url")}`;
 }
 
-function sanitizeToolHistoryMessage(message: unknown): unknown {
+function sanitizeToolHistoryMessage(message: unknown, preserveBoundedCompositeToolIds = false): unknown {
 	const m = message as { role?: string; content?: unknown; toolCallId?: unknown };
 	if (m?.role === "toolResult" && typeof m.toolCallId === "string") {
-		const toolCallId = portableToolId(m.toolCallId);
+		const toolCallId = portableToolId(m.toolCallId, preserveBoundedCompositeToolIds);
 		return toolCallId === m.toolCallId ? message : { ...m, toolCallId };
 	}
 	if (m?.role !== "assistant" || !Array.isArray(m.content)) return message;
@@ -285,7 +292,7 @@ function sanitizeToolHistoryMessage(message: unknown): unknown {
 	const content = m.content.map((block) => {
 		const b = block as { type?: string; id?: unknown };
 		if (b?.type !== "toolCall" || typeof b.id !== "string") return block;
-		const id = portableToolId(b.id);
+		const id = portableToolId(b.id, preserveBoundedCompositeToolIds);
 		if (id === b.id) return block;
 		changed = true;
 		return { ...b, id };
@@ -302,7 +309,7 @@ function stripAssistantSubagentToolCallBlocks(message: unknown): unknown | undef
 	return { ...m, content: filteredContent };
 }
 
-export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
+export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveBoundedCompositeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
 	const preserveCurrentFanoutToolHistory = options.preserveFanoutToolHistory === true;
 	const sanitizeToolIds = options.sanitizeToolIds ?? true;
 	let changed = false;
@@ -317,7 +324,7 @@ export function stripParentOnlySubagentMessages(messages: unknown[], options: { 
 			changed = true;
 			continue;
 		}
-		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped) : stripped;
+		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped, options.preserveBoundedCompositeToolIds === true) : stripped;
 		if (stripped !== message || sanitized !== stripped) changed = true;
 		filtered.push(sanitized);
 	}
@@ -456,6 +463,7 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 	}) => void;
 	registerTool({
 		name: "structured_output",
+		...MODEL_ONLY_TOOL,
 		label: "Structured Output",
 		description: "Submit the required final structured output for this subagent step. This terminates the step.",
 		parameters,
@@ -565,6 +573,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
 		const messages = stripParentOnlySubagentMessages(event.messages, {
 			sanitizeToolIds: !COMPOSITE_TOOL_ID_APIS.has(ctx?.model?.api ?? ""),
+			preserveBoundedCompositeToolIds: ctx?.model?.api === "openai-codex-responses",
 			preserveFanoutToolHistory: config.fanoutChild,
 		});
 		if (messages === event.messages) return undefined;

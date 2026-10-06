@@ -8,6 +8,7 @@ import type { ChildSupervisorMetadata } from "../runs/shared/child-runtime-confi
 import { INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type ControlEvent, type IntercomEventBus, type SubagentState } from "../shared/types.ts";
 import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { shouldUseNativeFsWatch } from "../shared/watch-strategy.ts";
+import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
 import {
 	SUPERVISOR_REQUEST_MESSAGE_TYPE,
 	SUPERVISOR_REPLY_ENTRY_TYPE,
@@ -87,6 +88,7 @@ interface NativeSupervisorChannelDeps {
 	getChannelDirs?: () => { dirs: string[]; retire?: () => void };
 	/** Retained scheduled states for the current runtime owner, never foreign owners. */
 	getCurrentOwnerStates?: () => Iterable<SubagentState>;
+	parentWake?: Pick<ExtensionAPI, "sendMessage">;
 	platform?: NodeJS.Platform;
 	watch?: SupervisorWatch;
 	timers?: Pick<typeof globalThis, "setInterval" | "clearInterval" | "setImmediate" | "clearImmediate">;
@@ -259,6 +261,7 @@ export function registerNativeSupervisorClient(pi: ExtensionAPI, metadata: Child
 	if (!metadata || hasTool(pi, "contact_supervisor")) return;
 	const tool: ToolDefinition<typeof ContactSupervisorParamsSchema, Record<string, unknown>> = {
 		name: "contact_supervisor",
+		...MODEL_ONLY_TOOL,
 		label: "Contact Supervisor",
 		description: "Contact the parent/supervisor session for a blocking decision, structured interview, or progress update.",
 		parameters: ContactSupervisorParamsSchema,
@@ -585,6 +588,7 @@ function publicPendingRequests(pending: Map<string, PendingSupervisorRequest>): 
 function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver, discover: () => void, runState: (request: SupervisorRequest) => SubagentState): ToolDefinition<typeof IntercomParamsSchema, Record<string, unknown>> {
 	return {
 		name: NATIVE_SUPERVISOR_TOOL_NAME,
+		...MODEL_ONLY_TOOL,
 		label: "Subagent Supervisor",
 		description: "Native pi-subagents supervisor channel. Use reply/pending/status to answer child subagent requests without overriding pi-intercom.",
 		parameters: IntercomParamsSchema,
@@ -752,7 +756,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
 			try {
-				pi.sendMessage({
+				(deps.parentWake ?? pi).sendMessage({
 					customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
 					content: requestVisibleText(request),
 					display: true,
@@ -788,7 +792,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		if (poller) return;
 		poller = timers.setInterval(() => {
 			poll();
-			if (!useNativeWatcher() && (platform === "darwin" || deps.getChannelDirs) && !hasTransportDemand()) {
+			if (!useNativeWatcher() && !hasTransportDemand()) {
 				if (poller) timers.clearInterval(poller);
 				poller = undefined;
 			}

@@ -467,6 +467,7 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 							storage: launch.storage,
 							model: launch.model,
 							tools: launch.tools,
+							builtinMcpTools: launch.builtinMcpTools,
 							excludeTools: launch.excludeTools,
 							extensionPaths: launch.extensionPaths,
 							ambientExtensions: launch.ambientExtensions,
@@ -474,6 +475,7 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 							noSkills: launch.noSkills,
 							noContextFiles: launch.noContextFiles,
 							processEnv: launch.processEnv,
+							projectTrusted: launch.projectTrusted,
 						},
 						runtime: { ...launch.runtime, structuredOutput: launch.runtime.structuredOutput ? { schema: launch.runtime.structuredOutput.schema, acceptanceReport: launch.runtime.structuredOutput.acceptanceReport } : undefined },
 					}), "utf-8");
