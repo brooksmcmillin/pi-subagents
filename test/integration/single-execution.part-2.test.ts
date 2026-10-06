@@ -876,6 +876,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		});
 		const ctx = {
 			...makeMinimalCtx(tempDir),
+			isIdle: () => false,
 			modelRegistry: {
 				getAvailable: () => [{ provider: "mock", id: "test-model", reasoning: true }],
 			},
@@ -1360,7 +1361,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 					summary: "done",
 					patch: { path: path.join(repo, ".pi", "subagents", "artifacts", "worktree.patch"), branch: worktree.branch, changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 },
 				}],
-				cleanup: { state: "partial", pruned: false, tasks: [{ index: 0, path: worktree.path, branch: worktree.branch, worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				cleanup: { state: "partial", pruned: false, tasks: [{ index: 0, path: worktree.path, branch: worktree.branch, recordedBaseDir: worktree.recordedBaseDir, worktreeRemoved: false, branchRemoved: false, preserved: true }] },
 			}],
 		}, null, 2), "utf-8");
 		fs.writeFileSync(path.join(repo, ".pi", "subagents", "artifacts", "status.json"), JSON.stringify({ runId: "cleanup-action-run", state: "complete" }), "utf-8");
@@ -1380,9 +1381,16 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			assert.match(childSafeResult.content[0]?.text ?? "", /child-safe subagent fanout mode/i);
 			const apply = await executor.executePublic("cleanup-apply", { action: "worktree.cleanup", repo: "cleanup-repo", mode: "apply", planId }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(apply.isError, true);
-			assert.match(apply.content[0]?.text ?? "", /plan.*only|apply\/removal is not available/i);
+			assert.match(apply.content[0]?.text ?? "", /requires interactive confirmation/i);
 			assert.ok(fs.existsSync(worktree.path));
 			assert.notEqual(execFileSync("git", ["-C", repo, "branch", "--list", worktree.branch], { encoding: "utf-8" }).trim(), "");
+			const authorized = makeExecutor([makeAgent("echo")], { worktreeBaseDir: baseDir, authorityPolicy: { discardWorktree: "auto" } });
+			const removed = await authorized.executePublic("cleanup-authorized", { action: "worktree.cleanup", repo: "cleanup-repo", mode: "apply", planId }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(removed.isError, undefined, removed.content[0]?.text);
+			assert.match(removed.content[0]?.text ?? "", /complete/);
+			assert.equal(fs.existsSync(worktree.path), false);
+			assert.notEqual(execFileSync("git", ["-C", repo, "branch", "--list", worktree.branch], { encoding: "utf-8" }).trim(), "");
+
 		} finally {
 			try { execFileSync("git", ["-C", repo, "worktree", "remove", "--force", worktree.path], { stdio: "ignore" }); } catch {}
 			try { execFileSync("git", ["-C", repo, "branch", "-D", worktree.branch], { stdio: "ignore" }); } catch {}
@@ -1653,6 +1661,24 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 
 		assert.equal(result.isError, true);
 		assert.match(result.details?.results?.[0]?.error ?? "", /Failed to persist schema-validated output artifact/);
+	});
+
+	it("saves the structured result, not closing prose, to a bound output file", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const structuredOutput = { ok: true, note: "captured" };
+		mockPi.onCall({ output: "Enough; writing up.", structuredOutput });
+		const outputPath = path.join(tempDir, "structured.json");
+
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"single-schema-output",
+			{ agent: "echo", task: "Return structured data", output: outputPath, outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } }, acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), `${JSON.stringify(structuredOutput, null, 2)}\n`);
 	});
 
 	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

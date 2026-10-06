@@ -35,8 +35,10 @@ interface AsyncJobTrackerOptions {
 	pollIntervalMs?: number;
 	resultsDir?: string;
 	widgetEnabled?: boolean;
+	widgetCollapsed?: boolean;
 	platform?: NodeJS.Platform;
-	onJobTerminal?: () => void;
+	onJobTerminal?: (job: AsyncJobState) => void;
+	onJobCleanup?: (asyncId: string) => void;
 	watch?: typeof fs.watch;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
@@ -104,7 +106,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -124,7 +126,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else renderWidget(ctx, Array.from(state.asyncJobs.values()));
+			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed);
 		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);
@@ -219,6 +221,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const job = state.asyncJobs.get(asyncId);
 			retainNestedLookupRoute(state, job?.nestedRoute, job?.sessionId);
 			state.asyncJobs.delete(asyncId);
+			options.onJobCleanup?.(asyncId);
 			rerenderLastWidget();
 		}, completionRetentionMs);
 		state.cleanupTimers.set(asyncId, timer);
@@ -340,7 +343,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if ((parsed as { type?: unknown }).type !== "subagent.control") return;
 				const candidate = parsed as Partial<ControlRecord>;
 				if (!candidate.event || !Array.isArray(candidate.channels)) return;
-				// SAFETY: event and channels were checked above; every other ControlRecord field is optional.
+				// SAFETY: event is present and channels is an array; every other ControlRecord field is optional.
 				const record = candidate as ControlRecord;
 				const supervisorRequest = record.event.type === "needs_attention" && record.event.reason === "supervisor_request" && options.supervisorRequestState !== undefined;
 				if (supervisorRequest && readSupervisorRequestState(record.event, job.asyncDir) === "resolved") return;
@@ -559,7 +562,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.();
+					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);

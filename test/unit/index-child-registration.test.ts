@@ -40,10 +40,11 @@ describe("subagent extension child mode", () => {
 			});
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
+			if (registeredTool.exposure !== "model-only") throw new Error("codemode scripts must not call subagent, got exposure " + registeredTool.exposure);
 			const calls = [];
 			const ctx = {
 				cwd: process.cwd(),
-				hasUI: true,
+				isIdle() { return false; }, hasUI: true,
 				ui: {
 					setToolsExpanded(value) { calls.push(value); },
 					setWidget() {},
@@ -71,7 +72,7 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("renders only the public workflow execution mode", () => {
+	it("renders the workflow source without reading the script", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			const events = { on() { return () => {}; }, emit() {} };
@@ -84,56 +85,44 @@ describe("subagent extension child mode", () => {
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
 			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-			const workflow = registeredTool.renderCall({
-				workflowScript: "const scan = await runs.run('scan', {agent:'worker'}); return runs.all([{key:'correctness',agent:'reviewer'},{key:'tests',agent:'reviewer'}]);",
-			}, theme).text;
-			const foregroundWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('publish', {agent:'worker'});", async: false }, theme).text;
-			const templateWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run(\`template\`, {agent:'worker'});", async: false }, theme).text;
-			const commentedWorkflow = registeredTool.renderCall({ workflowScript: "// runs.run('ignored', {agent:'worker'})\nconst note = \"key: 'also-ignored'\"; return runs.run('real', {agent:'worker'});" }, theme).text;
-			const dynamicKeyWorkflow = registeredTool.renderCall({ workflowScript: "return runs.all([{key: 'review-' + item, agent: 'reviewer'}]);" }, theme).text;
-			const ordinaryKeyWorkflow = registeredTool.renderCall({ workflowScript: "const config = {key: 'secret'}; return runs.all([{agent: 'reviewer', config: {key: 'nested'}, key: 'review'}]);" }, theme).text;
-			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
-			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
-			if (!templateWorkflow.includes("foreground · 1 lane: template")) throw new Error("expected static template lane, got " + templateWorkflow);
-			if (!commentedWorkflow.includes("background · 1 lane: real")) throw new Error("expected lexical lane filtering, got " + commentedWorkflow);
-			if (!dynamicKeyWorkflow.includes("workflow script · background")) throw new Error("expected dynamic key fallback, got " + dynamicKeyWorkflow);
-			if (!ordinaryKeyWorkflow.includes("background · 1 lane: review") || ordinaryKeyWorkflow.includes("secret") || ordinaryKeyWorkflow.includes("nested")) throw new Error("expected only runs.all child key, got " + ordinaryKeyWorkflow);
+			const rows = [
+				registeredTool.renderCall({ workflow: true, async: true }, theme).text,
+				registeredTool.renderCall({ workflow: "./ci/sweep.js" }, theme).text,
+				registeredTool.renderCall({ workflow: "review" }, theme).text,
+			];
+			const expected = ["subagent workflow (reply block) [async]", "subagent workflow ./ci/sweep.js", "subagent workflow review"];
+			if (JSON.stringify(rows) !== JSON.stringify(expected)) throw new Error("expected " + JSON.stringify(expected) + ", got " + JSON.stringify(rows));
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
-	it("shows omitted workflow async as background even when asyncByDefault is false", () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-workflow-manifest-config-"));
-		try {
-			const configDir = path.join(agentDir, "extensions", "subagent");
-			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncByDefault: false, forceTopLevelAsync: true }), "utf-8");
-			const script = String.raw`
-				import registerSubagentExtension from "./index.ts";
-				const events = { on() { return () => {}; }, emit() {} };
-				let registeredTool;
-				const fakePi = new Proxy({
-					events, registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
-					registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
-				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
-				registerSubagentExtension(fakePi);
-				const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-				const result = registeredTool.renderCall({
-					workflowScript: "return runs.run('scan' /* stable lane */, {agent:'worker'});",
-				}, theme).text;
-				const explicitForeground = registeredTool.renderCall({
-					workflowScript: "return runs.run('publish', {agent:'worker'});",
-					async: false,
-				}, theme).text;
-				if (!result.includes("background · 1 lane: scan")) throw new Error("expected workflow executor background manifest, got " + result);
-				if (!explicitForeground.includes("foreground · 1 lane: publish")) throw new Error("expected workflow executor foreground manifest, got " + explicitForeground);
-			`;
-			const env = parentToolEnv();
-			env.PI_CODING_AGENT_DIR = agentDir;
-			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
-		}
+	it("rejects model-sent workflowScript and workflowScriptPath on parent and fanout tools before execution", () => {
+		const script = String.raw`
+			import assert from "node:assert/strict";
+			import registerSubagentExtension from "./index.ts";
+			import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
+			const tools = {};
+			const makePi = (name) => new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) { if (tool.name === "subagent") tools[name] = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(makePi("parent"));
+			registerFanoutChildSubagentExtension(makePi("fanout"), { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false });
+			const expanded = [];
+			const ctx = {
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
+				ui: { setToolsExpanded(value) { expanded.push(value); } },
+				sessionManager: { getSessionId() { return "session-test"; }, getSessionFile() { return null; }, getBranch() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			for (const tool of [tools.parent, tools.fanout]) {
+				await assert.rejects(tool.execute("model-script", { workflowScript: "return 1" }, new AbortController().signal, undefined, ctx), /workflowScript was removed.*subagent\(\{ workflow: true \}\)/);
+				await assert.rejects(tool.execute("model-path", { workflowScriptPath: "ci/sweep.js" }, new AbortController().signal, undefined, ctx), /workflowScriptPath was removed.*workflow: "\.\/path\/to\/script\.js"/);
+			}
+			assert.deepEqual(expanded, [], "rejected calls must not reach parent execution");
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
 	it("keeps registered tool errors actionable while successful results stay collapsed", () => {
@@ -446,7 +435,7 @@ describe("subagent extension child mode", () => {
 					setStatus() {}, notify() {},
 				};
 				const ctx = {
-					cwd: process.cwd(), hasUI: true, ui,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true, ui,
 					sessionManager: { getSessionId() { return "slash-theme-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
 				};
@@ -566,7 +555,7 @@ describe("subagent extension child mode", () => {
 			const channelDir = resolveSupervisorChannelDir("nested-reviewer-run", "reviewer", 0);
 			const requestFile = path.join(channelDir, "requests", requestId + ".json");
 			const ctx = {
-				cwd: process.cwd(), hasUI: false,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 				sessionManager: {
 					getSessionId() { return ownerSessionId; },
 					getSessionFile() { return runtimeSessionId; },
@@ -633,7 +622,7 @@ describe("subagent extension child mode", () => {
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const widgets = [];
 				const ctx = {
-					cwd: process.cwd(), hasUI: true,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 					ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
@@ -649,6 +638,50 @@ describe("subagent extension child mode", () => {
 			`;
 			const env = parentToolEnv();
 			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("mounts an initially collapsed async widget when configured", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-async-widget-collapsed-config-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidgetCollapsed: true }), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const eventHandlers = new Map();
+				const handlers = new Map();
+				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage() {}, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				let widget;
+				const ctx = {
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
+					ui: {
+						setWidget(key, value) { if (key === "subagent-async") widget = value; },
+						requestRender() {}, getToolsExpanded() { return false; },
+						theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } },
+					},
+					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+					modelRegistry: { getAvailable() { return []; } },
+				};
+				registerSubagentExtension(fakePi);
+				for (const handler of handlers.get("session_start")) await handler({}, ctx);
+				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "single", agent: "worker", asyncDir: "/tmp/widget-run" });
+				if (!widget) throw new Error("async widget was not mounted");
+				const component = widget({ requestRender() {} }, ctx.ui.theme);
+				const lines = component.render(120);
+				if (lines.length !== 1) throw new Error("configured collapsed widget must render one line: " + JSON.stringify(lines));
+				for (const handler of handlers.get("session_shutdown")) await handler();
+			`;
+			const env = parentToolEnv(agentDir);
 			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
@@ -674,7 +707,7 @@ describe("subagent extension child mode", () => {
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const widgets = [];
 				const ctx = {
-					cwd: process.cwd(), hasUI: true,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 					ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
@@ -720,7 +753,7 @@ describe("subagent extension child mode", () => {
 			const runId = "management-refresh-" + crypto.randomUUID();
 			const sessionId = "session-" + runId;
 			const ctx = {
-				cwd: process.cwd(), hasUI: true,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 				ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 				sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 				modelRegistry: { getAvailable() { return []; } },
@@ -739,7 +772,8 @@ describe("subagent extension child mode", () => {
 			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			const fleetWidgets = widgets.filter((entry) => entry.key === "subagent-fleet-status");
 			if (!fleetWidgets.some((entry) => typeof entry.value === "function")) throw new Error("management result did not restore active fleet status: " + JSON.stringify(fleetWidgets));
-			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 1 subagent"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
+			// The coordinator stays visible while contributing no subagent leaf.
+			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 0 subagents"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
 			const herdrCommandCount = herdrCommands.length;
 			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			if (herdrCommands.length !== herdrCommandCount) throw new Error("unchanged active jobs redundantly refreshed Herdr status: " + JSON.stringify(herdrCommands));
@@ -770,8 +804,9 @@ describe("subagent extension child mode", () => {
 				events,
 				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
-				sendMessage() {}, getSessionName() { return undefined; },
+				sendMessage(message) { if (message.customType === "subagent-notify") sent.push(message); }, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const sent = [];
 			const sessionId = "liveness-" + crypto.randomUUID();
 			const sessionFile = "/tmp/" + sessionId + ".jsonl";
 			let provider;
@@ -785,7 +820,7 @@ describe("subagent extension child mode", () => {
 				},
 			};
 			const ctx = {
-				cwd: process.cwd(), hasUI: false,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 				ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 				sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return sessionFile; }, getEntries() { return []; } },
 				modelRegistry: { getAvailable() { return []; } },
@@ -802,6 +837,9 @@ describe("subagent extension child mode", () => {
 			events.emit("subagent:async-complete", { id: "run-1", sessionId: sessionFile, completionOwnerId, success: true, summary: "done" });
 			if (!provider.isActive()) throw new Error("pending completion delivery was not reported live");
 			const deliveryDeadline = Date.now() + 2000;
+			while (sent.length === 0 && Date.now() < deliveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+			if (!provider.isActive()) throw new Error("an accepted completion wake was reported idle before Pi started it");
+			for (const handler of handlers.get("message_start")) handler({ message: { role: "custom", ...sent[0] } });
 			while (provider.isActive() && Date.now() < deliveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
 			if (provider.isActive()) throw new Error("retained terminal work was reported live after delivery");
 			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" });
@@ -847,7 +885,7 @@ describe("subagent extension child mode", () => {
 					getEntries() { return []; },
 				};
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager,
 					modelRegistry: { getAvailable() { return []; } },
@@ -935,7 +973,7 @@ describe("subagent extension child mode", () => {
 					sendMessage() {}, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
@@ -1010,7 +1048,7 @@ describe("subagent extension child mode", () => {
 				sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 			const ctx = {
-				cwd: process.cwd(), hasUI: false,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 				ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 				sessionManager: { getSessionId() { return "notify-shutdown-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 				modelRegistry: { getAvailable() { return []; } },
@@ -1092,7 +1130,7 @@ describe("subagent extension child mode", () => {
 					sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager,
 					modelRegistry: { getAvailable() { return []; } },
@@ -1177,7 +1215,7 @@ describe("subagent extension child mode", () => {
 			let stale = false;
 			const ctx = {
 				cwd: process.cwd(),
-				get hasUI() {
+				isIdle() { return false; }, get hasUI() {
 					if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
 					return true;
 				},
@@ -1238,7 +1276,7 @@ describe("subagent extension child mode", () => {
 			fs.writeFileSync(newSession, "");
 			let currentSession = oldSession;
 			const sessionManager = { getSessionId() { return path.basename(currentSession); }, getSessionFile() { return currentSession; }, getEntries() { return []; } };
-			const ctx = { cwd: process.cwd(), hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
+			const ctx = { cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
 			registerSubagentExtension(pi);
 			for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
 			currentSession = newSession;
@@ -1370,6 +1408,29 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
+	it("tells the user to restart Pi when the installed version changed after load", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-stale-load-"));
+		for (const file of ["index.ts", "package.json", "src/runs/shared/herdr-pi-protocol.ts", "src/shared/package-version.ts"]) {
+			fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+			fs.copyFileSync(path.join(projectRoot, file), path.join(root, file));
+		}
+		const script = String.raw`
+			import * as fs from "node:fs";
+			import registerSubagentExtension from "./index.ts";
+			registerSubagentExtension({});
+			const manifest = JSON.parse(fs.readFileSync("package.json", "utf-8"));
+			fs.writeFileSync("package.json", JSON.stringify({ ...manifest, version: "999.0.0" }));
+			try { registerSubagentExtension({}); } catch (error) { console.log(error.message); }
+		`;
+		const output = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", script], {
+			cwd: root,
+			env: { ...parentToolEnv(), [SUBAGENT_CHILD_ENV]: "1" },
+			encoding: "utf-8",
+		});
+		const loaded = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8")).version;
+		assert.equal(output.trim(), `pi-subagents 999.0.0 is installed, but this Pi process still has ${loaded} loaded. Restart Pi to load the update; /reload cannot replace extension modules that Node has already loaded.`);
+	});
+
 	it("does not double-register the child-safe subagent tool when index and fanout-child both load", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
@@ -1431,7 +1492,7 @@ describe("subagent extension child mode", () => {
 			if (!registeredTool) throw new Error("tool not registered");
 			const ctx = {
 				cwd: process.cwd(),
-				hasUI: false,
+				isIdle() { return false; }, hasUI: false,
 				sessionManager: { getSessionId() { return "session-test"; }, getSessionFile() { return null; } },
 				modelRegistry: { getAvailable() { return []; } },
 			};

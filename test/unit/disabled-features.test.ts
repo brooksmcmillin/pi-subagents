@@ -9,7 +9,9 @@ import { SUBAGENT_RPC_PROTOCOL_VERSION, SUBAGENT_RPC_REQUEST_EVENT, registerSuba
 import { readSubagentGuide } from "../../src/extension/subagent-guide.ts";
 import { buildSubagentToolDescription, SUBAGENT_SAFETY_GUIDANCE } from "../../src/extension/tool-description.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
-import type { ExtensionConfig, SubagentState } from "../../src/shared/types.ts";
+import { createChildSafeState } from "../../src/extension/fanout-child.ts";
+import type { ExtensionConfig } from "../../src/shared/types.ts";
+import { makeMinimalCtx } from "../support/helpers.ts";
 
 const ALL_FEATURES = Object.keys(SUBAGENT_FEATURES) as SubagentFeature[];
 const ALL_DISABLED: ExtensionConfig = { disabledFeatures: ALL_FEATURES, scheduledRuns: { enabled: false } };
@@ -30,6 +32,7 @@ const GROUPS: Array<{ name: string; config: ExtensionConfig; setting: string; pa
 		["control-overrides", ["control"], []],
 		["extension-bindings", ["extensionBindings"], []],
 		["external-machines", ["machine"], []],
+		["workflow-scripts", ["workflow", "args", "preflight", "globalConcurrencyLimit", "maxSubagentSpawnsPerRun"], ["validate"]],
 	] as const).map(([name, params, actions]) => ({ name, config: { disabledFeatures: [name] }, setting: `disabledFeatures "${name}"`, params: [...params], actions: [...actions] })),
 	{
 		name: "schedules",
@@ -41,32 +44,13 @@ const GROUPS: Array<{ name: string; config: ExtensionConfig; setting: string; pa
 ];
 
 function schemaKeys(config: ExtensionConfig): string[] {
-	return Object.keys((createSubagentParamsSchema(resolveDisabledFeatureSurface(config)) as { properties: Record<string, unknown> }).properties);
-}
-
-function createState(): SubagentState {
-	return {
-		baseCwd: "",
-		currentSessionId: null,
-		asyncJobs: new Map(),
-		foregroundRuns: new Map(),
-		foregroundControls: new Map(),
-		lastForegroundControlId: null,
-		pendingForegroundControlNotices: new Map(),
-		cleanupTimers: new Map(),
-		lastUiContext: null,
-		poller: null,
-		completionSeen: new Map(),
-		watcher: null,
-		watcherRestartTimer: null,
-		resultFileCoalescer: { schedule: () => false, clear: () => {} },
-	};
+	return Object.keys(createSubagentParamsSchema(resolveDisabledFeatureSurface(config)).properties);
 }
 
 function createExecutor(config: ExtensionConfig) {
 	return createSubagentExecutor({
 		pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return "parent"; } } as never,
-		state: createState(),
+		state: createChildSafeState(),
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {}, ...config } as never,
 		asyncByDefault: false,
 		tempArtifactsDir: os.tmpdir(),
@@ -77,14 +61,7 @@ function createExecutor(config: ExtensionConfig) {
 }
 
 function ctx(cwd = os.tmpdir()) {
-	return {
-		cwd,
-		hasUI: false,
-		ui: {},
-		sessionManager: { getSessionId() { return "session-disabled-features"; }, getSessionFile() { return null; } },
-		modelRegistry: { getAvailable() { return []; } },
-		model: { provider: "test", id: "test-model" },
-	} as never;
+	return makeMinimalCtx(cwd) as never;
 }
 
 function resultText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -116,7 +93,9 @@ describe("disabled feature groups", () => {
 	for (const group of GROUPS) {
 		it(`${group.name}: removes exactly its parameters from the schema`, () => {
 			for (const param of group.params) assert.ok(fullKeys.includes(param), `${param} is not a schema parameter`);
-			assert.deepEqual(schemaKeys(group.config), fullKeys.filter((key) => !group.params.includes(key)));
+			// workflow-scripts replaces the removed script parameters with chain/tasks after task.
+			const added = group.name === "workflow-scripts" ? ["tasks", "chain"] : [];
+			assert.deepEqual(schemaKeys(group.config), fullKeys.filter((key) => !group.params.includes(key)).flatMap((key) => key === "task" ? [key, ...added] : [key]));
 		});
 
 		it(`${group.name}: rejects its actions and parameters with the setting name`, async () => {
@@ -131,7 +110,7 @@ describe("disabled feature groups", () => {
 			const result = await executor.executePublic("disabled-option", { agent: "worker", task: "scan", [param]: "x" }, new AbortController().signal, undefined, ctx());
 			assert.equal(result.isError, true);
 			assert.equal(resultText(result), `subagent option '${param}' is disabled by config ${group.setting}.`);
-			assert.equal(result.details.mode, "single");
+			assert.equal(result.details.mode, param === "workflow" ? "workflow" : "single");
 		});
 	}
 });
@@ -190,16 +169,17 @@ describe("disabled feature discovery", () => {
 	it("removes disabled-feature text from the built-in descriptions and keeps the safety guidance", () => {
 		const enabled = buildSubagentToolDescription({ toolDescriptionMode: "full" });
 		for (const text of featureText) assert.ok(enabled.includes(text), `enabled description lacks ${text}`);
-		assert.match(enabled, /Management discovery: list\/get\/models\/guide; create\/update\/delete\/eject\/disable\/enable\/reset\/refine; mission\.\*, schedule\.\*, watchdog\.\*, inspector\.\*, project\.\*, lane\.status\/recordMerge\/recordSupersession; worktree\.discard and plan-only worktree\.cleanup; doctor and grant-spawn-budget\. /);
+		assert.match(enabled, /Management discovery: list\/get\/models\/guide; create\/update\/delete\/eject\/disable\/enable\/reset\/refine; mission\.\*, schedule\.\*, watchdog\.\*, inspector\.\*, project\.\*, lane\.status\/recordMerge\/recordSupersession; worktree\.discard and reviewed worktree\.cleanup; doctor and grant-spawn-budget\. /);
 
 		const disabledFeatures = resolveDisabledFeatureSurface(ALL_DISABLED);
 		for (const toolDescriptionMode of [undefined, "full"] as const) {
 			const description = buildSubagentToolDescription({ toolDescriptionMode }, { disabledFeatures });
 			for (const text of featureText) assert.ok(!description.includes(text), `${toolDescriptionMode ?? "default"} description still has ${text}`);
-			assert.ok(description.includes(SUBAGENT_SAFETY_GUIDANCE));
+			// Every safety line stays; with workflow-scripts disabled only the script-writing wording changes.
+			for (const line of SUBAGENT_SAFETY_GUIDANCE.split("\n").filter((text) => !/runs\.|workflow call/.test(text))) assert.ok(description.includes(line), `${toolDescriptionMode ?? "default"} description lacks safety line ${line}`);
 			assert.match(description, /Thinking uses model suffix\./);
 		}
-		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "full" }, { disabledFeatures }), /Management discovery: list\/get\/models\/guide; doctor\. /);
+		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "full" }, { disabledFeatures }), /Management discovery: list\/get\/models\/guide; doctor\. Use guide topics agents, observability, tool-reference, configuration, models or extension-api for/);
 	});
 
 	it("lists only enabled actions for an unknown action", async () => {

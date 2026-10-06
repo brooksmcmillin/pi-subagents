@@ -6,9 +6,10 @@ import { DIRS, type AsyncStatus, type Details, type SubagentState } from "../../
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { deliverStopRequest, stopInboxClosedPath } from "../background/control-channel.ts";
 import { readProcessTerminal } from "../background/process-terminal.ts";
-import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
+import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { readStatus } from "../../shared/utils.ts";
+import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -36,15 +37,34 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus): string | undefine
 		return `process-terminal proof is ${proof?.state === "unknown" ? `unknown (${proof.reason})` : proof?.state ?? "missing"}`;
 	}
 	if (!status.sessionId) return "session identity is missing";
-	const existingResultPath = resultPayloadPathForSessionRun(DIRS.results, status.sessionId, status.runId);
-	if (!existingResultPath) return "paused result is missing";
+	// The validated lookup skips unreadable or foreign files; those must be refused below, not replaced.
+	const existingResultPath = resultPayloadPathForSessionRun(DIRS.results, status.sessionId, status.runId)
+		?? resultPayloadFileForSessionRun(DIRS.results, status.sessionId, status.runId);
 	let existingResult: Record<string, unknown>;
-	try {
-		const parsed: unknown = JSON.parse(fs.readFileSync(existingResultPath, "utf-8"));
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("result is not an object");
-		existingResult = parsed as Record<string, unknown>;
-	} catch (error) {
-		return `paused result is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+	if (!existingResultPath) {
+		// Delivery deletes the paused result, and an interrupted parent may never have received one; seal from status.
+		existingResult = {
+			id: status.runId,
+			mode: status.mode,
+			sessionId: status.sessionId,
+			asyncDir,
+			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
+			...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
+			results: (status.steps ?? []).map((step) => ({
+				agent: step.agent,
+				success: step.status === "complete" || step.status === "completed",
+				...(step.error ? { error: step.error } : {}),
+				...(step.exitCode !== undefined ? { exitCode: step.exitCode } : {}),
+			})),
+		};
+	} else {
+		try {
+			const parsed: unknown = JSON.parse(fs.readFileSync(existingResultPath, "utf-8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("result is not an object");
+			existingResult = parsed as Record<string, unknown>;
+		} catch (error) {
+			return `paused result is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+		}
 	}
 	const resultRunId = typeof existingResult.runId === "string" ? existingResult.runId : existingResult.id;
 	if (resultRunId !== status.runId || existingResult.sessionId !== status.sessionId) {
@@ -108,6 +128,18 @@ export function stopAsyncRun(
 	childId?: string,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
+	// An async workflow runs in this process: it has no runner to read a stop request, so stop it through its controller.
+	const workflowRunId = target?.asyncId ?? runId;
+	const workflowController = childId === undefined && workflowRunId ? state.workflowControllers?.get(workflowRunId) : undefined;
+	const workflowAsyncDir = workflowController && workflowRunId ? target?.asyncDir ?? state.asyncJobs.get(workflowRunId)?.asyncDir : undefined;
+	const workflowStatus = workflowAsyncDir ? readStatus(workflowAsyncDir) : undefined;
+	// Controllers outlive a session switch; a workflow owned by another session falls through to the ownership check below.
+	const foreignWorkflow = Boolean(state.currentSessionId && workflowStatus && workflowStatus.sessionId !== state.currentSessionId);
+	if (workflowController && workflowRunId && !foreignWorkflow) {
+		if (workflowStatus) stopStoppableAsyncStatusChildren(workflowStatus, state.workflowChildStops?.get(workflowRunId), "Workflow stopped.");
+		workflowController.abort(new Error("Workflow stopped."));
+		return { content: [{ type: "text", text: `Stop requested for async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
+	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
 	if (state.currentSessionId && status?.sessionId !== state.currentSessionId) {

@@ -46,7 +46,7 @@ type ResultWatcherTimers = {
 type ResultWatcherDeps = {
 	fs?: ResultWatcherFs;
 	timers?: ResultWatcherTimers;
-	notifier?: Pick<CompletionNotifier, "deliver">;
+	notifier?: Pick<CompletionNotifier, "deliver"> & Partial<Pick<CompletionNotifier, "flush">>;
 	/** Receives persisted completions before active-session delivery filtering. */
 	observeCompletion?: (result: CompletionNotification & { runId: string }) => void;
 	/** Returns cross-session run ids that the completion observer currently owns. */
@@ -64,6 +64,8 @@ type ResultWatcherDeps = {
 	platform?: NodeJS.Platform;
 	/** Shared current/predecessor session ownership used by the notifier. */
 	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds">;
+	/** Called once the parent has this run's result: the notifier accepted it, or an earlier delivery already did. */
+	onResultDelivered?: (runId: string) => void;
 };
 
 type ResultFileChild = {
@@ -73,6 +75,7 @@ type ResultFileChild = {
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
 	outputState?: SubagentOutputState;
+	outputPartial?: boolean;
 	error?: string;
 	success?: boolean;
 	state?: string;
@@ -214,6 +217,7 @@ export function createResultWatcher(
 	startResultWatcher: () => void;
 	transitionResultDelivery: () => void;
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
+	deliverPendingResults: () => Promise<void>;
 	refreshResultDelivery: () => void;
 	stopResultWatcher: () => void;
 } {
@@ -231,6 +235,9 @@ export function createResultWatcher(
 	const pendingTriggerTurn = new Map<string, boolean>();
 	const incompleteResultRetries = new Map<string, number>();
 	const processing = new Set<string>();
+	const handling = new Set<Promise<void>>();
+	// While deliverPendingResults runs, completions skip the batch delay.
+	let deliveringPending = 0;
 	const identityCache = new Map<string, { signature: string; identity: ResultFileIdentity }>();
 	let deliveryActive = true;
 	let deliveryEpoch = 0;
@@ -491,6 +498,7 @@ export function createResultWatcher(
 				}
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (markReplacedPayload()) return;
+				deps.onResultDelivered?.(runId);
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
@@ -535,6 +543,7 @@ export function createResultWatcher(
 					outputState: result.outputState === "present" || result.outputState === "absent" || result.outputState === "unknown"
 						? result.outputState
 						: "unknown",
+					...(result.outputPartial === true ? { outputPartial: true } : {}),
 					summary,
 					index,
 					artifactPath: result.artifactPaths?.outputPath,
@@ -552,6 +561,7 @@ export function createResultWatcher(
 				}
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (markReplacedPayload()) return;
+				deps.onResultDelivered?.(runId);
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
@@ -580,7 +590,7 @@ export function createResultWatcher(
 				if (!intercomDelivered) console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
 			}
 
-			const accepted = await notifier.deliver({
+			const delivery = notifier.deliver({
 				...data,
 				id: data.id ?? runId,
 				runId,
@@ -600,12 +610,16 @@ export function createResultWatcher(
 					})) : [],
 				} : {}),
 			});
+			if (deliveringPending > 0) notifier.flush?.();
+			const accepted = await delivery;
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 			if (!accepted) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
+			// A newer payload replaced this one; keep the hold until that one is delivered.
 			if (markReplacedPayload()) return;
+			deps.onResultDelivered?.(runId);
 			try {
 				data = markDeliveredNotification(publicResultPath(file), data, runId, Date.now());
 				identityCache.delete(file);
@@ -659,11 +673,14 @@ export function createResultWatcher(
 		}
 	};
 
-	state.resultFileCoalescer = createFileCoalescer((file) => {
+	const resultFileCoalescer = createFileCoalescer((file) => {
 		const triggerTurn = pendingTriggerTurn.get(file) !== false;
 		pendingTriggerTurn.delete(file);
-		void handleResult(file, triggerTurn);
+		const run = handleResult(file, triggerTurn);
+		handling.add(run);
+		void run.finally(() => handling.delete(run));
 	}, deps.coalesceDelayMs ?? 50);
+	state.resultFileCoalescer = resultFileCoalescer;
 
 	const logScanStats = (stats: ResultScanStats) => {
 		const elapsed = Date.now() - stats.startedAt;
@@ -688,9 +705,9 @@ export function createResultWatcher(
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
+	const eligibleResultFiles = (): string[] => {
+		const files: string[] = [];
 		try {
-			const triggerTurn = options.triggerTurn !== false;
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
 			const observed = observedRunIds();
 			for (const file of indexedResultCandidates(observed)) {
@@ -699,11 +716,31 @@ export function createResultWatcher(
 				if (!signature) continue;
 				if (!shouldProcessResult(file, observed, signature)) continue;
 				stats.scheduled += 1;
-				scheduleResult(file, triggerTurn);
+				files.push(file);
 			}
 			logScanStats(stats);
 		} catch (error) {
 			if (!isNotFound(error)) console.error(`Failed to scan subagent result index in '${resultsDir}':`, error);
+		}
+		return files;
+	};
+	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
+		const triggerTurn = options.triggerTurn !== false;
+		for (const file of eligibleResultFiles()) scheduleResult(file, triggerTurn);
+	};
+	/** Hand every result that is already on disk to the notifier now, without coalescing or batch delays. */
+	const deliverPendingResults = async (): Promise<void> => {
+		if (!deliveryActive) return;
+		deliveringPending += 1;
+		try {
+			notifier.flush?.();
+			for (const file of eligibleResultFiles()) {
+				scheduleResult(file, true);
+				resultFileCoalescer.flush(file);
+			}
+			await Promise.allSettled([...handling]);
+		} finally {
+			deliveringPending -= 1;
 		}
 	};
 
@@ -836,5 +873,5 @@ export function createResultWatcher(
 		incompleteResultRetries.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }
