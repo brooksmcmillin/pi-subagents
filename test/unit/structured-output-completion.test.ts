@@ -13,7 +13,8 @@ import { makeAgentConfigs } from "../support/helpers.ts";
 
 for (const mode of ["foreground", "background"] as const) {
 	for (const scenario of ["empty", "prose", "no-evidence", "already-captured", "repeated-missing", "late-violation", "changed-evidence", "provider-error", "rejected-tool", "pending-tool", "queued-input", "tool-diagnostic", "shutdown", "stop", "interrupt", "timeout", "forced-drain", "deadline-during"] as const) {
-		it(`${mode}: bounded same-session structured completion for ${scenario}`, { timeout: 15_000 }, async () => {
+		it(`${mode}: bounded same-session structured completion for ${scenario}`, { timeout: 15_000 }, async (t) => {
+			if (scenario === "deadline-during") t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.now() });
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "structured-completion-"));
 			try {
 				const runtime = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } }, additionalProperties: false }, dir);
@@ -50,7 +51,7 @@ for (const mode of ["foreground", "background"] as const) {
 										listener({ type: "tool_result_end", message: evidence });
 									}
 								}
-								if (scenario === "deadline-during") await new Promise((resolve) => setTimeout(resolve, 60));
+								if (scenario === "deadline-during") t.mock.timers.tick(60);
 								if (scenario === "timeout") {
 									if (mode === "background") timeout?.();
 									else await new Promise((resolve) => setTimeout(resolve, 120));

@@ -10,7 +10,6 @@ import type { JsonSchemaObject } from "../../shared/types.ts";
 import type { ResolvedAcceptanceReportMode } from "./acceptance.ts";
 import type { ChildStructuredOutput } from "./child-runtime-config.ts";
 import { snapshotTrackedMutations, collectTrackedMutationEvidence } from "./mutation-evidence.ts";
-import { captureWatchdogDiffBaseline } from "../../watchdog/diff-tool.ts";
 
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
 export const STRUCTURED_OUTPUT_COMPLETION_PROMPT = `${MISSING_STRUCTURED_OUTPUT_CALL_ERROR} Continue in this same session using the evidence already gathered; do not repeat implementation or inspection. Only structured_output is permitted in this report-only attempt. Submit your report through structured_output as your only final action. If evidence is insufficient, report that limitation using the declared schema rather than claiming success.`;
@@ -32,13 +31,29 @@ export function shouldRecoverStructuredOutputCompletion(options: {
 		&& !last.content.some((part) => part.type === "toolCall");
 }
 
+function captureGitBaseline(cwd: string): { root: string; ref: string } | undefined {
+	// Keep this completion path independent of the watchdog tool's optional Typebox runtime.
+	const result = spawnSync("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
+	if (result.error || result.status !== 0) return undefined;
+	const lines = result.stdout.trim().split(/\r?\n/);
+	const ref = lines.pop();
+	const root = lines.join("\n");
+	return root && ref ? { root, ref } : undefined;
+}
+
+function captureIndexTree(cwd: string): string | undefined {
+	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "write-tree"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
+	const tree = result.stdout?.trim();
+	return !result.error && result.status === 0 && tree && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
+}
+
 /** Fence the existing continuation, rather than creating or resuming another run. */
 export function beginStructuredOutputCompletion(structured: ChildStructuredOutput | undefined, messages: readonly Message[], cwd: string, deadlineAt?: number): boolean {
 	if (!structured || structured.completionRecovery) return false;
 	const messageCount = messages.length;
 	const originalMessages = JSON.stringify(messages);
 	const originalSchema = JSON.stringify(structured.schema);
-	const baseline = captureWatchdogDiffBaseline(cwd);
+	const baseline = captureGitBaseline(cwd);
 	if (!baseline) {
 		const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8", timeout: 2_000, env: { ...process.env, LC_ALL: "C" }, windowsHide: true });
 		const diagnostic = probe.stderr.trim();
@@ -46,17 +61,20 @@ export function beginStructuredOutputCompletion(structured: ChildStructuredOutpu
 			|| /^fatal: not a git repository \(or any parent up to mount point [^\r\n]+\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.$/.test(diagnostic);
 		if (probe.error || probe.status !== 128 || !nonGit) return false;
 	}
-	const mutations = baseline ? snapshotTrackedMutations(cwd) : undefined;
-	if (mutations?.unavailable || mutations?.truncated || (deadlineAt !== undefined && Date.now() >= deadlineAt)) return false;
+	// A HEAD-to-worktree diff omits changes confined to the staged subject.
+	const indexTree = baseline ? captureIndexTree(baseline.root) : undefined;
+	const mutations = baseline ? snapshotTrackedMutations(baseline.root) : undefined;
+	if ((baseline && !indexTree) || mutations?.unavailable || mutations?.truncated || (deadlineAt !== undefined && Date.now() >= deadlineAt)) return false;
 	structured.completionRecovery = {
 		originalError: MISSING_STRUCTURED_OUTPUT_CALL_ERROR,
 		validateSubject() {
 			if (JSON.stringify(structured.schema) !== originalSchema) return "Structured completion recovery failed: output schema changed.";
 			if (JSON.stringify(messages.slice(0, messageCount)) !== originalMessages) return "Structured completion recovery failed: original evidence changed.";
 			if (!baseline || !mutations) return undefined;
-			const current = captureWatchdogDiffBaseline(cwd);
+			const current = captureGitBaseline(cwd);
 			if (!current || current.root !== baseline.root || current.ref !== baseline.ref) return "Structured completion recovery failed: Git subject changed or became unavailable.";
-			const evidence = collectTrackedMutationEvidence(mutations, cwd);
+			if (captureIndexTree(baseline.root) !== indexTree) return "Structured completion recovery failed: staged subject changed or became unavailable.";
+			const evidence = collectTrackedMutationEvidence(mutations, baseline.root);
 			if (evidence.unavailable || evidence.truncated || evidence.attemptedMutation) return "Structured completion recovery failed: tracked subject changed or became unavailable.";
 			return undefined;
 		},

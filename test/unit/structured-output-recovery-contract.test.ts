@@ -66,15 +66,84 @@ for (const toolName of ["read", "bash", "mcp", "write", "subagent"]) {
 	});
 }
 
+function gitSubject(dir: string) {
+	const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	git("init", "-q");
+	fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = true;\n");
+	git("add", "fixture.ts");
+	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "subject");
+	return git;
+}
+
+it("index-only mutation cannot capture a clean report even when the HEAD-to-worktree diff stays empty", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const git = gitSubject(dir);
+	const before = git("write-tree");
+	const h = harness(dir);
+	assert.equal(h.begin(), true);
+	fs.writeFileSync(path.join(dir, "index-content"), "export const stable = false;\n");
+	const blob = git("hash-object", "-w", "index-content");
+	git("update-index", "--cacheinfo", "100644", blob, "fixture.ts");
+	assert.notEqual(git("write-tree"), before);
+	assert.equal(git("diff", "HEAD"), "");
+	await assert.rejects(h.submit(), /staged subject changed|unavailable/);
+	assert.deepEqual(h.captured, []);
+});
+
+it("unchanged staged and unstaged review content can recover", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const git = gitSubject(dir);
+	fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = false;\n");
+	git("add", "fixture.ts");
+	fs.appendFileSync(path.join(dir, "fixture.ts"), "export const pending = true;\n");
+	const indexTree = git("write-tree");
+	const h = harness(dir);
+	assert.equal(h.begin(), true);
+	await h.submit();
+	assert.deepEqual(h.captured, [{ ok: true }]);
+	assert.equal(git("write-tree"), indexTree);
+});
+
+it("nested child cwd detects another edit to already-dirty root-relative content", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	gitSubject(dir);
+	const nested = path.join(dir, "nested");
+	fs.mkdirSync(nested);
+	fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = false;\n");
+	const h = harness(nested);
+	assert.equal(h.begin(), true);
+	assert.equal(h.structured.completionRecovery?.validateSubject(), undefined);
+	fs.appendFileSync(path.join(dir, "fixture.ts"), "export const later = true;\n");
+	await assert.rejects(h.submit(), /tracked subject changed|unavailable/);
+	assert.deepEqual(h.captured, []);
+});
+
+for (const phase of ["before", "after"] as const) {
+	it(`unavailable index identity ${phase} recovery admission cannot yield a clean report`, async (t) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+		t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+		gitSubject(dir);
+		const h = harness(dir);
+		if (phase === "after") assert.equal(h.begin(), true);
+		fs.writeFileSync(path.join(dir, ".git", "index"), "invalid-index");
+		if (phase === "before") {
+			assert.equal(h.begin(), false);
+			assert.equal(h.structured.completionRecovery, undefined);
+		} else {
+			await assert.rejects(h.submit(), /staged subject changed|unavailable/);
+			assert.deepEqual(h.captured, []);
+		}
+	});
+}
+
 for (const kind of ["evidence", "schema", "tracked-tree", "head", "unavailable"] as const) {
 	it(`changed ${kind} cannot yield a recovered report`, async (t) => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
 		t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
-		git("init", "-q");
-		fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = true;\n");
-		git("add", "fixture.ts");
-		git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "subject");
+		const git = gitSubject(dir);
 		const h = harness(dir);
 		assert.equal(h.begin(), true);
 		assert.equal(h.structured.completionRecovery?.validateSubject(), undefined);
