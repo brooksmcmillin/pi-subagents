@@ -63,7 +63,7 @@ import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
-import { formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
+import { beginStructuredOutputCompletion, formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
@@ -1439,13 +1439,16 @@ async function runSingleAttempt(
 						|| Boolean(result.timedOut || result.stopped || result.error || assistantError || progress.currentTool || capture.toolDiagnostic())
 						|| unfinishedToolAtTerminal || forcedTermination || created.shutDown === true || childSessionHasQueuedMessages(created)
 						|| (attemptTimeout !== undefined && Date.now() - startTime >= attemptTimeout.remainingMs),
-				})) {
+				}) && !options.machine && beginStructuredOutputCompletion(launch.config.structuredOutput, result.messages ?? [], options.cwd ?? runtimeCwd, attemptTimeout ? startTime + attemptTimeout.remainingMs : undefined)) {
 					clearFinalDrainTimers();
 					cleanTerminalAssistantStopReceived = false;
 					agentSettledReceived = false;
 					appendRecentOutput(progress, ["Recovering missing structured_output: one same-session completion turn."]);
 					fireUpdate();
 					await created.prompt(STRUCTURED_OUTPUT_COMPLETION_PROMPT);
+					const recovery = launch.config.structuredOutput?.completionRecovery;
+					if (recovery) recovery.error ??= recovery.validateSubject();
+					if (recovery?.error) throw new Error(recovery.error);
 				}
 				settle(undefined);
 			} catch (error) {
@@ -1489,7 +1492,7 @@ async function runSingleAttempt(
 		result.structuredOutputSchemaPath = options.structuredOutput.schemaPath;
 		result.structuredOutputPath = options.structuredOutput.outputPath;
 		const structured = capture.structuredOutput();
-		if (structuredOutputToolInvoked && structured.called) {
+		if (structuredOutputToolInvoked && structured.called && !launch.config.structuredOutput?.completionRecovery?.error) {
 			result.structuredOutput = structured.value;
 			const acceptanceMode = options.structuredOutput.acceptanceReportPath
 				? options.structuredOutput.acceptanceReportRequired ? "required" : "optional"

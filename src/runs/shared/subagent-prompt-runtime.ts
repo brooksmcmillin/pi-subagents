@@ -468,21 +468,32 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 		description: "Submit the required final structured output for this subagent step. This terminates the step.",
 		parameters,
 		async execute(_id: string, params: { value: unknown; acceptanceReport?: unknown }) {
-			const validation = await validateStructuredOutputValue(structured.schema, params.value);
-			if (validation.status === "invalid") {
-				throw new Error(`Structured output validation failed: ${validation.message}`);
+			const recovery = structured.completionRecovery;
+			if (recovery) {
+				if (terminalState.captured) recovery.error ??= "Structured completion recovery failed: report already submitted.";
+				recovery.error ??= recovery.validateSubject();
+				if (recovery.error) throw new Error(recovery.error);
 			}
-			if (required && params.acceptanceReport === undefined) {
-				throw new Error(MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR);
-			}
-			if (required && params.acceptanceReport !== undefined) {
-				const acceptanceValidation = validateAcceptanceReport(params.acceptanceReport, "acceptanceReport");
-				if (!acceptanceValidation.report) {
-					throw new Error(`Invalid structured output acceptance report: ${acceptanceValidation.errors.join("; ")}`);
+			try {
+				const validation = await validateStructuredOutputValue(structured.schema, params.value);
+				if (validation.status === "invalid") {
+					throw new Error(`Structured output validation failed: ${validation.message}`);
 				}
+				if (required && params.acceptanceReport === undefined) {
+					throw new Error(MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR);
+				}
+				if (required && params.acceptanceReport !== undefined) {
+					const acceptanceValidation = validateAcceptanceReport(params.acceptanceReport, "acceptanceReport");
+					if (!acceptanceValidation.report) {
+						throw new Error(`Invalid structured output acceptance report: ${acceptanceValidation.errors.join("; ")}`);
+					}
+				}
+				structured.capture(params.value, structured.acceptanceReport ? params.acceptanceReport : undefined);
+				terminalState.captured = true;
+			} catch (error) {
+				if (recovery) recovery.error ??= "Structured completion recovery failed: structured_output was rejected.";
+				throw error;
 			}
-			structured.capture(params.value, structured.acceptanceReport ? params.acceptanceReport : undefined);
-			terminalState.captured = true;
 			return {
 				content: [{ type: "text", text: "Structured output captured." }],
 				details: {},
@@ -565,7 +576,21 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 			config.holdFinalDrain?.(false);
 		}
 	});
-	if (config.structuredOutput) registerStructuredOutputTool(pi, config.structuredOutput);
+	if (config.structuredOutput) {
+		registerStructuredOutputTool(pi, config.structuredOutput);
+		onRuntimeEvent("tool_call", (event: unknown) => {
+			const recovery = config.structuredOutput?.completionRecovery;
+			if (!recovery || !event || typeof event !== "object" || !("toolName" in event) || event.toolName === "structured_output") return;
+			recovery.error = "Structured completion recovery failed: only structured_output is permitted; review work must not be repeated.";
+			return { block: true, reason: recovery.error };
+		});
+		pi.on("tool_result", (event) => {
+			const recovery = config.structuredOutput?.completionRecovery;
+			if (recovery && event.toolName === "structured_output" && event.isError) {
+				recovery.error ??= "Structured completion recovery failed: structured_output was rejected.";
+			}
+		});
+	}
 
 	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx, config.forkCacheKey));
 

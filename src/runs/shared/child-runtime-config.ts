@@ -41,6 +41,12 @@ export interface ChildStructuredOutput {
 	acceptanceReport?: "optional" | "required";
 	/** Authoritative child-local state set only after validated capture succeeds. */
 	terminalState?: { captured: boolean };
+	/** Local one-attempt report-only fence; never inherited by another child. */
+	completionRecovery?: {
+		originalError: string;
+		error?: string;
+		validateSubject: () => string | undefined;
+	};
 	/** Receives the validated value; `acceptanceReport` is undefined when the child omitted it. */
 	capture: (value: unknown, acceptanceReport: unknown | undefined) => void;
 }
