@@ -1,15 +1,29 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { runWorkflowScript } from "../../src/workflows/scripted-workflow.ts";
 
 const recipePath = "skills/pi-subagents/references/task-delivery.md";
-const read = (path: string) => readFileSync(resolve(path), "utf8");
+const read = (path: string) => readFileSync(resolve(path), "utf8").replace(/\r\n/g, "\n");
 const recipe = read(recipePath);
 const skill = read("skills/pi-subagents/SKILL.md");
-const script = recipe.match(/```js workflow\n([\s\S]*?)\n```/)?.[1];
+const extractScript = (text: string) => text.match(/```js workflow\n([\s\S]*?)\n```/)?.[1];
+const script = extractScript(recipe);
 assert.ok(script, "recipe must include the executable two-stage example");
+
+for (const [name, newline] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
+	test(`recipe file reads normalize ${name} for executable example extraction`, (t) => {
+		const dir = mkdtempSync(resolve(tmpdir(), "delivery-guidance-"));
+		t.after(() => rmSync(dir, { recursive: true, force: true }));
+		const path = resolve(dir, "recipe.md");
+		writeFileSync(path, recipe.replace(/\r?\n/g, newline));
+		const normalized = read(path);
+		assert.doesNotMatch(normalized, /\r/);
+		assert.equal(extractScript(normalized), script);
+	});
+}
 
 // Prose guards and fake launches prove documentation composition, not model compliance.
 test("compact route is discoverable without unconditional broad reference loading", () => {
