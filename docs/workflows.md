@@ -4,11 +4,16 @@ How to compose subagents: the recommended pattern, packaged prompt shortcuts, sc
 
 ## Recommended orchestration pattern
 
-Use orchestration as parent-agent guidance, not as a runtime workflow mode. For implementation work, the recommended loop is:
+For ordinary operator-authorized task delivery, start with the
+[pi-subagents skill](../skills/pi-subagents/SKILL.md) and its
+[compact task-delivery recipe](../skills/pi-subagents/references/task-delivery.md).
+Load advanced references only when their trigger applies; this full catalog is
+not a prerequisite for a worker/reviewer pair. The recipe preserves authority,
+worktree ownership, failure recovery and validation rules using existing APIs.
 
-```text
-clarify → scout → worker → fresh reviewers → worker
-```
+Use orchestration as parent-agent guidance, not as a runtime workflow mode. The
+smallest useful implementation loop is bounded work, validation, then review
+when required. Add scouting, reviewer fanout or a fix pass only when needed.
 
 Packaged `worker` defaults to fresh context so implementation starts from its assigned brief instead of the parent's unfinished conversation. Packaged `oracle` and `advisor` default to forked context; if the parent has no persisted session file or current leaf yet, that implicit default falls back to `fresh`. Explicit `context`, `context: "profile"`, and global `defaultSubagentContext` still override these profile defaults.
 
