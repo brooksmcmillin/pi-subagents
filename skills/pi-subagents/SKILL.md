@@ -95,20 +95,27 @@ that runner explicitly supports the option.
 
 ## Read the reference for the branch
 
+For ordinary authorized task delivery in one verified workspace, read
+[Compact task delivery](references/task-delivery.md) next. Together with this
+skill it covers mandatory authority, ownership, recovery and validation rules.
+Do not preload the broad references below or recursively follow their links:
+load only branches whose trigger applies, before using that capability. Multiple
+independent seams, workspaces or task lanes still require multi-lane guidance.
+
 For exact API fields and worked examples, call `subagent({action:"guide",topic:"tool-reference"})` or `topic:"workflows"`. The compact tool definition is not the recipe catalog; use `topic:"missions"` for mission updates and schedules.
 
 | Branch | Read |
 | --- | --- |
-| Delegate or choose roles, prompts, models, or slash commands | `references/prompting-and-roles.md` |
-| Execute single, scripted, async, scheduled, mission, forked, watchdog, oracle, or intercom workflows | `references/execution-controls.md` |
-| Review, validate, triage gate failures, or prepare delivery | `references/review-and-validation.md` |
+| Customize roles, prompts, models, or slash commands | `references/prompting-and-roles.md` |
+| Advanced execution, recovery, scheduled, mission, forked, watchdog, oracle, or intercom workflows | `references/execution-controls.md` |
+| Review fanout, disputed findings, or unresolved gate failures | `references/review-and-validation.md` |
 | Coordinate lanes, worktrees, repositories, or writer waves | `references/multi-lane-orchestration.md` |
 | List, create, edit, disable, eject, or expose agents/RPC | `references/management-authoring-rpc.md` |
 | Check safety constraints, recipes, or error handling | `references/constraints-and-recipes.md` |
 
-For an authorized complex delegated workflow, read `prompting-and-roles.md` and
-`execution-controls.md`, then load `review-and-validation.md` and
-`constraints-and-recipes.md` before launch or review.
+For advanced delegated workflows, use the triggered-branch table in
+`references/task-delivery.md` to select the needed references. Complexity alone
+is not a reason to load the entire reference catalog.
 
 ## Operating rules
 

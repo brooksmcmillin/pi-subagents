@@ -4,6 +4,11 @@ description: Review/fix loop until clean
 
 Run a parent-orchestrated review loop for the requested work.
 
+Read the installed `pi-subagents` skill and its `references/task-delivery.md`
+recipe first. Use its triggered-branch table instead of preloading all execution,
+role and constraint references. For this prompt's reviewer fanout also load
+`references/review-and-validation.md`. Preserve the gates and round cap below.
+
 Use the `subagent` tool. Keep the parent session as the loop controller and final decision-maker. Child subagents must receive concrete role-specific tasks; they must not run subagents or manage the loop themselves unless the parent intentionally selected an explicit fanout agent whose builtin `tools` includes `subagent` for that assigned fanout.
 
 Default to a maximum of 3 review rounds unless I specify a different cap. Count a review round each time fresh-context reviewers inspect the current diff after a worker pass. Stop early when reviewers find no P0 findings, no P1 fixes worth doing now, and no approved P2 notes that should be handled in this loop.
