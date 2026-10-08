@@ -63,7 +63,7 @@ import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
-import { formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput } from "../shared/structured-output.ts";
+import { formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
@@ -796,6 +796,7 @@ async function runSingleAttempt(
 		type ActiveToolCall = { attentionEmitted?: boolean; key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
 		const activeToolCalls = new Map<string, ActiveToolCall>();
+		let unfinishedToolAtTerminal = false;
 		const activeToolKeysByName = new Map<string, string[]>();
 		const latestActiveToolCall = (): ActiveToolCall | undefined => [...activeToolCalls.values()].sort((left, right) => right.startedAt - left.startedAt)[0];
 		const refreshCurrentTool = (): void => {
@@ -1128,6 +1129,7 @@ async function runSingleAttempt(
 					if (terminalAssistantStop) {
 						if (!evt.message.errorMessage && assistantText.trim()) assistantError = undefined;
 						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
+						unfinishedToolAtTerminal ||= activeToolCalls.size > 0;
 						clearAllToolTimeouts();
 						activeToolCalls.clear();
 						activeToolKeysByName.clear();
@@ -1429,6 +1431,22 @@ async function runSingleAttempt(
 				options.onChildSession?.({ steer: (text) => created.steer(text), followUp: (text) => created.followUp(text) });
 				messageBaseline = created.messages.length;
 				await created.prompt(`Task: ${task}`);
+				if (shouldRecoverStructuredOutputCompletion({
+					required: Boolean(options.structuredOutput),
+					toolInvoked: structuredOutputToolInvoked,
+					messages: result.messages ?? [],
+					blocked: sessionSettled || lifecycleFinished || abortedBySignal || interruptedByControl
+						|| Boolean(result.timedOut || result.stopped || result.error || assistantError || progress.currentTool || capture.toolDiagnostic())
+						|| unfinishedToolAtTerminal || forcedTermination || created.shutDown === true || childSessionHasQueuedMessages(created)
+						|| (attemptTimeout !== undefined && Date.now() - startTime >= attemptTimeout.remainingMs),
+				})) {
+					clearFinalDrainTimers();
+					cleanTerminalAssistantStopReceived = false;
+					agentSettledReceived = false;
+					appendRecentOutput(progress, ["Recovering missing structured_output: one same-session completion turn."]);
+					fireUpdate();
+					await created.prompt(STRUCTURED_OUTPUT_COMPLETION_PROMPT);
+				}
 				settle(undefined);
 			} catch (error) {
 				settle(error ?? new Error("Child session failed."));

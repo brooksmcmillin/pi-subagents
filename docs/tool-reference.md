@@ -160,6 +160,8 @@ The `output` field is the API binding; a filename mentioned in task text (for ex
 
 When a child also has `outputSchema`, the schema-validated `structured_output` value is authoritative for the declared output path. String roots are saved verbatim; other values are saved as deterministic pretty JSON. For file-only outputs, call `structured_output` without first writing receipt prose or different content at that path: immutable persistence rejects conflicting bytes. Inline output mode retains replacement behavior. The run fails if the validated artifact cannot be persisted. Consumers should use `structuredOutput` as the typed report and the returned output path as its durable representation.
 
+Native children that end an ordinary turn without calling required `structured_output` receive one same-session completion prompt, using their existing evidence rather than rerunning the task. This applies to empty and prose-only completions, retains the original transcript, and uses the remaining run deadline. It does not recover rejected structured calls, provider errors, stopped/interrupted/timed-out runs, or pending tools/input. If the extra turn still omits the tool, the run fails normally; prose is never treated as validated output.
+
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
 
 ### Retained children
