@@ -1020,7 +1020,8 @@ export default function() {
 		assert.equal(children.find(({ key }) => key === "inherited")?.ok, false);
 		assert.match(children.find(({ key }) => key === "inherited")?.error ?? "", /Missing structured_output call/);
 		assert.deepEqual(children.find(({ key }) => key === "disabled"), { key: "disabled", ok: true, output: "false opted out" });
-		assert.equal(mockPi.callCount(), 3);
+		// Each missing-schema completion gets one additional same-session turn.
+		assert.equal(mockPi.callCount(), 5);
 	});
 
 	it("background file-only outputSchema runs persist their validated artifact before completion checks", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

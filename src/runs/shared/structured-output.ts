@@ -9,6 +9,24 @@ import type { JsonSchemaObject } from "../../shared/types.ts";
 import type { ResolvedAcceptanceReportMode } from "./acceptance.ts";
 
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
+export const STRUCTURED_OUTPUT_COMPLETION_PROMPT = "Your previous turn ended without the required structured_output call. Continue in this same session using the evidence already gathered; do not repeat implementation or inspection. Submit your report through structured_output as your only final action. If evidence is insufficient, report that limitation using the declared schema rather than claiming success.";
+
+/** Recover only an ordinary completed turn, never a rejected tool call or an interrupted run. */
+export function shouldRecoverStructuredOutputCompletion(options: {
+	required: boolean;
+	toolInvoked: boolean;
+	messages: readonly Message[];
+	blocked: boolean;
+}): boolean {
+	if (!options.required || options.toolInvoked || options.blocked) return false;
+	const last = options.messages.at(-1) as (Message & { stopReason?: string; errorMessage?: string }) | undefined;
+	return last?.role === "assistant"
+		&& last.stopReason === "stop"
+		&& !last.errorMessage
+		&& Array.isArray(last.content)
+		&& !last.content.some((part) => part.type === "toolCall");
+}
+
 export const MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR = "Missing acceptanceReport in structured_output call; acceptance.report is \"on\".";
 export const STRUCTURED_OUTPUT_REJECTION_ERROR = "structured_output was invoked but no valid output was captured.";
 export const INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR = "Structured output invocation was rejected: invalid outputSchema.";

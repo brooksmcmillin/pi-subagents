@@ -27,6 +27,7 @@ import { createReportedChildSessionInput, type InProcessChildLaunch } from "../s
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
+import { shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
@@ -211,6 +212,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		type ActiveToolCall = { key: string; tool: string; args?: string; path?: string };
 		let activeToolSequence = 0;
 		const activeToolCalls = new Map<string, ActiveToolCall>();
+		let unfinishedToolAtTerminal = false;
 		const activeToolKeysByName = new Map<string, string[]>();
 		const refreshCurrentTool = (): void => {
 			const active = [...activeToolCalls.values()].at(-1);
@@ -540,6 +542,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				if (isTerminalAssistantStop(event.message)) {
 					if (!event.message.errorMessage && extractTextFromContent(event.message.content).trim()) assistantError = undefined;
 					cleanTerminalAssistantStopReceived ||= !event.message.errorMessage;
+					unfinishedToolAtTerminal ||= activeToolCalls.size > 0;
 					clearAllToolTimeouts();
 					activeToolCalls.clear();
 					activeToolKeysByName.clear();
@@ -713,6 +716,23 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
 				await created.prompt(input.prompt);
+				if (shouldRecoverStructuredOutputCompletion({
+					required: Boolean(input.launch.config?.structuredOutput),
+					toolInvoked: structuredOutputToolInvoked,
+					messages,
+					blocked: settled || interrupted || timedOut || stopped || forcedTermination || unfinishedToolAtTerminal
+						|| Boolean(error || assistantError || currentTool || input.launch.capture?.toolDiagnostic())
+						|| created.shutDown === true || childSessionHasQueuedMessages(created)
+						|| (input.runDeadlineAt !== undefined && Date.now() >= input.runDeadlineAt),
+				})) {
+					clearFinalDrainTimers();
+					clearWatchdogTailTimer();
+					cleanTerminalAssistantStopReceived = false;
+					agentSettledReceived = false;
+					input.writeOutputLine("Recovering missing structured_output: one same-session completion turn.");
+					appendChildEvent({ type: "structured_output_completion_recovery", attempt: 1 });
+					await created.prompt(STRUCTURED_OUTPUT_COMPLETION_PROMPT);
+				}
 				promptSettled = true;
 				settle(undefined);
 			} catch (promptError) {
