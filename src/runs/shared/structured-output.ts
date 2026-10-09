@@ -47,6 +47,12 @@ function captureIndexTree(cwd: string): string | undefined {
 	return !result.error && result.status === 0 && tree && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
 }
 
+function hasHiddenTrackedFiles(cwd: string): boolean | undefined {
+	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { cwd, encoding: "utf8", timeout: 2_000, maxBuffer: 1024 * 1024, windowsHide: true });
+	if (result.error || result.status !== 0) return undefined;
+	return result.stdout.split("\0").some((entry) => /^[a-zS]/.test(entry));
+}
+
 /** Fence the existing continuation, rather than creating or resuming another run. */
 export function beginStructuredOutputCompletion(structured: ChildStructuredOutput | undefined, messages: readonly Message[], cwd: string, deadlineAt?: number): boolean {
 	if (!structured || structured.completionRecovery) return false;
@@ -61,9 +67,15 @@ export function beginStructuredOutputCompletion(structured: ChildStructuredOutpu
 			|| /^fatal: not a git repository \(or any parent up to mount point [^\r\n]+\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.$/.test(diagnostic);
 		if (probe.error || probe.status !== 128 || !nonGit) return false;
 	}
+	if (baseline) {
+		const hiddenFiles = hasHiddenTrackedFiles(baseline.root);
+		if (hiddenFiles !== false) {
+			throw new Error(`${MISSING_STRUCTURED_OUTPUT_CALL_ERROR} Recovery unavailable: ${hiddenFiles ? "tracked files use assume-unchanged or skip-worktree flags" : "Git tracked-file flags are unavailable"}.`);
+		}
+	}
 	// A HEAD-to-worktree diff omits changes confined to the staged subject.
 	const indexTree = baseline ? captureIndexTree(baseline.root) : undefined;
-	const mutations = baseline ? snapshotTrackedMutations(baseline.root) : undefined;
+	const mutations = baseline ? snapshotTrackedMutations(baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000)) : undefined;
 	if ((baseline && !indexTree) || mutations?.unavailable || mutations?.truncated || (deadlineAt !== undefined && Date.now() >= deadlineAt)) return false;
 	structured.completionRecovery = {
 		originalError: MISSING_STRUCTURED_OUTPUT_CALL_ERROR,
@@ -74,7 +86,8 @@ export function beginStructuredOutputCompletion(structured: ChildStructuredOutpu
 			const current = captureGitBaseline(cwd);
 			if (!current || current.root !== baseline.root || current.ref !== baseline.ref) return "Structured completion recovery failed: Git subject changed or became unavailable.";
 			if (captureIndexTree(baseline.root) !== indexTree) return "Structured completion recovery failed: staged subject changed or became unavailable.";
-			const evidence = collectTrackedMutationEvidence(mutations, baseline.root);
+			if (hasHiddenTrackedFiles(baseline.root) !== false) return "Structured completion recovery failed: tracked-file flags hide the subject or became unavailable.";
+			const evidence = collectTrackedMutationEvidence(mutations, baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000));
 			if (evidence.unavailable || evidence.truncated || evidence.attemptedMutation) return "Structured completion recovery failed: tracked subject changed or became unavailable.";
 			return undefined;
 		},

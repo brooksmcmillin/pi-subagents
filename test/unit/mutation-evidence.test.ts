@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync, type ExecFileSyncOptions } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -107,6 +108,53 @@ describe("tracked mutation evidence", () => {
 			assert.equal(fs.existsSync(marker), false);
 		});
 	});
+
+	it("fingerprints raw bytes without invoking a configured textconv", () => {
+		withRepo((repo) => {
+			const marker = path.join(repo, "textconv-invoked");
+			const converter = path.join(repo, "converter.cjs");
+			fs.writeFileSync(converter, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "invoked"); throw new Error("converter should not run");\n`);
+			fs.writeFileSync(path.join(repo, ".gitattributes"), "tracked.txt diff=fixture\n");
+			git(repo, ["config", "diff.fixture.textconv", `${JSON.stringify(process.execPath)} ${JSON.stringify(converter)}`]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n");
+			const snapshot = snapshotTrackedMutations(repo, Date.now() + 10_000);
+			assert.equal(snapshot.unavailable, undefined);
+			assert.equal(collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000).attemptedMutation, false);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n");
+			assert.equal(collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000).attemptedMutation, true);
+			assert.equal(fs.existsSync(marker), false);
+		});
+	});
+
+	for (const fault of ["timeout", "overflow", "overflow-expired"]) {
+		it(`bounds fingerprint ${fault} without an unbounded fallback`, (t) => {
+			withRepo((repo) => {
+				fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n");
+				t.mock.timers.enable({ apis: ["Date"], now: 10_000 });
+				const original = childProcess.execFileSync;
+				const timeouts: Array<number | undefined> = [];
+				t.mock.method(childProcess, "execFileSync", (command: string, args: readonly string[], options: ExecFileSyncOptions) => {
+					if (!args.includes("--binary")) return original(command, args, options);
+					timeouts.push(options.timeout);
+					assert.equal(args.includes("--no-textconv"), true);
+					if (args.some((arg) => arg.startsWith("--output="))) return original(command, args, options);
+					t.mock.timers.tick(fault === "overflow-expired" ? 10_001 : 100);
+					throw Object.assign(new Error(`simulated ${fault}`), { code: fault === "timeout" ? "ETIMEDOUT" : "ENOBUFS" });
+				});
+				syncBuiltinESMExports();
+				t.after(() => { t.mock.restoreAll(); t.mock.timers.reset(); syncBuiltinESMExports(); });
+				const snapshot = snapshotTrackedMutations(repo, 20_000);
+				assert.equal(timeouts[0], 10_000);
+				if (fault === "overflow") {
+					assert.deepEqual(timeouts, [10_000, 9_900]);
+					assert.equal(snapshot.unavailable, undefined);
+				} else {
+					assert.equal(timeouts.length, 1);
+					assert.match(snapshot.unavailable ?? "", /simulated timeout|deadline expired/);
+				}
+			});
+		});
+	}
 
 	it("formats bounded timeout recovery data", () => {
 		const summary = buildTimeoutRecoverySummary({

@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync, type ExecFileSyncOptions, type SpawnSyncOptions } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { it } from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import type { ChildStructuredOutput } from "../../src/runs/shared/child-runtime-config.ts";
+import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
+import type { ChildRuntimeConfig, ChildStructuredOutput } from "../../src/runs/shared/child-runtime-config.ts";
 import registerSubagentPromptRuntime from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import { beginStructuredOutputCompletion, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, shouldRecoverStructuredOutputCompletion } from "../../src/runs/shared/structured-output.ts";
 
-function harness(cwd: string) {
+function harness(cwd: string, permissions?: ChildRuntimeConfig["permissions"]) {
 	const captured: unknown[] = [];
 	const handlers = new Map<string, Array<(event: unknown) => unknown>>();
 	let execute!: (id: string, params: { value: unknown }) => Promise<unknown>;
@@ -21,12 +23,17 @@ function harness(cwd: string) {
 		on(name: string, handler: (event: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 		registerTool(tool: { name: string; execute: typeof execute }) { if (tool.name === "structured_output") execute = tool.execute; },
 		events: { on() {} },
-	} as never, { cwd, structuredOutput: structured, fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false });
+	} as never, { cwd, permissions, structuredOutput: structured, fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false });
+	const nativeRunner = Object.assign(Object.create(ExtensionRunner.prototype) as ExtensionRunner, {
+		extensions: [{ handlers }], createContext: () => ({}),
+	});
 	const messages = [fauxAssistantMessage("fixture.ts:1 inspected; stable export, no findings.")];
 	return {
 		structured, captured, messages,
 		begin: () => beginStructuredOutputCompletion(structured, messages, cwd),
 		submit: (value: unknown = { ok: true }) => execute("report", { value }),
+		nativeToolCall: (toolName: string) => nativeRunner.emitToolCall({ type: "tool_call", toolName, toolCallId: "probe", input: {} }),
+		nativeToolResult: (toolName: string) => nativeRunner.emitToolResult({ type: "tool_result", toolName, toolCallId: "probe", input: {}, content: [], details: {}, isError: true }),
 		async emit(name: string, event: unknown) {
 			const results = [];
 			for (const handler of handlers.get(name) ?? []) results.push(await handler(event));
@@ -65,6 +72,77 @@ for (const toolName of ["read", "bash", "mcp", "write", "subagent"]) {
 		assert.deepEqual(h.captured, []);
 	});
 }
+
+for (const toolName of ["read", "write"]) {
+	it(`native permission-denied ${toolName} exhausts report-only recovery`, async (t) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+		t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+		const h = harness(dir, { rules: { [toolName]: "deny" } });
+		assert.match((await h.nativeToolCall(toolName))?.reason ?? "", /permission rule.*denied/);
+		assert.equal(h.structured.completionRecovery, undefined);
+		assert.equal(h.begin(), true);
+		assert.equal((await h.nativeToolCall(toolName))?.block, true);
+		let failure: unknown;
+		try { await h.submit(); } catch (error) { failure = error; }
+		assert.deepEqual(h.captured, []);
+		assert.match(String(failure), /only structured_output/);
+	});
+}
+
+it("a native forbidden-tool result latches failure without an owned tool_call event", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const h = harness(dir);
+	assert.equal(h.begin(), true);
+	await h.nativeToolResult("read");
+	await assert.rejects(h.submit(), /only structured_output/);
+	assert.deepEqual(h.captured, []);
+});
+
+for (const values of [[{ ok: true }, { ok: false }], [{ ok: "invalid" }, { ok: true }], [{ ok: true }, { ok: "invalid" }]]) {
+	it(`parallel recovery reports ${JSON.stringify(values)} exhaust the attempt without capture`, async (t) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+		t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+		const h = harness(dir);
+		assert.equal(h.begin(), true);
+		await Promise.all(values.map(() => h.nativeToolCall("structured_output")));
+		const settled = await Promise.allSettled(values.map((value) => h.submit(value)));
+		assert.deepEqual(settled.map((result) => result.status), ["rejected", "rejected"]);
+		assert.deepEqual(h.captured, []);
+		assert.match(h.structured.completionRecovery?.error ?? "", /already submitted/);
+		await assert.rejects(h.submit(), /already submitted/);
+	});
+}
+
+it("ordinary invalid-report correction releases submission ownership", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const h = harness(dir);
+	await assert.rejects(h.submit({ ok: "invalid" }), /validation failed/);
+	await h.submit({ ok: true });
+	assert.deepEqual(h.captured, [{ ok: true }]);
+	assert.equal(h.structured.completionRecovery, undefined);
+});
+
+it("ordinary parallel reports preserve only the first accepted capture", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const h = harness(dir);
+	const settled = await Promise.allSettled([h.submit({ ok: true }), h.submit({ ok: false })]);
+	assert.deepEqual(settled.map((result) => result.status), ["fulfilled", "rejected"]);
+	assert.deepEqual(h.captured, [{ ok: true }]);
+});
+
+it("a violation during asynchronous validation prevents capture", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const h = harness(dir);
+	assert.equal(h.begin(), true);
+	const report = h.submit();
+	await h.nativeToolResult("read");
+	await assert.rejects(report, /only structured_output/);
+	assert.deepEqual(h.captured, []);
+});
 
 function gitSubject(dir: string) {
 	const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -121,6 +199,65 @@ it("nested child cwd detects another edit to already-dirty root-relative content
 	assert.deepEqual(h.captured, []);
 });
 
+for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+	for (const phase of ["before", "after"] as const) {
+		it(`${flag} ${phase} admission visibly prevents automatic recovery`, async (t) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+			t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+			const git = gitSubject(dir);
+			const h = harness(dir);
+			const indexTree = git("write-tree");
+			if (phase === "after") assert.equal(h.begin(), true);
+			git("update-index", flag, "fixture.ts");
+			if (phase === "before") {
+				assert.throws(h.begin, /Missing structured_output.*Recovery unavailable.*flags/);
+				assert.equal(h.structured.completionRecovery, undefined);
+			} else {
+				fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = false;\n");
+				assert.equal(git("diff", "HEAD"), "");
+				await assert.rejects(h.submit(), /tracked-file flags/);
+				assert.deepEqual(h.captured, []);
+			}
+			assert.equal(git("write-tree"), indexTree);
+			assert.match(git("ls-files", "-v"), /^[a-zS]/, "recovery never clears repository flags");
+		});
+	}
+}
+
+for (const code of ["ENOBUFS", "ETIMEDOUT"]) {
+	for (const phase of ["before", "after"] as const) {
+		it(`flags enumeration ${code} ${phase} admission cannot clean`, async (t) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+			t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+			gitSubject(dir);
+			const h = harness(dir);
+			if (phase === "after") assert.equal(h.begin(), true);
+			const original = childProcess.spawnSync;
+			let flagProbes = 0;
+			t.mock.method(childProcess, "spawnSync", (command: string, args: readonly string[], options: SpawnSyncOptions) => {
+				const result = original(command, args, options);
+				if (command !== "git" || !args.includes("ls-files")) return result;
+				flagProbes++;
+				assert.equal(options.timeout, 2_000);
+				assert.equal(options.maxBuffer, 1024 * 1024);
+				return { ...result, status: null, error: Object.assign(new Error("private syscall diagnostic"), { code }) };
+			});
+			syncBuiltinESMExports();
+			t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+			if (phase === "before") {
+				assert.throws(h.begin, /Missing structured_output.*Recovery unavailable.*flags are unavailable/);
+				assert.equal(h.structured.completionRecovery, undefined);
+			} else {
+				await assert.rejects(h.submit(), /tracked-file flags.*unavailable/);
+				assert.equal(h.structured.completionRecovery?.originalError, MISSING_STRUCTURED_OUTPUT_CALL_ERROR);
+				assert.doesNotMatch(h.structured.completionRecovery?.error ?? "", /private syscall diagnostic/);
+			}
+			assert.equal(flagProbes, 1);
+			assert.deepEqual(h.captured, []);
+		});
+	}
+}
+
 for (const phase of ["before", "after"] as const) {
 	it(`unavailable index identity ${phase} recovery admission cannot yield a clean report`, async (t) => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
@@ -130,7 +267,7 @@ for (const phase of ["before", "after"] as const) {
 		if (phase === "after") assert.equal(h.begin(), true);
 		fs.writeFileSync(path.join(dir, ".git", "index"), "invalid-index");
 		if (phase === "before") {
-			assert.equal(h.begin(), false);
+			assert.throws(h.begin, /Recovery unavailable.*flags are unavailable/);
 			assert.equal(h.structured.completionRecovery, undefined);
 		} else {
 			await assert.rejects(h.submit(), /staged subject changed|unavailable/);
@@ -138,6 +275,29 @@ for (const phase of ["before", "after"] as const) {
 		}
 	});
 }
+
+it("a fingerprint timeout after admission latches failure without fallback or capture", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "report-recovery-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	gitSubject(dir);
+	fs.appendFileSync(path.join(dir, "fixture.ts"), "export const dirty = true;\n");
+	const h = harness(dir);
+	assert.equal(h.begin(), true);
+	const original = childProcess.execFileSync;
+	let fingerprints = 0;
+	t.mock.method(childProcess, "execFileSync", (command: string, args: readonly string[], options: ExecFileSyncOptions) => {
+		if (!args.includes("--binary")) return original(command, args, options);
+		fingerprints++;
+		assert.ok(options.timeout !== undefined && options.timeout > 0 && options.timeout <= 2_000);
+		throw Object.assign(new Error("simulated timeout"), { code: "ETIMEDOUT" });
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	await assert.rejects(h.submit(), /tracked subject changed or became unavailable/);
+	await assert.rejects(h.submit(), /tracked subject changed or became unavailable/);
+	assert.equal(fingerprints, 1);
+	assert.deepEqual(h.captured, []);
+});
 
 for (const kind of ["evidence", "schema", "tracked-tree", "head", "unavailable"] as const) {
 	it(`changed ${kind} cannot yield a recovered report`, async (t) => {

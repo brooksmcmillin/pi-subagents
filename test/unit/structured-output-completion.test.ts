@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,11 +13,19 @@ import { createStructuredOutputFileCapture, createStructuredOutputRuntime, readS
 import { makeAgentConfigs } from "../support/helpers.ts";
 
 for (const mode of ["foreground", "background"] as const) {
-	for (const scenario of ["empty", "prose", "no-evidence", "already-captured", "repeated-missing", "late-violation", "changed-evidence", "provider-error", "rejected-tool", "pending-tool", "queued-input", "tool-diagnostic", "shutdown", "stop", "interrupt", "timeout", "forced-drain", "deadline-during"] as const) {
+	for (const scenario of ["empty", "prose", "no-evidence", "already-captured", "repeated-missing", "late-violation", "changed-evidence", "provider-error", "rejected-tool", "pending-tool", "queued-input", "tool-diagnostic", "shutdown", "stop", "interrupt", "timeout", "forced-drain", "deadline-during", "assume-unchanged", "skip-worktree"] as const) {
 		it(`${mode}: bounded same-session structured completion for ${scenario}`, { timeout: 15_000 }, async (t) => {
 			if (scenario === "deadline-during") t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.now() });
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "structured-completion-"));
 			try {
+				if (scenario === "assume-unchanged" || scenario === "skip-worktree") {
+					const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+					git("init", "-q");
+					fs.writeFileSync(path.join(dir, "fixture.ts"), "export const stable = true;\n");
+					git("add", "fixture.ts");
+					git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "subject");
+					git("update-index", `--${scenario}`, "fixture.ts");
+				}
 				const runtime = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } }, additionalProperties: false }, dir);
 				let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
 				const messages: ChildSession["messages"][number][] = [];
@@ -121,6 +130,11 @@ for (const mode of ["foreground", "background"] as const) {
 					assert.match((await readStructuredOutput(runtime)).error ?? "", /Missing structured_output/);
 					if (mode === "foreground" && scenario !== "interrupt") assert.equal(result.exitCode, 1);
 					if (scenario === "provider-error") assert.equal(result.exitCode, 1);
+					if (scenario === "assume-unchanged" || scenario === "skip-worktree") {
+						assert.equal(result.exitCode, 1);
+						assert.match(result.error ?? "", /Missing structured_output.*Recovery unavailable.*flags/);
+						assert.equal(result.structuredOutput, undefined);
+					}
 					if (scenario === "rejected-tool" && mode === "background") assert.equal(result.structuredOutputToolInvoked, true, "runner final validation must reject the uncaptured invocation");
 					if (scenario === "deadline-during" || scenario === "timeout") assert.equal(result.timedOut, true);
 					if (scenario === "stop") assert.equal(result.stopped, true);
