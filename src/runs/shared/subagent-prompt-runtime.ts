@@ -31,6 +31,8 @@ import {
 	type ChildRuntimeConfig,
 } from "./child-runtime-config.ts";
 
+const REPORT_ONLY_RECOVERY_ERROR = "Structured completion recovery failed: only structured_output is permitted; review work must not be repeated.";
+
 const STRUCTURED_OUTPUT_INSTRUCTIONS = [
 	"This subagent step has a strict structured output contract.",
 	"Your final action must be to call the `structured_output` tool with JSON matching the provided schema.",
@@ -452,6 +454,7 @@ function assertRequiredChildToolsActive(pi: ExtensionAPI, requiredTools: readonl
 
 function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<ChildRuntimeConfig["structuredOutput"]>): void {
 	const terminalState = structured.terminalState ??= { captured: false };
+	let submissionInFlight = false;
 	const required = structured.acceptanceReport === "required";
 	const parameters = createStructuredOutputToolParameters(structured.schema, { acceptanceReport: structured.acceptanceReport });
 	const registerTool = pi.registerTool as unknown as (tool: {
@@ -468,21 +471,39 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 		description: "Submit the required final structured output for this subagent step. This terminates the step.",
 		parameters,
 		async execute(_id: string, params: { value: unknown; acceptanceReport?: unknown }) {
-			const validation = await validateStructuredOutputValue(structured.schema, params.value);
-			if (validation.status === "invalid") {
-				throw new Error(`Structured output validation failed: ${validation.message}`);
+			const recovery = structured.completionRecovery;
+			if (terminalState.captured || submissionInFlight) {
+				if (recovery) recovery.error ??= "Structured completion recovery failed: report already submitted.";
+				throw new Error(recovery?.error ?? "Structured output already submitted.");
 			}
-			if (required && params.acceptanceReport === undefined) {
-				throw new Error(MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR);
+			if (recovery) {
+				recovery.error ??= recovery.validateSubject();
+				if (recovery.error) throw new Error(recovery.error);
 			}
-			if (required && params.acceptanceReport !== undefined) {
-				const acceptanceValidation = validateAcceptanceReport(params.acceptanceReport, "acceptanceReport");
-				if (!acceptanceValidation.report) {
-					throw new Error(`Invalid structured output acceptance report: ${acceptanceValidation.errors.join("; ")}`);
+			submissionInFlight = true;
+			try {
+				const validation = await validateStructuredOutputValue(structured.schema, params.value);
+				if (validation.status === "invalid") {
+					throw new Error(`Structured output validation failed: ${validation.message}`);
 				}
+				if (required && params.acceptanceReport === undefined) {
+					throw new Error(MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR);
+				}
+				if (required && params.acceptanceReport !== undefined) {
+					const acceptanceValidation = validateAcceptanceReport(params.acceptanceReport, "acceptanceReport");
+					if (!acceptanceValidation.report) {
+						throw new Error(`Invalid structured output acceptance report: ${acceptanceValidation.errors.join("; ")}`);
+					}
+				}
+				if (recovery?.error) throw new Error(recovery.error);
+				structured.capture(params.value, structured.acceptanceReport ? params.acceptanceReport : undefined);
+				terminalState.captured = true;
+			} catch (error) {
+				if (recovery) recovery.error ??= "Structured completion recovery failed: structured_output was rejected.";
+				throw error;
+			} finally {
+				submissionInFlight = false;
 			}
-			structured.capture(params.value, structured.acceptanceReport ? params.acceptanceReport : undefined);
-			terminalState.captured = true;
 			return {
 				content: [{ type: "text", text: "Structured output captured." }],
 				details: {},
@@ -499,6 +520,15 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	// the configured inline factory. It must be inert rather than crashing the
 	// child before startup; the inline factory remains the real registration path.
 	if (!config) return;
+	if (config.structuredOutput) {
+		// Native dispatch stops at the first block; latch before ordinary gates.
+		pi.on("tool_call", (event) => {
+			const recovery = config.structuredOutput?.completionRecovery;
+			if (!recovery || event.toolName === "structured_output") return;
+			recovery.error ??= REPORT_ONLY_RECOVERY_ERROR;
+			return { block: true, reason: recovery.error };
+		});
+	}
 	registerRuntimeExtensionAcknowledgements(pi, config.runtimeAcknowledgements);
 	registerPermissionGate(pi, config.permissions, config.childWatchdog);
 	registerToolBudget(pi, config.toolBudget);
@@ -565,7 +595,17 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 			config.holdFinalDrain?.(false);
 		}
 	});
-	if (config.structuredOutput) registerStructuredOutputTool(pi, config.structuredOutput);
+	if (config.structuredOutput) {
+		registerStructuredOutputTool(pi, config.structuredOutput);
+		pi.on("tool_result", (event) => {
+			const recovery = config.structuredOutput?.completionRecovery;
+			if (!recovery) return;
+			if (event.toolName !== "structured_output") recovery.error ??= REPORT_ONLY_RECOVERY_ERROR;
+			else if (event.isError) {
+				recovery.error ??= "Structured completion recovery failed: structured_output was rejected.";
+			}
+		});
+	}
 
 	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx, config.forkCacheKey));
 

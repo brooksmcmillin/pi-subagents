@@ -332,7 +332,7 @@ syncBuiltinESMExports();
 					assert.ok(transcript);
 					assert.match(fs.readFileSync(transcript, "utf-8"), /Blocked by policy/);
 				}
-				assert.equal(mockPi.callCount(), 1);
+				assert.equal(mockPi.callCount(), diagnostic === "structured" && !interrupted ? 2 : 1);
 			});
 		}
 	}

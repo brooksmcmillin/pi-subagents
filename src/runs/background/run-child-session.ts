@@ -27,7 +27,7 @@ import { createReportedChildSessionInput, type InProcessChildLaunch } from "../s
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
-import { shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
+import { beginStructuredOutputCompletion, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
@@ -724,14 +724,17 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 						|| Boolean(error || assistantError || currentTool || input.launch.capture?.toolDiagnostic())
 						|| created.shutDown === true || childSessionHasQueuedMessages(created)
 						|| (input.runDeadlineAt !== undefined && Date.now() >= input.runDeadlineAt),
-				})) {
+				}) && !input.launch.session.machine && beginStructuredOutputCompletion(input.launch.config.structuredOutput, messages, input.launch.session.cwd, input.runDeadlineAt)) {
 					clearFinalDrainTimers();
 					clearWatchdogTailTimer();
 					cleanTerminalAssistantStopReceived = false;
 					agentSettledReceived = false;
 					input.writeOutputLine("Recovering missing structured_output: one same-session completion turn.");
-					appendChildEvent({ type: "structured_output_completion_recovery", attempt: 1 });
+					appendChildEvent({ type: "structured_output_completion_recovery", attempt: 1, originalError: MISSING_STRUCTURED_OUTPUT_CALL_ERROR, sessionId: created.sessionId });
 					await created.prompt(STRUCTURED_OUTPUT_COMPLETION_PROMPT);
+					const recovery = input.launch.config.structuredOutput?.completionRecovery;
+					if (recovery) recovery.error ??= recovery.validateSubject();
+					if (recovery?.error) throw new Error(recovery.error);
 				}
 				promptSettled = true;
 				settle(undefined);

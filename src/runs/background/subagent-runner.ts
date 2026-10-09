@@ -1256,7 +1256,11 @@ export async function runSingleStepInner(
 		let validatedStructuredOutput = false;
 		if (effectiveStructuredOutput) {
 			const otherwiseSuccessful = terminalDiagnosticsEligible && run.exitCode === 0 && !run.error && !toolAvailabilityError && !midToolExitError;
-			if (!run.structuredOutputToolInvoked && otherwiseSuccessful) {
+			const recoveryError = launch.config.structuredOutput?.completionRecovery?.error;
+			if (recoveryError) {
+				structuredError = recoveryError;
+				clearStructuredOutputCaptures(effectiveStructuredOutput);
+			} else if (!run.structuredOutputToolInvoked && otherwiseSuccessful) {
 				structuredError = MISSING_STRUCTURED_OUTPUT_CALL_ERROR;
 			} else if (run.structuredOutputToolInvoked) {
 				const structured = await readStructuredOutput({

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,9 +8,11 @@ import type { Message } from "@earendil-works/pi-ai";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import type { JsonSchemaObject } from "../../shared/types.ts";
 import type { ResolvedAcceptanceReportMode } from "./acceptance.ts";
+import type { ChildStructuredOutput } from "./child-runtime-config.ts";
+import { snapshotTrackedMutations, collectTrackedMutationEvidence } from "./mutation-evidence.ts";
 
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
-export const STRUCTURED_OUTPUT_COMPLETION_PROMPT = "Your previous turn ended without the required structured_output call. Continue in this same session using the evidence already gathered; do not repeat implementation or inspection. Submit your report through structured_output as your only final action. If evidence is insufficient, report that limitation using the declared schema rather than claiming success.";
+export const STRUCTURED_OUTPUT_COMPLETION_PROMPT = `${MISSING_STRUCTURED_OUTPUT_CALL_ERROR} Continue in this same session using the evidence already gathered; do not repeat implementation or inspection. Only structured_output is permitted in this report-only attempt. Submit your report through structured_output as your only final action. If evidence is insufficient, report that limitation using the declared schema rather than claiming success.`;
 
 /** Recover only an ordinary completed turn, never a rejected tool call or an interrupted run. */
 export function shouldRecoverStructuredOutputCompletion(options: {
@@ -19,12 +22,77 @@ export function shouldRecoverStructuredOutputCompletion(options: {
 	blocked: boolean;
 }): boolean {
 	if (!options.required || options.toolInvoked || options.blocked) return false;
+	if (!options.messages.some((message) => (message.role === "assistant" || (message.role === "toolResult" && !message.isError)) && messageText(message.content).trim())) return false;
 	const last = options.messages.at(-1) as (Message & { stopReason?: string; errorMessage?: string }) | undefined;
 	return last?.role === "assistant"
 		&& last.stopReason === "stop"
 		&& !last.errorMessage
 		&& Array.isArray(last.content)
 		&& !last.content.some((part) => part.type === "toolCall");
+}
+
+function captureGitBaseline(cwd: string): { root: string; ref: string } | undefined {
+	// Keep this completion path independent of the watchdog tool's optional Typebox runtime.
+	const result = spawnSync("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
+	if (result.error || result.status !== 0) return undefined;
+	const lines = result.stdout.trim().split(/\r?\n/);
+	const ref = lines.pop();
+	const root = lines.join("\n");
+	return root && ref ? { root, ref } : undefined;
+}
+
+function captureIndexTree(cwd: string): string | undefined {
+	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "write-tree"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
+	const tree = result.stdout?.trim();
+	return !result.error && result.status === 0 && tree && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
+}
+
+function hasHiddenTrackedFiles(cwd: string): boolean | undefined {
+	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { cwd, encoding: "utf8", timeout: 2_000, maxBuffer: 1024 * 1024, windowsHide: true });
+	if (result.error || result.status !== 0) return undefined;
+	return result.stdout.split("\0").some((entry) => /^[a-zS]/.test(entry));
+}
+
+/** Fence the existing continuation, rather than creating or resuming another run. */
+export function beginStructuredOutputCompletion(structured: ChildStructuredOutput | undefined, messages: readonly Message[], cwd: string, deadlineAt?: number): boolean {
+	if (!structured || structured.completionRecovery) return false;
+	const messageCount = messages.length;
+	const originalMessages = JSON.stringify(messages);
+	const originalSchema = JSON.stringify(structured.schema);
+	const baseline = captureGitBaseline(cwd);
+	if (!baseline) {
+		const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8", timeout: 2_000, env: { ...process.env, LC_ALL: "C" }, windowsHide: true });
+		const diagnostic = probe.stderr.trim();
+		const nonGit = diagnostic === "fatal: not a git repository (or any of the parent directories): .git"
+			|| /^fatal: not a git repository \(or any parent up to mount point [^\r\n]+\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.$/.test(diagnostic);
+		if (probe.error || probe.status !== 128 || !nonGit) return false;
+	}
+	if (baseline) {
+		const hiddenFiles = hasHiddenTrackedFiles(baseline.root);
+		if (hiddenFiles !== false) {
+			throw new Error(`${MISSING_STRUCTURED_OUTPUT_CALL_ERROR} Recovery unavailable: ${hiddenFiles ? "tracked files use assume-unchanged or skip-worktree flags" : "Git tracked-file flags are unavailable"}.`);
+		}
+	}
+	// A HEAD-to-worktree diff omits changes confined to the staged subject.
+	const indexTree = baseline ? captureIndexTree(baseline.root) : undefined;
+	const mutations = baseline ? snapshotTrackedMutations(baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000)) : undefined;
+	if ((baseline && !indexTree) || mutations?.unavailable || mutations?.truncated || (deadlineAt !== undefined && Date.now() >= deadlineAt)) return false;
+	structured.completionRecovery = {
+		originalError: MISSING_STRUCTURED_OUTPUT_CALL_ERROR,
+		validateSubject() {
+			if (JSON.stringify(structured.schema) !== originalSchema) return "Structured completion recovery failed: output schema changed.";
+			if (JSON.stringify(messages.slice(0, messageCount)) !== originalMessages) return "Structured completion recovery failed: original evidence changed.";
+			if (!baseline || !mutations) return undefined;
+			const current = captureGitBaseline(cwd);
+			if (!current || current.root !== baseline.root || current.ref !== baseline.ref) return "Structured completion recovery failed: Git subject changed or became unavailable.";
+			if (captureIndexTree(baseline.root) !== indexTree) return "Structured completion recovery failed: staged subject changed or became unavailable.";
+			if (hasHiddenTrackedFiles(baseline.root) !== false) return "Structured completion recovery failed: tracked-file flags hide the subject or became unavailable.";
+			const evidence = collectTrackedMutationEvidence(mutations, baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000));
+			if (evidence.unavailable || evidence.truncated || evidence.attemptedMutation) return "Structured completion recovery failed: tracked subject changed or became unavailable.";
+			return undefined;
+		},
+	};
+	return true;
 }
 
 export const MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR = "Missing acceptanceReport in structured_output call; acceptance.report is \"on\".";
