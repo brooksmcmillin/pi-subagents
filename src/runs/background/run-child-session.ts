@@ -7,7 +7,8 @@
  */
 import type { Message } from "@earendil-works/pi-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
+import { qualifyModelWithProvider } from "../../shared/model-info.ts";
 import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
 	acceptChildWatchdogEvent,
@@ -206,8 +207,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let abortSettleTimer: NodeJS.Timeout | undefined;
 		let childWatchdogState: ChildWatchdogStateSnapshot | undefined;
 		const childLifecycleState: ChildLifecycleState = { compactionRetryActive: false };
-		const timeoutMessage = () => input.timeoutMessage ?? "Subagent timed out.";
-		const stopMessage = () => input.stopMessage ?? "Subagent stopped by user.";
+		const timeoutMessage = () => input.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE;
+		const stopMessage = () => input.stopMessage ?? SUBAGENT_STOPPED_MESSAGE;
 
 		type ActiveToolCall = { key: string; tool: string; args?: string; path?: string };
 		let activeToolSequence = 0;
@@ -519,7 +520,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				if (event.type !== "message_end" || event.message.role !== "assistant") return;
 				const hasToolCall = assistantStartsToolCall(event.message);
 				if (event.message.model) {
-					model = event.message.model;
+					model = qualifyModelWithProvider(event.message.model, event.message.provider, input.modelVerificationRegistry) ?? event.message.model;
 					if (input.expectedModelForVerification && !hasToolCall) {
 						const modelVerificationError = formatSubagentModelVerificationError(input.expectedModelForVerification, event.message.model, input.modelVerificationRegistry, input.modelResponseAliases, session?.virtualModelId);
 						if (modelVerificationError && !error) error = modelVerificationError;

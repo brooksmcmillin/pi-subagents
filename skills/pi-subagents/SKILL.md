@@ -102,7 +102,7 @@ Do not preload the broad references below or recursively follow their links:
 load only branches whose trigger applies, before using that capability. Multiple
 independent seams, workspaces or task lanes still require multi-lane guidance.
 
-For exact API fields and worked examples, call `subagent({action:"guide",topic:"tool-reference"})` or `topic:"workflows"`. The compact tool definition is not the recipe catalog; use `topic:"missions"` for mission updates and schedules.
+For exact API fields and worked examples, call `subagent({action:"guide",options:{topic:"tool-reference"}})` or `topic:"workflows"`. The compact tool definition is not the recipe catalog; use `topic:"missions"` for mission updates and schedules.
 
 | Branch | Read |
 | --- | --- |

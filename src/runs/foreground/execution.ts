@@ -61,12 +61,12 @@ import { resolvePermissionRules } from "../shared/permissions.ts";
 import { applyThinkingSuffix, deriveForkPromptCacheKey } from "../shared/child-tool-plan.ts";
 import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
-import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { qualifyModelWithProvider, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
 import { beginStructuredOutputCompletion, formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
-import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
+import { formatChildModelResolutionDiagnostic, formatInheritedProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
 import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -140,6 +140,7 @@ function persistSingleResultMetadata(input: {
 	metadataPath?: string;
 	enabled: boolean;
 	runId?: string;
+	parentSessionId?: string;
 	agent: string;
 	task: string;
 	result: SingleResult;
@@ -148,6 +149,7 @@ function persistSingleResultMetadata(input: {
 	const target = input.result;
 	writeMetadata(input.metadataPath, {
 		runId: input.runId,
+		parentSessionId: input.parentSessionId,
 		agent: input.agent,
 		task: PROMPT_REDACTED,
 		exitCode: target.exitCode,
@@ -414,6 +416,7 @@ async function runSingleAttempt(
 		nestedRoute: options.nestedRoute,
 		runFanoutBudget: options.runFanoutBudget,
 		parentSessionId: options.parentSessionId,
+		parentSessionFile: options.parentSessionFile,
 		forkCacheKey: options.context === "fork" ? deriveForkPromptCacheKey(options.parentSessionId) : undefined,
 		structuredOutput: options.structuredOutput,
 		...(options.outputMode === "file-only" && options.outputPath ? { fileHandoffPath: options.outputPath } : {}),
@@ -575,6 +578,7 @@ async function runSingleAttempt(
 		let sessionSettled = false;
 		let lifecycleFinished = false;
 		let detached = false;
+		let hostStopReason: string | undefined;
 		let intercomStarted = false;
 		let assistantError: string | undefined;
 		let removeAbortListener: (() => void) | undefined;
@@ -1111,8 +1115,9 @@ async function runSingleAttempt(
 					}
 					projectCompleteUsage();
 					if (evt.message.model) {
-						progress.model = evt.message.model;
-						if (!result.model) result.model = evt.message.model;
+						const observedModel = qualifyModelWithProvider(evt.message.model, evt.message.provider, options.availableModels);
+						progress.model = observedModel;
+						if (!result.model) result.model = observedModel;
 						if (expectedModelForVerification && !hasToolCall) {
 							const modelVerificationError = formatSubagentModelVerificationError(expectedModelForVerification, evt.message.model, options.availableModels, options.modelResponseAliases, session?.virtualModelId);
 							if (modelVerificationError && !result.error) result.error = modelVerificationError;
@@ -1316,10 +1321,11 @@ async function runSingleAttempt(
 			if (!closeError && promptErrorMessage !== undefined) {
 				closeError = promptErrorMessage;
 			}
-			// A foreground child never loads the parent's ambient extensions, so a
-			// provider one registers resolves as "not found" before the child starts.
-			// Annotate only a creation/prompt failure that produced no turn; keep the
-			// core error and add the host rule and both remedies after it.
+			// A foreground child never loads the parent's ambient extensions. A model
+			// whose provider the parent registry does not serve resolves as "not found"
+			// before the child starts; a provider it does serve is inherited without its
+			// extension's session hooks and can fail the first request. Keep the
+			// original error first and add the host rule and remedies after it.
 			if (promptErrorMessage !== undefined
 				&& closeError === promptErrorMessage
 				&& isChildModelResolutionFailure(promptErrorMessage)
@@ -1327,12 +1333,19 @@ async function runSingleAttempt(
 				&& result.usage.turns === 0
 				&& !launch.session.ambientExtensions) {
 				closeError = `${promptErrorMessage}\n\n${formatChildModelResolutionDiagnostic({ agent: agent.name, model: launch.session.model, host: "parent", capabilityCeiling: launch.toolPlan.capabilityCeiling })}`;
+			} else if (session?.inheritedProvider
+				&& closeError !== undefined
+				&& (closeError === promptErrorMessage || closeError === assistantError)
+				&& progress.toolCount === 0
+				&& (result.messages ?? []).every((message) => message.role !== "assistant" || (message as { stopReason?: string }).stopReason === "error")) {
+				closeError = `${closeError}\n\n${formatInheritedProviderDiagnostic({ agent: agent.name, model: launch.session.model, provider: session.inheritedProvider, capabilityCeiling: launch.toolPlan.capabilityCeiling })}`;
 			}
 			const forcedDrainAfterFinalSuccess = (forced || forcedTermination) && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !closeError;
 			const forcedDrainAfterEmptyTerminal = forcedDrainAfterFinalSuccess && hasEmptyTerminalAssistantResponse(result.messages ?? []);
-			if (!closeError && (abortedBySignal || session?.shutDown) && !result.interrupted && !result.timedOut) {
-				closeError = session?.shutDown ? "Subagent stopped because the parent session shut down." : STOPPED_BEFORE_COMPLETION_ERROR;
+			if (!closeError && (abortedBySignal || session?.shutDown || hostStopReason) && !result.interrupted && !result.timedOut) {
+				closeError = hostStopReason ?? (session?.shutDown ? "Subagent stopped because the parent session shut down." : STOPPED_BEFORE_COMPLETION_ERROR);
 			}
+			if (hostStopReason && !result.interrupted && !result.timedOut) result.stopped = true;
 			// A workflow child ended by the workflow's abort signal was stopped, not failed.
 			if (options.abortedAsStopped && abortedBySignal && !session?.shutDown && !result.interrupted && !result.timedOut) result.stopped = true;
 			if (!closeError && forced && !forcedDrainAfterFinalSuccess) {
@@ -1428,14 +1441,23 @@ async function runSingleAttempt(
 				if (abortedBySignal || interruptedByControl || result.timedOut) {
 					abortChild();
 				}
-				options.onChildSession?.({ steer: (text) => created.steer(text), followUp: (text) => created.followUp(text) });
+				options.onChildSession?.({
+					steer: (text) => created.steer(text),
+					followUp: (text) => created.followUp(text),
+					stop: (reason) => {
+						if (sessionSettled || lifecycleFinished) return;
+						hostStopReason = reason;
+						abortChild();
+					},
+				});
 				messageBaseline = created.messages.length;
-				await created.prompt(`Task: ${task}`);
+				// Runtime replacement may stop a detached child while it is being created.
+				if (!hostStopReason) await created.prompt(`Task: ${task}`);
 				if (shouldRecoverStructuredOutputCompletion({
 					required: Boolean(options.structuredOutput),
 					toolInvoked: structuredOutputToolInvoked,
 					messages: result.messages ?? [],
-					blocked: sessionSettled || lifecycleFinished || abortedBySignal || interruptedByControl
+					blocked: Boolean(hostStopReason) || sessionSettled || lifecycleFinished || abortedBySignal || interruptedByControl
 						|| Boolean(result.timedOut || result.stopped || result.error || assistantError || progress.currentTool || capture.toolDiagnostic())
 						|| unfinishedToolAtTerminal || forcedTermination || created.shutDown === true || childSessionHasQueuedMessages(created)
 						|| (attemptTimeout !== undefined && Date.now() - startTime >= attemptTimeout.remainingMs),
@@ -1804,7 +1826,7 @@ async function runSyncCompletionInner(
 			error: "Skills not found: pi-subagents",
 		}, options.context));
 	}
-	const systemPrompt = buildEffectiveSystemPrompt({ agent, resolvedSkills, cwd: skillCwd, ...(options.outputPath ? { outputPath: options.outputPath } : {}) });
+	const systemPrompt = buildEffectiveSystemPrompt({ agent, resolvedSkills, cwd: skillCwd });
 
 	const { model: selectedModel, requestedModel } = resolveModelSelection(
 		options.modelOverride ?? agent.model,
@@ -1875,6 +1897,7 @@ async function runSyncCompletionInner(
 			metadataPath: artifactPathsResult?.metadataPath,
 			enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false,
 			runId: options.runId,
+			parentSessionId: options.parentSessionId,
 			agent: agentName,
 			task,
 			result: target,
@@ -2248,6 +2271,7 @@ export async function runSync(
 				metadataPath: failedResult.artifactPaths?.metadataPath,
 				enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false,
 				runId: options.runId,
+				parentSessionId: options.parentSessionId,
 				agent: failedResult.agent,
 				task: failedResult.task,
 				result: failedResult,
