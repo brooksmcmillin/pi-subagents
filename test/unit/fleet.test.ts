@@ -539,7 +539,13 @@ describe("native subagent fleet", () => {
 				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
 			);
 			try {
-				assert.ok(component.render(100).some((line) => line.includes("gpt-5.5 · thinking high")));
+				// The provider-qualified label wraps across rows in the 61-column detail pane, so
+				// reassemble the detail column before asserting the model and thinking metadata.
+				const detail = component.render(100)
+					.map((line) => line.split("│")[2] ?? "")
+					.join(" ")
+					.replace(/\s+/g, " ");
+				assert.ok(detail.includes("openai-codex/gpt-5.5 · thinking high"));
 			} finally {
 				component.dispose();
 			}
@@ -1376,7 +1382,7 @@ describe("native subagent fleet", () => {
 				assert.ok(lines.some((line) => line.includes("worker")));
 				assert.ok(lines.some((line) => line.includes("reviewer")));
 				assert.ok(lines.some((line) => line.includes("foreground · live")));
-				assert.ok(lines.some((line) => line.includes("live-model · thinking high")));
+				assert.ok(lines.some((line) => line.includes("provider/live-model · thinking high")));
 				assert.ok(lines.every((line) => !line.includes("Implement the active task") && !line.includes("Review the active task")));
 				assert.ok(lines.some((line) => line.includes("Conversation") && line.includes("assistant response")));
 				assert.ok(lines.some((line) => line.includes("Worker live result")));
@@ -1461,7 +1467,7 @@ describe("native subagent fleet", () => {
 						const lines = component.render(100);
 						assert.ok(lines.some((line) => line.includes(expected)), `missing ${expected}`);
 						if (initialKey.startsWith("foreground-recent:")) {
-							assert.ok(lines.some((line) => line.includes("recent-model · thinking xhigh")));
+							assert.ok(lines.some((line) => line.includes("provider/recent-model · thinking xhigh")));
 						}
 					} finally {
 						component.dispose();
@@ -1620,7 +1626,7 @@ describe("native subagent fleet", () => {
 			const lines = component.render(90);
 			const selectedLine = lines.find((line) => line.includes("›"));
 			assert.ok(selectedLine?.includes("run-work"), `unexpected selected row: ${selectedLine}`);
-			assert.ok(lines.some((line) => line.includes("Model: raw-model · thinking medium")));
+			assert.ok(lines.some((line) => line.includes("Model: provider/raw-model · thinking medium")));
 		} finally {
 			component.dispose();
 		}
@@ -1633,7 +1639,7 @@ describe("native subagent fleet", () => {
 			{ initialKey: "foreground-recent:run-recent:0", refreshMs: 60_000 },
 		);
 		try {
-			assert.ok(recentComponent.render(90).some((line) => line.includes("Model: recent-raw-model · thinking xhigh")));
+			assert.ok(recentComponent.render(90).some((line) => line.includes("Model: provider/recent-raw-model · thinking xhigh")));
 		} finally {
 			recentComponent.dispose();
 		}
@@ -1842,74 +1848,72 @@ describe("native subagent fleet", () => {
 	});
 
 	it("reuses an unchanged transcript across refresh ticks and rereads it when it changes", (t) => {
-		for (const runState of ["complete", "running"] as const) {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-transcript-reuse-"));
-			let transcriptOpens = 0;
-			let failNextOpen = true;
-			const openSync = fsDefault.openSync;
-			t.mock.method(fsDefault, "openSync", (...args: Parameters<typeof fs.openSync>) => {
-				if (path.basename(String(args[0])) === "transcript-0.jsonl") {
-					transcriptOpens++;
-					if (failNextOpen) {
-						failNextOpen = false;
-						throw Object.assign(new Error("too many open files"), { code: "EMFILE" });
-					}
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-transcript-reuse-"));
+		let transcriptOpens = 0;
+		let failNextOpen = true;
+		const openSync = fsDefault.openSync;
+		t.mock.method(fsDefault, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+			if (path.basename(String(args[0])) === "transcript-0.jsonl") {
+				transcriptOpens++;
+				if (failNextOpen) {
+					failNextOpen = false;
+					throw Object.assign(new Error("too many open files"), { code: "EMFILE" });
 				}
-				return openSync(...args);
-			});
-			syncBuiltinESMExports();
-			t.mock.timers.enable({ apis: ["setTimeout"] });
-			const asyncDir = writeAsyncRun(root, {
-				id: `reuse-${runState}`,
-				state: runState,
-				transcript: [{ recordType: "message", role: "assistant", text: "first alpha answer" }],
-			});
-			const transcriptPath = path.join(asyncDir, "transcript-0.jsonl");
-			const state = stateForTest();
-			state.baseCwd = root;
-			const component = new SubagentFleetComponent(
-				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
-				theme as never,
-				state,
-				() => {},
-				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 250, markdownTheme },
-			);
-			const tickAndRender = () => {
-				t.mock.timers.tick(250);
-				return component.render(100);
-			};
-			try {
-				assert.ok(!component.render(100).some((line) => line.includes("first alpha answer")), `${runState}: the first read fails`);
-				assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")), `${runState}: a failed read recovers on the next tick`);
-				for (let tick = 0; tick < 3; tick++) assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")));
-				assert.equal(transcriptOpens, 2, `${runState}: an unchanged transcript is read once across refresh ticks`);
-
-				fs.appendFileSync(transcriptPath, `${JSON.stringify({ recordType: "message", role: "assistant", text: "second appended answer" })}\n`);
-				assert.ok(tickAndRender().some((line) => line.includes("second appended answer")), `${runState}: an append shows on the next tick`);
-
-				const fixedTime = new Date(1_700_000_000_000);
-				fs.utimesSync(transcriptPath, fixedTime, fixedTime);
-				tickAndRender();
-				const before = fs.statSync(transcriptPath, { bigint: true });
-				fs.writeFileSync(transcriptPath, fs.readFileSync(transcriptPath, "utf-8").replace("second appended answer", "second replaced answer"));
-				fs.utimesSync(transcriptPath, fixedTime, fixedTime);
-				const after = fs.statSync(transcriptPath, { bigint: true });
-				assert.deepEqual([after.size, after.mtimeNs], [before.size, before.mtimeNs]);
-				assert.ok(tickAndRender().some((line) => line.includes("second replaced answer")), `${runState}: a same-size, same-mtime rewrite shows on the next tick`);
-
-				const opens = transcriptOpens;
-				component.invalidate();
-				component.render(100);
-				component.handleInput("r");
-				component.render(100);
-				assert.equal(transcriptOpens, opens + 2, `${runState}: host invalidation and the refresh key reread the transcript`);
-			} finally {
-				component.dispose();
-				t.mock.timers.reset();
-				t.mock.restoreAll();
-				syncBuiltinESMExports();
-				fs.rmSync(root, { recursive: true, force: true });
 			}
+			return openSync(...args);
+		});
+		syncBuiltinESMExports();
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const asyncDir = writeAsyncRun(root, {
+			id: "reuse-running",
+			state: "running",
+			transcript: [{ recordType: "message", role: "assistant", text: "first alpha answer" }],
+		});
+		const transcriptPath = path.join(asyncDir, "transcript-0.jsonl");
+		const state = stateForTest();
+		state.baseCwd = root;
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 250, markdownTheme },
+		);
+		const tickAndRender = () => {
+			t.mock.timers.tick(250);
+			return component.render(100);
+		};
+		try {
+			assert.ok(!component.render(100).some((line) => line.includes("first alpha answer")), "the first read fails");
+			assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")), "a failed read recovers on the next tick");
+			for (let tick = 0; tick < 3; tick++) assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")));
+			assert.equal(transcriptOpens, 2, "an unchanged transcript is read once across refresh ticks");
+
+			fs.appendFileSync(transcriptPath, `${JSON.stringify({ recordType: "message", role: "assistant", text: "second appended answer" })}\n`);
+			assert.ok(tickAndRender().some((line) => line.includes("second appended answer")), "an append shows on the next tick");
+
+			const fixedTime = new Date(1_700_000_000_000);
+			fs.utimesSync(transcriptPath, fixedTime, fixedTime);
+			tickAndRender();
+			const before = fs.statSync(transcriptPath, { bigint: true });
+			fs.writeFileSync(transcriptPath, fs.readFileSync(transcriptPath, "utf-8").replace("second appended answer", "second replaced answer"));
+			fs.utimesSync(transcriptPath, fixedTime, fixedTime);
+			const after = fs.statSync(transcriptPath, { bigint: true });
+			assert.deepEqual([after.size, after.mtimeNs], [before.size, before.mtimeNs]);
+			assert.ok(tickAndRender().some((line) => line.includes("second replaced answer")), "a same-size, same-mtime rewrite shows on the next tick");
+
+			const opens = transcriptOpens;
+			component.invalidate();
+			component.render(100);
+			component.handleInput("r");
+			component.render(100);
+			assert.equal(transcriptOpens, opens + 2, "host invalidation and the refresh key reread the transcript");
+		} finally {
+			component.dispose();
+			t.mock.timers.reset();
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 

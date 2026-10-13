@@ -69,6 +69,40 @@ import { registerSubagentCapabilityCeiling } from "../../src/api/capability-ceil
 import { appendWorkflowChildJournal, runtimeReplacedAbortReason, workflowChildFingerprint } from "../../src/workflows/workflow-reuse.ts";
 import { updateTerminalRunIndex } from "../../src/runs/background/terminal-run-index.ts";
 
+function writeRetainedEchoRun(runId: string, options: { outputPath: string; state: "complete" | "failed"; steps: number }) {
+	const asyncDir = path.join(DIRS.async, runId);
+	const sessionFile = path.join(tempDir, "retained-session.jsonl");
+	const runFanoutBudget = createRunFanoutBudget(runId, 10);
+	fs.mkdirSync(asyncDir, { recursive: true });
+	fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+	fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+		runId,
+		sessionId: "session-123",
+		state: options.state,
+		cwd: tempDir,
+		sessionFile,
+		steps: Array.from({ length: options.steps }, () => ({ agent: "echo", status: options.state, sessionFile })),
+	}), "utf-8");
+	fs.writeFileSync(path.join(asyncDir, "recovery-descriptor.json"), JSON.stringify({
+		version: 1,
+		runFanoutBudget,
+		sourceRunId: runId,
+		agent: "echo",
+		cwd: tempDir,
+		systemPromptMode: "append",
+		inheritProjectContext: true,
+		inheritSkills: true,
+		outputPath: options.outputPath,
+		outputMode: "inline",
+		maxSubagentDepth: 1,
+		share: false,
+	}), "utf-8");
+	return () => {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(runFanoutBudget.directory, { recursive: true, force: true });
+	};
+}
+
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
 
@@ -137,10 +171,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	it("emits successful async workflow child settlements without provider turns", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ matchArgIncludes: "Child A", output: "A done" });
 		mockPi.onCall({ matchArgIncludes: "Child B", output: "B done" });
-		const sent: Array<{ message: { customType?: string; content?: string }; options?: { triggerTurn?: boolean } }> = [];
+		const sent: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean } }> = [];
 		const sendMessage = (message: unknown, options?: unknown) => {
 			sent.push({
-				message: message as { customType?: string; content?: string },
+				message: message as { customType?: string; content?: string; details?: unknown },
 				options: options as { triggerTurn?: boolean } | undefined,
 			});
 		};
@@ -158,6 +192,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual(
 			childMessages().map(({ message }) => message.content?.split("\n", 1)[0]).sort(),
 			["Workflow child completed: **a**", "Workflow child completed: **b**"],
+		);
+		assert.deepEqual(
+			childMessages().map(({ message }) => message.details).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+			[{ childKey: "a", outcome: "completed" }, { childKey: "b", outcome: "completed" }],
 		);
 		assert.ok(childMessages().every(({ options }) => options?.triggerTurn === false));
 	});
@@ -1209,6 +1247,20 @@ Answer only from the supplied synthetic text.
 		assert.equal(mockPi.callCount(), 1);
 	});
 
+	it("runs the built-in parallel workflow's tasks as children of one named workflow", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Parallel child completed" });
+		const result = await makeExecutor([makeAgent("reviewer"), makeAgent("scout")]).executePublic(
+			"named-parallel-resource",
+			{ workflow: "parallel", args: { tasks: [{ agent: "reviewer", task: "Review src/api" }, { agent: "scout", task: "Map the tests" }] }, async: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "parallel workflow failed");
+		assert.equal(result.details.workflow?.resource?.name, "parallel");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
 	it("executes a registered mixed foreground workflow without widening session or child authority", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const ctx = makeMinimalCtx(tempDir);
 		// A persistent session's file path is not its SDK session ID.
@@ -2049,6 +2101,11 @@ Answer only from the supplied synthetic text.
 				{ workflowKey: "stage3", reused: undefined },
 			]);
 			assert.equal(relaunched.steps?.[1]?.runId, stage2RunId);
+			assert.deepEqual(relaunched.steps?.map(({ workflowKey, tokens, turnCount }) => ({ workflowKey, total: tokens?.total, turnCount })), [
+				{ workflowKey: "stage1", total: 150, turnCount: 1 },
+				{ workflowKey: "stage2", total: 150, turnCount: 1 },
+				{ workflowKey: "stage3", total: 150, turnCount: 1 },
+			]);
 			assert.equal(fs.existsSync(path.join(DIRS.async, stage2RunId, "workflow-result.json")), false, "the relaunch consumes the awaited result like the normal path");
 		});
 
@@ -2926,6 +2983,27 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(persisted.results?.map((entry) => entry.error), ["Subagent timed out after 150ms."]);
 		fs.rmSync(childDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 		fs.rmSync(childResultPath, { force: true });
+	});
+
+	it("carries workflow child usage onto the parent's step rows", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "detached child", matchArgIncludes: "Detached" });
+		mockPi.onCall({ output: "in-process child", matchArgIncludes: "In process" });
+		const started = await makeExecutor([makeAgent("echo")], {}, true).execute(
+			`scripted-workflow-child-usage-${Date.now()}`,
+			{ workflowScript: `const [a, b] = await runs.all([{ key: "detached", agent: "echo", task: "Detached" }, { key: "inline", agent: "echo", task: "In process", async: false }]); return a.runId;` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const status = await waitForAsyncState(started.details.asyncId!, (candidate) => ["complete", "failed", "stopped"].includes(candidate.state ?? ""), 60_000) as AsyncStatus;
+		assert.equal(status.state, "complete");
+		const detachedStatus = JSON.parse(fs.readFileSync(path.join(DIRS.async, status.workflow?.value as string, "status.json"), "utf-8")) as AsyncStatus;
+		const rows = Object.fromEntries((status.steps ?? []).map((step) => [step.workflowKey, { tokens: step.tokens, turnCount: step.turnCount }]));
+		const { input, output, total } = detachedStatus.totalTokens!;
+		assert.deepEqual(rows.detached?.tokens, { input, output, total });
+		assert.equal(rows.detached?.turnCount, detachedStatus.steps?.[0]?.turnCount);
+		assert.ok((rows.inline?.tokens?.total ?? 0) > 0);
+		assert.equal((rows.detached?.tokens?.total ?? 0) + (rows.inline?.tokens?.total ?? 0), status.totalTokens?.total);
 	});
 
 	it("persists workflow parent metadata in an async worktree child status and result", { skip: !createSubagentExecutor || process.platform === "win32" ? "executor unavailable or worktree paths differ on Windows" : undefined }, async () => {
@@ -3819,71 +3897,6 @@ Answer only from the supplied synthetic text.
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
 	});
 
-	it("isolates inherited outputs that collide with a resumed child output", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const retainedRunId = `retained-output-${Date.now()}`;
-		const retainedAsyncDir = path.join(DIRS.async, retainedRunId);
-		const retainedSessionFile = path.join(tempDir, "retained-session.jsonl");
-		const retainedOutputPath = path.join(tempDir, "context.md");
-		const runFanoutBudget = createRunFanoutBudget(retainedRunId, 10);
-		fs.mkdirSync(retainedAsyncDir, { recursive: true });
-		fs.writeFileSync(retainedSessionFile, "{}\n", "utf-8");
-		fs.writeFileSync(path.join(retainedAsyncDir, "status.json"), JSON.stringify({
-			runId: retainedRunId,
-			sessionId: "session-123",
-			state: "failed",
-			cwd: tempDir,
-			sessionFile: retainedSessionFile,
-			steps: [
-				{ agent: "echo", status: "failed", sessionFile: retainedSessionFile },
-				{ agent: "echo", status: "failed", sessionFile: retainedSessionFile },
-			],
-		}), "utf-8");
-		fs.writeFileSync(path.join(retainedAsyncDir, "recovery-descriptor.json"), JSON.stringify({
-			version: 1,
-			runFanoutBudget,
-			sourceRunId: retainedRunId,
-			agent: "echo",
-			cwd: tempDir,
-			systemPromptMode: "append",
-			inheritProjectContext: true,
-			inheritSkills: true,
-			outputPath: retainedOutputPath,
-			outputMode: "inline",
-			maxSubagentDepth: 1,
-			share: false,
-		}), "utf-8");
-		mockPi.onCall({ output: "resumed report", matchArgIncludes: "Resume" });
-		mockPi.onCall({ output: "review report", matchArgIncludes: "Review" });
-
-		try {
-			const result = await makeExecutor([makeAgent("echo", { output: "context.md" })]).execute(
-				"scripted-workflow-resumed-inherited-output-collision",
-				{
-					async: false,
-					workflowScript: `return await runs.all([
-						{ key: "resume", resume: ${JSON.stringify(retainedRunId)}, index: 1, task: "Resume" },
-						{ key: "review", agent: "echo", task: "Review" }
-					]);`,
-				},
-				new AbortController().signal,
-				undefined,
-				makeMinimalCtx(tempDir),
-			);
-
-			assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
-			const children = result.details.workflow?.value as Array<{ ok: boolean }>;
-			assert.deepEqual(children.map(({ ok }) => ok), [true, true]);
-			assert.equal(fs.readFileSync(retainedOutputPath, "utf-8"), "resumed report");
-			const outputPaths = result.details.results.map(({ savedOutputPath }) => savedOutputPath ?? "");
-			const inheritedOutputPaths = outputPaths.filter((outputPath) => outputPath && outputPath !== retainedOutputPath).sort();
-			assert.deepEqual(inheritedOutputPaths.map((outputPath) => path.basename(outputPath)), ["context.md"]);
-			assert.ok(inheritedOutputPaths.every((outputPath) => pathContainsSegments(outputPath, "artifacts", "outputs")));
-		} finally {
-			fs.rmSync(retainedAsyncDir, { recursive: true, force: true });
-			fs.rmSync(runFanoutBudget.directory, { recursive: true, force: true });
-		}
-	});
-
 	it("reroutes a later inherited agent-default output collision", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "first report", matchArgIncludes: "First" });
 		mockPi.onCall({ output: "second report", matchArgIncludes: "Second" });
@@ -3944,30 +3957,7 @@ Answer only from the supplied synthetic text.
 		assert.equal(fs.readFileSync(deslopPath, "utf-8"), "deslop report");
 	});
 
-	it("keeps an explicit output: true resume of an earlier workflow stage launchable", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const applyPath = path.join(tempDir, "apply.md");
-		mockPi.onCall({ output: "apply report" });
-		mockPi.onCall({ output: "deslop report" });
-		const result = await makeExecutor([makeAgent("echo")]).execute(
-			"scripted-workflow-resume-output-true",
-			{
-				async: false,
-				workflowScript: `
-					const apply = await runs.run("apply", { agent: "echo", task: "Apply", acceptance: false, output: ${JSON.stringify(applyPath)} });
-					const deslop = await runs.run("deslop", { resume: apply.runId, task: "Deslop", output: true });
-					return [apply, deslop];
-				`,
-			},
-			new AbortController().signal,
-			undefined,
-			makeMinimalCtx(tempDir),
-		);
-
-		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
-		assert.deepEqual((result.details.workflow?.value as Array<{ ok: boolean }>).map(({ ok }) => ok), [true, true]);
-	});
-
-	it("reroutes a later output-less resume of a stage that reused an outside run's report path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("gives an output-less resume of an outside run its own report path instead of overwriting that run's report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const outsidePath = path.join(tempDir, "outside.md");
 		const executor = makeExecutor([makeAgent("echo")]);
 		const ctx = makeMinimalCtx(tempDir);
@@ -3994,42 +3984,44 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
-		assert.equal(fs.readFileSync(outsidePath, "utf-8"), "apply report");
+		assert.equal(fs.readFileSync(outsidePath, "utf-8"), "outside report");
+		const applyPath = result.details.results[0]?.savedOutputPath ?? "";
+		assert.equal(path.basename(applyPath), "apply.md");
+		assert.equal(fs.readFileSync(applyPath, "utf-8"), "apply report");
 		const deslopPath = result.details.results[1]?.savedOutputPath ?? "";
 		assert.equal(path.basename(deslopPath), "deslop.md");
 		assert.equal(fs.readFileSync(deslopPath, "utf-8"), "deslop report");
 	});
 
+	it("keeps an outside run's report when the resuming workflow's default output names the same file", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const outsidePath = path.join(tempDir, "report.apply.md");
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		mockPi.onCall({ output: "outside report" });
+		const outside = await executor.execute(
+			"outside-same-default",
+			{ async: false, workflowScript: `return runs.run("outside", { agent: "echo", task: "Outside", acceptance: false, output: ${JSON.stringify(outsidePath)} });` },
+			new AbortController().signal, undefined, ctx,
+		);
+		const outsideRunId = (outside.details.workflow?.value as { runId: string }).runId;
+		mockPi.onCall({ output: "apply report" });
+		const result = await executor.execute(
+			"scripted-workflow-resume-same-default",
+			{ async: false, output: path.join(tempDir, "report.md"), workflowScript: `return runs.run("apply", { resume: ${JSON.stringify(outsideRunId)}, task: "Apply" });` },
+			new AbortController().signal, undefined, ctx,
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(fs.readFileSync(outsidePath, "utf-8"), "outside report");
+		const applyPath = result.details.results[0]?.savedOutputPath ?? "";
+		assert.notEqual(applyPath, outsidePath);
+		assert.equal(fs.readFileSync(applyPath, "utf-8"), "apply report");
+	});
+
 	it("gives an output-less retained resume its own default output when an earlier stage owns its report path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const retainedRunId = `retained-claimed-output-${Date.now()}`;
-		const retainedAsyncDir = path.join(DIRS.async, retainedRunId);
-		const retainedSessionFile = path.join(tempDir, "retained-session.jsonl");
 		const applyPath = path.join(tempDir, "apply.md");
-		const runFanoutBudget = createRunFanoutBudget(retainedRunId, 10);
-		fs.mkdirSync(retainedAsyncDir, { recursive: true });
-		fs.writeFileSync(retainedSessionFile, "{}\n", "utf-8");
-		fs.writeFileSync(path.join(retainedAsyncDir, "status.json"), JSON.stringify({
-			runId: retainedRunId,
-			sessionId: "session-123",
-			state: "complete",
-			cwd: tempDir,
-			sessionFile: retainedSessionFile,
-			steps: [{ agent: "echo", status: "complete", sessionFile: retainedSessionFile }],
-		}), "utf-8");
-		fs.writeFileSync(path.join(retainedAsyncDir, "recovery-descriptor.json"), JSON.stringify({
-			version: 1,
-			runFanoutBudget,
-			sourceRunId: retainedRunId,
-			agent: "echo",
-			cwd: tempDir,
-			systemPromptMode: "append",
-			inheritProjectContext: true,
-			inheritSkills: true,
-			outputPath: applyPath,
-			outputMode: "inline",
-			maxSubagentDepth: 1,
-			share: false,
-		}), "utf-8");
+		const cleanupRetainedRun = writeRetainedEchoRun(retainedRunId, { outputPath: applyPath, state: "complete", steps: 1 });
 		mockPi.onCall({ output: "apply report", matchArgIncludes: "Apply" });
 		mockPi.onCall({ output: "deslop report", matchArgIncludes: "Deslop" });
 
@@ -4057,8 +4049,7 @@ Answer only from the supplied synthetic text.
 			assert.equal(path.basename(deslopPath), "deslop.md");
 			assert.equal(fs.readFileSync(deslopPath, "utf-8"), "deslop report");
 		} finally {
-			fs.rmSync(retainedAsyncDir, { recursive: true, force: true });
-			fs.rmSync(runFanoutBudget.directory, { recursive: true, force: true });
+			cleanupRetainedRun();
 		}
 	});
 
