@@ -190,14 +190,14 @@ test("validateStructuredOutputValue validates values against a JSON Schema", asy
 	assert.ok(invalid.status === "invalid" && invalid.message.length > 0);
 });
 
-test("chord is omitted before 0.85, but required host-first on chord-era and unknown hosts (#2026)", () => {
+test("chord aliases follow host dependencies, not versions, and reject broken declared dependencies", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-chord-alias-"));
 	const host = path.join(root, "host");
 	const extension = path.join(root, "extension");
 	const chord = "@earendil-works/chord";
-	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>) {
+	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>, dependencies?: Record<string, string>) {
 		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports }));
+		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports, dependencies }));
 		for (const target of Object.values(exports)) fs.writeFileSync(path.join(dir, target), "export {};\n");
 	}
 	const hostChord = path.join(host, "node_modules", chord);
@@ -218,12 +218,16 @@ test("chord is omitted before 0.85, but required host-first on chord-era and unk
 		assert.equal(preChord.aliases[`${chord}/context`], undefined);
 		// An extension-local copy must never satisfy a missing host chord export.
 		writePackage(path.join(extension, "node_modules", chord), chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
-		for (const version of ["0.85.0", "0.85.1", "1.0.0", "0.84.4-test", "unknown"]) {
-			writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports);
-			const result = resolveHostPeerAliases(host);
-			for (const specifier of [chord, `${chord}/context`]) assert.ok(result.missing.includes(specifier), version);
+		for (const version of ["0.84.3", "0.85.0", "0.85.1", "1.2.0", "2.0.0", "2.0.0-beta.1", "unknown"]) {
+			for (const dependencies of [undefined, {}, { [chord]: "*" }]) {
+				writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports, dependencies);
+				const result = resolveHostPeerAliases(host);
+				assert.deepEqual(result.missing, dependencies?.[chord] ? [chord, `${chord}/context`] : [], version);
+				assert.equal(result.aliases[chord], undefined);
+				assert.equal(result.aliases[`${chord}/context`], undefined);
+			}
 		}
-		writePackage(host, "@earendil-works/pi-coding-agent", "0.85.1", hostExports);
+		writePackage(host, "@earendil-works/pi-coding-agent", "1.2.0", hostExports, { [chord]: "*" });
 		writePackage(hostChord, chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
 		let result = resolveHostPeerAliases(host);
 		assert.deepEqual(result.missing, []);
@@ -231,10 +235,15 @@ test("chord is omitted before 0.85, but required host-first on chord-era and unk
 		assert.equal(result.aliases[`${chord}/context`], fs.realpathSync(path.join(hostChord, "context.mjs")));
 		fs.unlinkSync(path.join(hostChord, "context.mjs"));
 		assert.deepEqual(resolveHostPeerAliases(host).missing, [`${chord}/context`]);
-		writePackage(host, "@earendil-works/pi-coding-agent", "0.84.3", hostExports);
+		writePackage(hostChord, chord, "0.85.1", { ".": "./index.mjs" });
+		assert.deepEqual(resolveHostPeerAliases(host).missing, [`${chord}/context`], "declared Chord must export context");
+		writePackage(host, "@earendil-works/pi-coding-agent", "1.2.0", hostExports);
+		result = resolveHostPeerAliases(host);
+		assert.deepEqual(result.missing, [], "leftover Chord installations do not define host requirements");
+		assert.equal(result.aliases[chord], undefined);
 		fs.rmSync(path.join(host, "node_modules", "@earendil-works/pi-tui"), { recursive: true });
 		result = resolveHostPeerAliases(host);
-		assert.deepEqual(result.missing, ["@earendil-works/pi-tui"], "pre-chord hosts still require TUI");
+		assert.deepEqual(result.missing, ["@earendil-works/pi-tui"], "hosts without Chord still require TUI");
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}

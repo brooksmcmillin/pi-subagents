@@ -30,7 +30,7 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "typebox/value", pkg: "typebox", subpath: "./value" },
 ];
 
-/** Public Pi manifests introduce chord in 0.85.0 (absent through 0.84.4). */
+/** Chord aliases apply only to hosts that declare it as a runtime dependency. */
 const CHORD_PEER_ALIASES = [
 	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
 	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
@@ -38,7 +38,7 @@ const CHORD_PEER_ALIASES = [
 
 interface PackageManifest {
 	name?: unknown;
-	version?: unknown;
+	dependencies?: Record<string, unknown>;
 	main?: unknown;
 	exports?: unknown;
 }
@@ -137,11 +137,9 @@ export function resolveHostPeerAliases(piPackageRoot: string): { aliases: Record
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const hostManifest = readManifest(piPackageRoot);
-	// Only known stable pre-chord versions may omit it. Unknown/prerelease
-	// hosts retain the required aliases, rather than hiding a broken install.
-	const stableVersion = typeof hostManifest?.version === "string" ? /^0\.(\d+)\.\d+$/.exec(hostManifest.version) : null;
-	const isPreChord = stableVersion !== null && Number(stableVersion[1]) < 85;
-	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(isPreChord ? [] : CHORD_PEER_ALIASES)];
+	// Dependencies can disappear in later releases; version ordering is not a capability contract.
+	const requiresChord = Object.hasOwn(hostManifest?.dependencies ?? {}, "@earendil-works/chord");
+	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(requiresChord ? CHORD_PEER_ALIASES : [])];
 	for (const { specifier, pkg, subpath, optional } of required) {
 		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		const target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
