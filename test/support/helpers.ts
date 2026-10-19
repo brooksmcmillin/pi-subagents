@@ -219,7 +219,7 @@ export const events = {
 				},
 			},
 			{
-				type: "tool_result_end",
+				type: "message_end",
 				message: {
 					role: "toolResult",
 					toolCallId: id,
@@ -241,7 +241,7 @@ export const events = {
 
 	toolResult(toolName: string, text: string, isError = false): object {
 		return {
-			type: "tool_result_end",
+			type: "message_end",
 			message: {
 				role: "toolResult",
 				toolName,

@@ -53,6 +53,10 @@ import { ACTIVE_RUN_INDEX_DIR } from "../../src/runs/background/active-run-index
 import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
+import { formatControlNoticeMessage } from "../../src/runs/shared/subagent-control.ts";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createChildCommandRuntime } from "../../src/runs/shared/child-commands.ts";
+import { supervisorChannelDir } from "../../src/runs/shared/child-tool-plan.ts";
 import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
@@ -1131,7 +1135,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 						},
 					}],
 				},
-				{ jsonl: [{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, content: [] } }] },
+				{ jsonl: [{ type: "message_end", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, content: [] } }] },
 				{
 					jsonl: [{
 						type: "message_end",
@@ -1730,8 +1734,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			output: "1 finding | artifact: review.md",
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true, note: "captured" } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true, note: "captured" },
 		});
@@ -1760,7 +1764,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			output: "receipt only",
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
@@ -1941,13 +1945,13 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const firstSchema = { type: "object", required: ["first"], properties: { first: { type: "boolean" } } };
 		const firstEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { first: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		const resumedEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({ stdoutRaw: firstEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { first: true } });
 		mockPi.onCall({ stdoutRaw: resumedEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
@@ -2081,8 +2085,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		fs.writeFileSync(agentPath, definition("ok"));
 		const structuredEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true }, writeFiles: [{ path: agentPath, content: definition("changed") }] });
 		mockPi.onCall({ stdoutRaw: structuredEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n", structuredOutputCapture: { ok: true } });
@@ -2280,8 +2284,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true }, acceptanceReport } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 			structuredOutputAcceptanceReport: acceptanceReport,
@@ -2319,8 +2323,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			stdoutRaw: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2366,8 +2370,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			stdoutRaw: [
 				events.assistantMessage(`done\n\`\`\`acceptance-report\n${JSON.stringify(acceptanceReport)}\n\`\`\``),
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2387,11 +2391,11 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 	});
 
 	it("accepts recovered tool errors before valid structured output but rejects later errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const recoveredError = { type: "tool_result_end", message: { role: "toolResult", toolName: "read", isError: true, content: [{ type: "text", text: "EISDIR" }] } };
+		const recoveredError = { type: "message_end", message: { role: "toolResult", toolName: "read", isError: true, content: [{ type: "text", text: "EISDIR" }] } };
 		const structuredEvents = [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			{ type: "tool_execution_end", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 		];
 		mockPi.onCall({
 			stdoutRaw: [recoveredError, ...structuredEvents].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
@@ -2440,8 +2444,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const rejectedEvents = [
 			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-rejected", name: "structured_output", arguments: { value: {} } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 			{ type: "tool_execution_start", toolCallId: "structured-rejected", toolName: "structured_output", args: { value: {} } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: "Structured output validation failed: ok: is required" }] } },
 			{ type: "tool_execution_end", toolCallId: "structured-rejected", toolName: "structured_output" },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: "Structured output validation failed: ok: is required" }] } },
 		];
 		mockPi.onCall({ stdoutRaw: rejectedEvents.map((entry) => JSON.stringify(entry)).join("\n") + "\n" });
 		const executor = makeExecutor([makeAgent("echo")]);
@@ -2475,8 +2479,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		mockPi.onCall({
 			jsonl: [
 				{ type: "tool_execution_start", toolCallId: "structured-malformed-schema", toolName: "structured_output", args: { value: "value" } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-malformed-schema", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 			],
 		});
 
@@ -2545,8 +2549,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 					},
 				},
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },
 		});
@@ -2655,6 +2659,61 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.progress.activityState, "active_long_running");
 	});
 
+	it("suggests command controls for a long-open bash call the child's command controller manages", async () => {
+		const runId = "run-active-controller";
+		const channelDir = supervisorChannelDir(runId, "echo", 0);
+		const commands = createChildCommandRuntime(channelDir);
+		const bash = commands.wrap({
+			name: "bash", label: "bash", description: "Run a command", parameters: { type: "object", properties: {} },
+			async execute() {
+				await new Promise((resolve) => setTimeout(resolve, 150));
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		} as unknown as ToolDefinition);
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+		const factory = {
+			async create() {
+				let listener: (event: { type: string; [key: string]: unknown }) => void = () => {};
+				return {
+					subscribe(handler: typeof listener) { listener = handler; return () => {}; },
+					async prompt() {
+						const running = bash.execute("bash-1", { command: "sleep 300" }, undefined, undefined, undefined as never);
+						listener({ type: "tool_execution_start", toolCallId: "bash-1", toolName: "bash", args: { command: "sleep 300" } });
+						await running;
+						listener({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", timestamp: Date.now() } });
+					},
+					async steer() {},
+					async followUp() {},
+					async dispose() {},
+					messages: [],
+					sessionFile: undefined,
+					sessionId: "command-controller-positive",
+					modelId: "mock/model",
+				};
+			},
+			async dispose() {},
+		};
+		try {
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Investigate behavior", {
+				runId,
+				controlConfig: { enabled: true, activeNoticeAfterMs: 20, activeNoticeAfterTurns: 999, activeNoticeAfterTokens: 999_999, notifyOn: ["needs_attention", "active_long_running"] },
+				onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+				childSessionFactory: factory,
+			});
+			assert.equal(result.exitCode, 0);
+			const attentionEvent = controlEvents.find((event) => event.type === "needs_attention");
+			assert.equal(attentionEvent?.reason, "tool_open_threshold");
+			assert.equal(attentionEvent?.toolCallId, "bash-1");
+			const notice = formatControlNoticeMessage(attentionEvent!);
+			assert.match(notice, /"action":"command\.status"/);
+			assert.match(notice, /"action":"command\.yield"/);
+			assert.match(notice, /"action":"command\.cancel"/);
+		} finally {
+			await commands.shutdown();
+			fs.rmSync(channelDir, { recursive: true, force: true });
+		}
+	});
+
 	it("escalates repeated mutating tool failures to needs attention", async () => {
 		mockPi.onCall({
 			jsonl: [
@@ -2685,6 +2744,61 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(failureEvent?.currentPath, "src/runs/background/async-status.ts");
 		assert.match(failureEvent?.recentFailureSummary ?? "", /No exact match/);
 		assert.equal(result.progress.activityState, "needs_attention");
+		assert.equal(result.messages?.filter((message) => message.role === "toolResult").length, 3, "each tool result is recorded once");
+	});
+
+	it("does not count tool-budget blocks of a mutating tool as tool failures", async () => {
+		const toolBudget = { hard: 1, block: "*" as const };
+		const blocked = "Tool budget hard limit reached after 2 tool calls (hard 1). The 'edit' tool is blocked so you can finalize from the context you already have.";
+		mockPi.onCall({
+			jsonl: [
+				...Array.from({ length: 3 }, () => [
+					events.toolStart("edit", { path: "src/a.ts" }),
+					events.toolEnd("edit"),
+					events.toolResult("edit", blocked, true),
+				]).flat(),
+				events.assistantMessage("The budget is spent."),
+			],
+		});
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+
+		const result = await runSync(tempDir, [makeAgent("worker")], "worker", "Edit the file", {
+			runId: "run-budget-blocked-edits",
+			toolBudget,
+			controlConfig: { enabled: true, failedToolAttemptsBeforeAttention: 3, notifyOn: ["active_long_running", "needs_attention"] },
+			onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+		});
+
+		assert.equal(result.toolBudgetBlocked, true);
+		assert.equal(controlEvents.some((event) => event.reason === "tool_failures"), false);
+		assert.notEqual(result.progress.activityState, "needs_attention");
+	});
+
+	it("records a parallel batch's mutating failure against the failed call's path", async () => {
+		// Pi's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			jsonl: [
+				{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+				{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+				{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+				{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+				result("edit-a", true, "No exact match found for a.ts"),
+				result("edit-b", false, "Edited src/b.ts"),
+				events.assistantMessage("Edit A failed."),
+			],
+		});
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+
+		await runSync(tempDir, [makeAgent("worker")], "worker", "Edit both files", {
+			runId: "run-parallel-failure",
+			controlConfig: { enabled: true, failedToolAttemptsBeforeAttention: 1, notifyOn: ["active_long_running", "needs_attention"] },
+			onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+		});
+
+		const failureEvent = controlEvents.find((event) => event.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
 	});
 
 	it("does not surface control state or events when control is disabled", async () => {

@@ -56,7 +56,7 @@ it("three-lane report fixture replaces two parent recoveries without replaying r
 								messages.push(evidence);
 								listener({ type: "tool_execution_start", toolName: "read" });
 								listener({ type: "tool_execution_end", toolName: "read" });
-								listener({ type: "tool_result_end", message: evidence });
+								listener({ type: "message_end", message: evidence });
 							} else assert.equal(text, STRUCTURED_OUTPUT_COMPLETION_PROMPT);
 							if (index === 0 || prompts === 2) {
 								listener({ type: "tool_execution_start", toolName: "structured_output" });

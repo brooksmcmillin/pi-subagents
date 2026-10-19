@@ -57,7 +57,7 @@ for (const mode of ["foreground", "background"] as const) {
 									if (scenario !== "no-evidence") {
 										const evidence = { role: "toolResult" as const, toolCallId: "read-fixture", toolName: "read", content: [{ type: "text" as const, text: "fixture.ts:1: export const stable = true;" }], isError: false, timestamp: Date.now() };
 										messages.push(evidence);
-										listener({ type: "tool_result_end", message: evidence });
+										listener({ type: "message_end", message: evidence });
 									}
 								}
 								if (scenario === "deadline-during") t.mock.timers.tick(60);

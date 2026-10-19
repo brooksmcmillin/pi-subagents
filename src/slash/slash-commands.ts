@@ -18,6 +18,7 @@ import {
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { findModelInfo, toModelInfos } from "../shared/model-info.ts";
 import { shortenPath } from "../shared/formatters.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
@@ -38,6 +39,7 @@ import {
 import {
 	SLASH_RESULT_TYPE,
 	SLASH_TEXT_RESULT_TYPE,
+	SLASH_TEXT_VIEW_ONLY_DETAILS,
 	SLASH_SUBAGENT_CANCEL_EVENT,
 	SLASH_SUBAGENT_REQUEST_EVENT,
 	SLASH_SUBAGENT_RESPONSE_EVENT,
@@ -146,7 +148,7 @@ const makeProviderCompletions = (state: SubagentState) => (prefix: string) => {
 };
 
 function sendSlashText(pi: ExtensionAPI, text: string): void {
-	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 async function withSlashStatus<T>(
@@ -627,7 +629,7 @@ export function registerSlashCommands(
 	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
-		if (ctx.mode !== "tui") {
+		if (!canRenderComponents(ctx)) {
 			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
@@ -810,7 +812,7 @@ export function registerSlashCommands(
 				ctx.ui.notify(message, "error");
 				return;
 			}
-			if (ctx.mode !== "tui") {
+			if (!canRenderComponents(ctx)) {
 				sendSlashText(pi, stopFallbackText(targets));
 				return;
 			}

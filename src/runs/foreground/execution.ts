@@ -45,6 +45,7 @@ import {
 	hasEmptyTerminalAssistantResponse,
 	formatEmptyTerminalAssistantResponseError,
 	extractToolArgsPreview,
+	assistantMessageError,
 	extractTextFromContent,
 	MAX_STREAMED_RECENT_TOOLS,
 	boundStreamedRecentTools,
@@ -58,7 +59,8 @@ import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
-import { applyThinkingSuffix, deriveForkPromptCacheKey } from "../shared/child-tool-plan.ts";
+import { applyThinkingSuffix, deriveForkPromptCacheKey, supervisorChannelDir } from "../shared/child-tool-plan.ts";
+import { retainsChildCommand } from "../shared/child-commands.ts";
 import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { qualifyModelWithProvider, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -69,7 +71,7 @@ import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, formatInheritedProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
 import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
-import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, isSettlementFatalOutputError, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	formatSubagentModelVerificationError,
 	formatModelConfigurationSource,
@@ -596,8 +598,11 @@ async function runSingleAttempt(
 				timeoutHardFinishTimer = undefined;
 			}
 		};
+		const startup = new AbortController();
 		const abortChild = (): void => {
-			if (!session || sessionSettled || lifecycleFinished) return;
+			if (sessionSettled || lifecycleFinished) return;
+			startup.abort();
+			if (!session) return;
 			void session.abort().catch(() => {
 				// The session settles through its prompt promise; abort failures are not separately actionable.
 			});
@@ -796,7 +801,11 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
-		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
+		type PendingToolResult = { tool: string; path?: string; mutates: boolean; startedAt?: number };
+		// Pi's parallel tool execution emits every tool_execution_start before the first result message,
+		// so results are matched to their call by toolCallId; the last-started slot covers events without one.
+		const pendingToolResultsByCallId = new Map<string, PendingToolResult>();
+		let pendingToolResult: PendingToolResult | undefined;
 		type ActiveToolCall = { attentionEmitted?: boolean; key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
 		const activeToolCalls = new Map<string, ActiveToolCall>();
@@ -859,7 +868,7 @@ async function runSingleAttempt(
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
-		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
+		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; toolCallId?: string; hasCommandController?: boolean; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
 			progress.activityState = "needs_attention";
@@ -879,6 +888,7 @@ async function runSingleAttempt(
 				toolCount: progress.toolCount,
 				currentTool: input.currentTool ?? progress.currentTool,
 				toolCallId: input.toolCallId,
+				hasCommandController: input.hasCommandController,
 				currentToolDurationMs: input.currentToolDurationMs ?? currentToolDurationMs(now),
 				currentPath: input.currentPath ?? progress.currentPath,
 				recentFailureSummary: input.recentFailureSummary,
@@ -931,11 +941,13 @@ async function runSingleAttempt(
 			if (toolAttentionTarget) {
 				toolAttentionTarget.attentionEmitted = true;
 				const durationMs = Math.max(0, now - toolAttentionTarget.startedAt);
+				const toolCallId = toolAttentionTarget.key.startsWith("id:") ? toolAttentionTarget.key.slice(3) : undefined;
 				return emitNeedsAttention(now, {
 					message: `${agent.name} has had tool '${toolAttentionTarget.tool}' open for ${Math.floor(durationMs / 1000)}s`,
 					reason: "tool_open_threshold",
 					currentTool: toolAttentionTarget.tool,
-					toolCallId: toolAttentionTarget.key.startsWith("id:") ? toolAttentionTarget.key.slice(3) : undefined,
+					toolCallId,
+					hasCommandController: Boolean(toolCallId && retainsChildCommand(supervisorChannelDir(options.runId, agent.name, options.index ?? 0), toolCallId)),
 					currentPath: toolAttentionTarget.path,
 					currentToolDurationMs: durationMs,
 				});
@@ -1062,10 +1074,11 @@ async function runSingleAttempt(
 				}
 				progress.toolCount++;
 				if (options.toolBudget) {
-					result.toolBudget = toolBudgetState(options.toolBudget, progress.toolCount);
+					result.toolBudget = toolBudgetState(options.toolBudget, progress.toolCount, result.toolBudget?.blockedTool);
 				}
 				const mutates = isMutatingTool(evt.toolName, toolArgs, agent.mutationTools);
 				pendingToolResult = { tool: evt.toolName ?? "tool", path: activeTool?.path, mutates, startedAt: now };
+				if (typeof evt.toolCallId === "string" && evt.toolCallId) pendingToolResultsByCallId.set(evt.toolCallId, pendingToolResult);
 				fireUpdate();
 			}
 
@@ -1123,7 +1136,7 @@ async function runSingleAttempt(
 							if (modelVerificationError && !result.error) result.error = modelVerificationError;
 						}
 					}
-					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
+					if (evt.message.errorMessage) assistantError = assistantMessageError(evt.message);
 					else if (hasToolCall && evt.message.stopReason === "toolUse") {
 						// A recovered request can finish via a terminating tool, without a text stop.
 						assistantError = undefined;
@@ -1142,63 +1155,51 @@ async function runSingleAttempt(
 						applyChildLifecycle(projectChildLifecycle(evt, true, childLifecycleState));
 					}
 				}
-				updateActivityState(now);
-				fireUpdate();
-			}
-
-			if (evt.type === "tool_result_end" && evt.message) {
-				const toolResultCompletion = {
-					toolCallId: (evt.message as { toolCallId?: unknown }).toolCallId ?? (evt as { toolCallId?: unknown }).toolCallId,
-					toolName: (evt.message as { toolName?: unknown }).toolName ?? (evt as { toolName?: unknown }).toolName,
-				};
-				clearActiveToolTimeout(toolResultCompletion);
-				const endedTool = removeActiveToolCall(toolResultCompletion);
-				if (endedTool) {
-					progress.recentTools.push({
-						tool: endedTool.tool,
-						args: endedTool.args,
-						endMs: now,
-					});
-					refreshCurrentTool();
-				}
-				result.messages!.push(evt.message);
-				const resultText = extractTextFromContent(evt.message.content);
-				// The result event's own tool name is authoritative; the single pending slot can
-				// describe a different, overlapping call and serves only as a fallback.
-				const blockedTool = (typeof toolResultCompletion.toolName === "string" && toolResultCompletion.toolName.length > 0
-					? toolResultCompletion.toolName
-					: undefined) ?? pendingToolResult?.tool;
-				if (options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool)) {
-					result.toolBudgetBlocked = true;
-					result.toolBudget = toolBudgetState(
-						options.toolBudget,
-						Math.max(progress.toolCount, options.toolBudget.hard + 1),
-						blockedTool,
-					);
-				}
-				appendRecentOutput(progress, resultText.split("\n").slice(-10));
-				const toolSnapshot = pendingToolResult;
-				pendingToolResult = undefined;
-				if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
-					recordMutatingFailure(mutatingFailures, {
-						tool: toolSnapshot.tool,
-						path: toolSnapshot.path,
-						error: resultText.split("\n").find((line) => line.trim())?.trim().slice(0, 180) ?? "mutating tool failed",
-						ts: now,
-					}, mutatingFailureWindowMs);
-					if (shouldEscalateMutatingFailures(mutatingFailures, controlConfig.failedToolAttemptsBeforeAttention)) {
-						emitNeedsAttention(now, {
-							message: `${agent.name} needs attention after repeated mutating tool failures`,
-							reason: "tool_failures",
-							currentTool: toolSnapshot.tool,
-							currentPath: toolSnapshot.path,
-							currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
-							recentFailureSummary: summarizeRecentMutatingFailures(mutatingFailures),
-						});
+				// Pi delivers every tool result, including a call blocked by a tool_call handler, as a
+				// toolResult message after tool_execution_end; it emits no separate result event.
+				if (evt.message.role === "toolResult") {
+					const resultText = extractTextFromContent(evt.message.content);
+					const resultCallId = (evt.message as { toolCallId?: unknown }).toolCallId;
+					const keyedSnapshot = typeof resultCallId === "string" ? pendingToolResultsByCallId.get(resultCallId) : undefined;
+					if (keyedSnapshot) pendingToolResultsByCallId.delete(resultCallId as string);
+					const toolSnapshot = keyedSnapshot ?? pendingToolResult;
+					if (!keyedSnapshot || pendingToolResult === keyedSnapshot) pendingToolResult = undefined;
+					// The result message's own tool name is authoritative; the pending snapshot is only a fallback.
+					const resultToolName = (evt.message as { toolName?: unknown }).toolName;
+					const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? toolSnapshot?.tool;
+					const budgetBlocked = Boolean(options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool));
+					if (options.toolBudget && budgetBlocked) {
+						result.toolBudgetBlocked = true;
+						result.toolBudget = toolBudgetState(
+							options.toolBudget,
+							Math.max(progress.toolCount, options.toolBudget.hard + 1),
+							blockedTool,
+						);
 					}
-				} else if (toolSnapshot?.mutates) {
-					resetMutatingFailureState(mutatingFailures);
+					appendRecentOutput(progress, resultText.split("\n").slice(-10));
+					// A budget block has its own signal; it is not a failing mutation.
+					if (toolSnapshot?.mutates && !budgetBlocked && didMutatingToolFail(evt.message)) {
+						recordMutatingFailure(mutatingFailures, {
+							tool: toolSnapshot.tool,
+							path: toolSnapshot.path,
+							error: resultText.split("\n").find((line) => line.trim())?.trim().slice(0, 180) ?? "mutating tool failed",
+							ts: now,
+						}, mutatingFailureWindowMs);
+						if (shouldEscalateMutatingFailures(mutatingFailures, controlConfig.failedToolAttemptsBeforeAttention)) {
+							emitNeedsAttention(now, {
+								message: `${agent.name} needs attention after repeated mutating tool failures`,
+								reason: "tool_failures",
+								currentTool: toolSnapshot.tool,
+								currentPath: toolSnapshot.path,
+								currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
+								recentFailureSummary: summarizeRecentMutatingFailures(mutatingFailures),
+							});
+						}
+					} else if (toolSnapshot?.mutates) {
+						resetMutatingFailureState(mutatingFailures);
+					}
 				}
+				updateActivityState(now);
 				fireUpdate();
 			}
 		};
@@ -1420,6 +1421,7 @@ async function runSingleAttempt(
 		void (async () => {
 			try {
 				const input = createReportedChildSessionInput(launch, shared.transcriptWriter);
+				input.signal = startup.signal;
 				const created = await childSessions.create(input);
 				if (lifecycleFinished) {
 					void created.dispose();
@@ -1632,9 +1634,11 @@ async function runSingleAttempt(
 			result.error = `Failed to persist schema-validated output artifact: ${resolvedOutput.saveError ?? "output path was not saved"}`;
 			progress.status = "failed";
 			progress.error = result.error;
-		} else if (resolvedOutput.fatalError) {
+		} else if (isSettlementFatalOutputError(resolvedOutput, options.outputMode)) {
 			result.exitCode = 1;
 			result.error = result.error ? `${result.error}\n${resolvedOutput.saveError}` : resolvedOutput.saveError;
+			progress.status = "failed";
+			progress.error = result.error;
 		}
 		if (resolvedOutput.savedPath) {
 			result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
