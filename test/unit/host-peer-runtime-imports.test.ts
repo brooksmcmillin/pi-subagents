@@ -236,14 +236,14 @@ test("validateStructuredOutputValue validates values against a JSON Schema", asy
 	assert.ok(invalid.status === "invalid" && invalid.message.length > 0);
 });
 
-test("chord aliases follow host dependencies, not versions, and reject broken declared dependencies", () => {
+test("chord is required only when the host declares it, and aliased host-first whenever present (#2026, #2854)", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-chord-alias-"));
 	const host = path.join(root, "host");
 	const extension = path.join(root, "extension");
 	const chord = "@earendil-works/chord";
-	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>, dependencies?: Record<string, string>) {
+	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>, extra: Record<string, unknown> = {}) {
 		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports, dependencies }));
+		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports, ...extra }));
 		for (const target of Object.values(exports)) fs.writeFileSync(path.join(dir, target), "export {};\n");
 	}
 	const hostChord = path.join(host, "node_modules", chord);
@@ -266,14 +266,27 @@ test("chord aliases follow host dependencies, not versions, and reject broken de
 		writePackage(path.join(extension, "node_modules", chord), chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
 		for (const version of ["0.84.3", "0.85.0", "0.85.1", "1.2.0", "2.0.0", "2.0.0-beta.1", "unknown"]) {
 			for (const dependencies of [undefined, {}, { [chord]: "*" }]) {
-				writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports, dependencies);
+				writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports, { dependencies });
 				const result = resolveHostPeerAliases(host);
 				assert.deepEqual(result.missing, dependencies?.[chord] ? [chord, `${chord}/context`] : [], version);
 				assert.equal(result.aliases[chord], undefined);
 				assert.equal(result.aliases[`${chord}/context`], undefined);
 			}
 		}
-		writePackage(host, "@earendil-works/pi-coding-agent", "1.2.0", hostExports, { [chord]: "*" });
+		// Pi 1.2.0+ no longer depends on chord: an undeclared, absent chord is not required.
+		for (const version of ["1.2.0", "2.0.0-test"]) {
+			writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports, { dependencies: { "@earendil-works/pi-tui": "^1.2.0" } });
+			const result = resolveHostPeerAliases(host);
+			assert.deepEqual(result.missing, [], version);
+			assert.equal(result.aliases[chord], undefined, version);
+		}
+		// A host that declares chord (0.85 through 1.1) fails closed when it is missing.
+		for (const field of ["dependencies", "optionalDependencies"]) {
+			writePackage(host, "@earendil-works/pi-coding-agent", "1.1.0", hostExports, { [field]: { [chord]: "^1.1.0" } });
+			const result = resolveHostPeerAliases(host);
+			for (const specifier of [chord, `${chord}/context`]) assert.ok(result.missing.includes(specifier), field);
+		}
+		writePackage(host, "@earendil-works/pi-coding-agent", "0.85.1", hostExports, { dependencies: { [chord]: "^0.85.1" } });
 		writePackage(hostChord, chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
 		let result = resolveHostPeerAliases(host);
 		assert.deepEqual(result.missing, []);
@@ -286,7 +299,7 @@ test("chord aliases follow host dependencies, not versions, and reject broken de
 		writePackage(host, "@earendil-works/pi-coding-agent", "1.2.0", hostExports);
 		result = resolveHostPeerAliases(host);
 		assert.deepEqual(result.missing, [], "leftover Chord installations do not define host requirements");
-		assert.equal(result.aliases[chord], undefined);
+		assert.equal(result.aliases[chord], fs.realpathSync(path.join(hostChord, "index.mjs")), "available host Chord is still aliased");
 		fs.rmSync(path.join(host, "node_modules", "@earendil-works/pi-tui"), { recursive: true });
 		result = resolveHostPeerAliases(host);
 		assert.deepEqual(result.missing, ["@earendil-works/pi-tui"], "hosts without Chord still require TUI");
