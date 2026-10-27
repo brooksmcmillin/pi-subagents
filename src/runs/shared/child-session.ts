@@ -20,7 +20,7 @@ import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveHostPiPackageRoot } from "./pi-spawn.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
-import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
+import type { PlacementMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
 export interface ChildSessionEvent {
 	type: string;
@@ -56,7 +56,7 @@ export type ChildSessionStorage =
 export interface ChildSessionLaunch {
 	cwd: string;
 	/** Resolved pane-native placement. Local launches omit this field. */
-	machine?: HerdrMachineReference;
+	machine?: PlacementMachineReference;
 	/** The launching session's project trust; undefined keeps Pi's default for hosts without trust. */
 	projectTrusted?: boolean;
 	/** Process-local provider source owned by the invoking foreground parent. */
@@ -96,6 +96,12 @@ export interface ChildSessionLaunch {
 	 * window one at a time. An undefined value removes the variable.
 	 */
 	processEnv?: Record<string, string | undefined>;
+	/**
+	 * Restore the hosting process's previous values of `processEnv` once that
+	 * window ends, so a child hosted in the parent's own process leaves the
+	 * parent's environment as it found it.
+	 */
+	restoreProcessEnv?: boolean;
 	/** The typed runtime config the hooks were built from; informational for factories. */
 	runtime: ChildRuntimeConfig;
 	onExtensionError?: (error: ChildSessionExtensionError) => void;
@@ -123,7 +129,7 @@ export interface ChildSession {
 	/** Live provider/id of the selected model when Pi marks it virtual (`api === "pi-virtual"`); assistant messages then name the dispatched physical model. */
 	readonly virtualModelId?: string;
 	readonly contextWindow?: number;
-	readonly machineEvidence?: { machineId: string; initial?: HerdrRemoteGitStatus; final?: HerdrRemoteGitStatus };
+	readonly machineEvidence?: { provider: PlacementMachineReference["provider"]; machineId: string; initial?: HerdrRemoteGitStatus; final?: HerdrRemoteGitStatus };
 	/** Event-updated pane-native status; reading it performs no network work. */
 	readonly placementSnapshot?: unknown;
 	/** Set by the foreground host once the run detached; `factory.dispose()` leaves such children running. */
@@ -192,6 +198,30 @@ function inheritParentProviders(modelRuntime: ModelRuntimeInstance, parentProvid
 
 const CHILD_PROMPT_RUNTIME_EXTENSION_PATH = "<inline:pi-subagents:prompt-runtime>";
 const CHILD_PROMPT_BOUNDARY_EXTENSION_PATH = "<inline:pi-subagents:prompt-boundary>";
+/** Same class as UNICODE_SPACES in pi-coding-agent dist/utils/paths.js, which resolvePath(..., { normalizeUnicodeSpaces: true }) replaces with a space. */
+const PI_UNICODE_SPACES = new RegExp("[\\u00A0\\u2000-\\u200A\\u202F\\u205F\\u3000]", "g");
+
+function childExtensionFileIdentity(extensionPath: string): string | undefined {
+	if (!path.isAbsolute(extensionPath)) return undefined;
+	try {
+		const stat = fs.statSync(extensionPath, { bigint: true });
+		return stat.isFile() ? `${stat.dev}:${stat.ino}` : undefined;
+	} catch { return undefined; }
+}
+
+function createRequiredChildExtensionIdentity(requiredPaths: ReadonlySet<string>): (extensionPath: string) => string | undefined {
+	const aliases = new Map([...requiredPaths].map((extensionPath) => [extensionPath, childExtensionFileIdentity(extensionPath) ?? extensionPath]));
+	const identities = new Set(aliases.values());
+	return (extensionPath) => {
+		const known = aliases.get(extensionPath);
+		if (known !== undefined) return known;
+		const identity = childExtensionFileIdentity(extensionPath);
+		if (identity === undefined || !identities.has(identity)) return undefined;
+		// Retain the alias even if the extension removes its file before reporting a failure.
+		aliases.set(extensionPath, identity);
+		return identity;
+	};
+}
 
 /** The prompt runtime filters parent-only context before ambient extensions inspect
  *  the child prompt, and the boundary hook appends the child boundary after every
@@ -243,12 +273,15 @@ function resetExtensionCacheOnReload(loader: object): boolean {
 	return true;
 }
 
-function applyProcessEnv(values: Record<string, string | undefined> | undefined): void {
-	if (!values) return;
+/** Applies `values` to `process.env` and returns a function that puts back the values they replaced. */
+function applyProcessEnv(values: Record<string, string | undefined> | undefined): () => void {
+	if (!values) return () => {};
+	const previous = Object.fromEntries(Object.keys(values).map((name) => [name, process.env[name]]));
 	for (const [name, value] of Object.entries(values)) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
 	}
+	return () => applyProcessEnv(previous);
 }
 
 /**
@@ -339,7 +372,7 @@ function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string }
 	return names.filter((name) => !active.has(name) || !direct.has(name));
 }
 
-function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined, requiredPaths: ReadonlySet<string>): { claimedProviderIds: Set<string>; registered: boolean } {
+function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined, isRequiredSource: (extensionPath: string) => boolean): { claimedProviderIds: Set<string>; registered: boolean } {
 	const claimedProviderIds = new Set<string>();
 	if (!("getExtensions" in loader) || typeof loader.getExtensions !== "function") return { claimedProviderIds, registered: false };
 	const { runtime } = loader.getExtensions();
@@ -351,7 +384,7 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
-			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
+			if (isRequiredSource(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingProviderRegistrations)) runtime.pendingProviderRegistrations = [];
@@ -362,7 +395,7 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_provider", error });
-			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
+			if (isRequiredSource(extensionPath)) throw new Error(`Required child extension provider registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(runtime.pendingNativeProviderRegistrations)) runtime.pendingNativeProviderRegistrations = [];
@@ -381,7 +414,7 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 			registered = true;
 		} catch (error) {
 			onError?.({ extensionPath, event: "register_virtual_model", error });
-			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension virtual model registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
+			if (isRequiredSource(extensionPath)) throw new Error(`Required child extension virtual model registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (Array.isArray(virtualModelQueue.pendingVirtualModelRegistrations)) virtualModelQueue.pendingVirtualModelRegistrations = [];
@@ -491,6 +524,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					},
 				})) }]
 				: [];
+			const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
+			const requiredExtensionIdentity = createRequiredChildExtensionIdentity(requiredPaths);
+			const resolvedExtensionPaths = new Map<string, string>();
+			// Pi reports failures by source path, without resolvedPath. A source Pi never loaded is classified by the
+			// file it names, after Pi's Unicode-space normalization. A required extension that failed under an
+			// unmatched spelling is still rejected by the missing-identity check after loading.
+			const isRequiredSource = (extensionPath: string) => requiredPaths.size > 0 && requiredExtensionIdentity(
+				resolvedExtensionPaths.get(extensionPath) ?? extensionPath.replace(PI_UNICODE_SPACES, " "),
+			) !== undefined;
 			const loader = new pi.DefaultResourceLoader({
 				cwd: launch.cwd,
 				agentDir,
@@ -509,7 +551,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				} }] : []), ...codemode, ...(builtinMcp ? [builtinMcp] : [])],
 				extensionsOverride: (result) => orderChildPromptHooks(prioritizeChildCommandRuntime(result)),
 				...(launch.systemPrompt !== undefined ? { systemPrompt: launch.systemPrompt } : {}),
-				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
+				// An empty list stops Pi from filling the slot with the operator's APPEND_SYSTEM.md (#2960).
+				appendSystemPrompt: launch.appendSystemPrompt !== undefined ? [launch.appendSystemPrompt] : [],
 			});
 			// pi's own hosts emit `session_shutdown` before disposing a session so the
 			// extensions loaded into it (ambient extensions included) release their
@@ -519,7 +562,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					await commands?.shutdown();
 					const runner = session.extensionRunner;
 					if (runner.hasHandlers("session_shutdown")) {
-						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
+						// Ref'd so a detached runner with nothing else pending stays alive until the bound
+						// ends and still publishes its result; cleared as soon as the handlers finish.
+						let bound: ReturnType<typeof setTimeout> | undefined;
+						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => { bound = setTimeout(resolve, shutdownTimeoutMs); })])
+							.finally(() => clearTimeout(bound));
 					}
 				} catch (error) {
 					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
@@ -528,15 +575,19 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				}
 			};
 			let inheritedProviders = new Set<string>();
-			const open = async () => {
-				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
-				applyProcessEnv(launch.processEnv);
+			const openSession = async () => {
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				await loader.reload();
+				if (requiredPaths.size > 0) for (const extension of loader.getExtensions().extensions) resolvedExtensionPaths.set(extension.path, extension.resolvedPath);
 				const loadErrors = requiredPaths.size > 0
-					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
+					? loader.getExtensions().errors.filter(({ path }) => isRequiredSource(path)) : [];
 				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
-				const queued = flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, requiredPaths);
+				const queued = flushQueuedProviderRegistrations(loader, modelRuntime, launch.onExtensionError, isRequiredSource);
+				if (requiredPaths.size > 0) {
+					const loadedIdentities = new Set(loader.getExtensions().extensions.map(({ resolvedPath }) => requiredExtensionIdentity(resolvedPath)));
+					const missing = [...requiredPaths].filter((extensionPath) => !loadedIdentities.has(requiredExtensionIdentity(extensionPath)));
+					if (missing.length) throw new Error(`Required child extension failed to load: ${missing.join(", ")}`);
+				}
 				if (launch.parentProviderRegistry) inheritedProviders = inheritParentProviders(modelRuntime, launch.parentProviderRegistry, queued.claimedProviderIds, launch.onExtensionError);
 				if (queued.registered || inheritedProviders.size > 0) {
 					try {
@@ -584,7 +635,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					await session.bindExtensions({
 						mode: "print",
 						onError: (error) => {
-							if (binding && requiredPaths.has(error.extensionPath)) requiredStartupErrors.push(`${error.extensionPath} (${error.event}): ${error.error}`);
+							if (binding && isRequiredSource(error.extensionPath)) requiredStartupErrors.push(`${error.extensionPath} (${error.event}): ${error.error}`);
 							launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error });
 						},
 					});
@@ -600,6 +651,14 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					throw new Error(`Required child extension failed during startup: ${requiredStartupErrors.join("; ")}`);
 				}
 				return session;
+			};
+			const open = async () => {
+				const restoreEnv = applyProcessEnv(launch.processEnv);
+				try {
+					return await openSession();
+				} finally {
+					if (launch.restoreProcessEnv) restoreEnv();
+				}
 			};
 			const opened = loading.catch(() => {}).then(open);
 			loading = opened;
@@ -630,8 +689,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
 				prompt: (text) => session.prompt(text),
 				...(commands ? { finishCommands: () => commands.finish() } : {}),
-				steer: (text) => session.steer(text),
-				followUp: (text) => session.followUp(text),
+				steer: async (text) => { await session.steer(text); },
+				followUp: async (text) => { await session.followUp(text); },
 				abort: () => session.abort(),
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
