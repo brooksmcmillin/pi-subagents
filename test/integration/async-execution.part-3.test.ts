@@ -24,7 +24,7 @@ import { createRunFanoutBudget, getRunFanoutBudgetSnapshot, writeRunFanoutBudget
 import { writeRetainedRequiredChildExtensions } from "../../src/shared/required-child-extensions.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
-import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
+import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, STRUCTURED_OUTPUT_COMPLETION_PROMPT as STRUCTURED_OUTPUT_FOLLOW_UP, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
@@ -906,6 +906,39 @@ export default function() {
 		assert.doesNotMatch(payload.results[0]?.error ?? "", /Missing structured_output call/);
 		assert.equal(payload.results[0]?.structuredOutputFailed, true);
 		assert.match(status.steps?.[0]?.error ?? "", /Structured output validation failed: ok: is required/);
+	});
+
+	it("background execution gives a structured child one follow-up turn to call structured_output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const prompts = () => fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { args: string[] }).args.at(-1));
+		const runStructured = async (id: string) => {
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return structured data", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				acceptance: false, structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+			return JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		};
+		mockPi.onCall({ output: "prose without the tool call" });
+		mockPi.onCall({ matchArgIncludes: STRUCTURED_OUTPUT_FOLLOW_UP, structuredOutput: { ok: true } });
+
+		const recovered = await runStructured(`async-single-schema-follow-up-${Date.now().toString(36)}`);
+
+		assert.equal(recovered.success, true, recovered.results[0]?.error);
+		assert.deepEqual(recovered.results[0]?.structuredOutput, { ok: true });
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+
+		mockPi.reset();
+		mockPi.onCall({ output: "prose without the tool call" });
+		const missing = await runStructured(`async-single-schema-follow-up-missing-${Date.now().toString(36)}`);
+
+		assert.equal(missing.success, false);
+		assert.match(missing.results[0]?.error ?? "", /Missing structured_output call/);
+		assert.equal(missing.results[0]?.usage?.turns, 2);
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+		assert.equal(prompts().length, 2);
 	});
 
 	it("does not persist malformed outputSchema compiler text in background evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

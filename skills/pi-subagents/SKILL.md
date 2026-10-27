@@ -46,7 +46,9 @@ and their resolved `tools` allow `subagent`.
 To launch a workflow script, write it as one ```` ```js workflow ```` fenced
 block in your reply, then call `subagent({ workflow: true, ... })` in the same
 reply. Use `workflow: "./path/to/script.js"` for a script file and
-`workflow: "<name>"` for a named resource.
+`workflow: "<name>"` for a named resource. If the reply block is lost, pass its
+source as `options: { script: "..." }` instead of `workflow: true` for the rest
+of the turn.
 
 A workflow script is code-driven: `runs.run(...)` for keyed steps,
 `runs.all([...])` for fanout, plain JavaScript for branching and aggregation.
