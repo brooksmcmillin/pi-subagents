@@ -11,7 +11,7 @@ The parent selects the roster, relays only curated claims, decides validity, and
 
 Before launch, read:
 
-- `skills/pi-subagents/references/execution-controls.md`
+- Execution controls via `subagent({ action: "guide", options: { topic: "workflows" } })` and `subagent({ action: "guide", options: { topic: "tool-reference" } })`; read the relevant sections before launch.
 - `skills/council-mode/references/pass-contracts.md`
 
 ## Roster

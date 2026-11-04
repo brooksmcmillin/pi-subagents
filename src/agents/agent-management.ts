@@ -29,7 +29,7 @@ import {
 } from "./proactive-skills.ts";
 import { parseFrontmatter, parseUnquotedList } from "./frontmatter.ts";
 import { resolveEffectiveThinking, THINKING_LEVELS, toModelInfos } from "../shared/model-info.ts";
-import { formatModelConfigurationSource, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
+import { formatModelConfigurationSource, isUnavailableSubagentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
@@ -43,7 +43,7 @@ import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; piSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
 
 function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string, settingsScope?: AgentScope): AgentDiscoveryAllResult {
 	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider, settingsScope ? { settingsScope } : undefined);
@@ -734,7 +734,9 @@ function formatAgentListLine(agent: AgentConfig, providerNames: Set<string> | un
 	return `- ${agent.name} (${agentListMetadata(agent, providerNames)}): ${agent.description}`;
 }
 
-function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<string> | undefined, externalCliAvailability?: ExternalCliAvailabilityByCommand): string {
+const UNAVAILABLE_MODEL_MARKER = "(unavailable in the active model registry)";
+
+function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<string> | undefined, externalCliAvailability: ExternalCliAvailabilityByCommand | undefined, unavailableModels: Set<AgentConfig>): string {
 	const declaredTools = [
 		...(agent.tools ?? []),
 		...(agent.mcpDirectTools ?? []).map((tool) => `mcp:${tool}`),
@@ -750,6 +752,7 @@ function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<stri
 	if (agent.model !== undefined) {
 		model = agent.model;
 		if (agent.modelProvider && !agent.model.includes("/")) model = `${agent.modelProvider}/${agent.model}`;
+		if (unavailableModels.has(agent)) model = `${model} ${UNAVAILABLE_MODEL_MARKER}`;
 	}
 	const thinking = agent.thinking === false ? "off" : agent.thinking ?? "default";
 	const machine = agent.machine ? `; Machine: ${agent.machine} (saved Herdr placement)` : "";
@@ -835,7 +838,7 @@ function agentModelAvailability(agent: AgentConfig, ctx: ManagementContext, mode
 		});
 		return { value: agent.model, thinking: agent.thinking, effective: model, source, available: true };
 	} catch (error) {
-		return { value: agent.model, thinking: agent.thinking, source, available: false, unavailableReason: error instanceof Error ? error.message : String(error) };
+		return { value: agent.model, thinking: agent.thinking, source, available: false, unavailable: true, unavailableReason: error instanceof Error ? error.message : String(error) };
 	}
 }
 
@@ -995,7 +998,7 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
 	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 	const visibleAgents = scopedAgents.filter((a) => !a.disabled);
 	const agents = visibleAgents.filter((a) => isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
 	const restrictedAgents = visibleAgents.filter((a) => !isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
@@ -1012,14 +1015,15 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	const unavailableAgents = agents.filter((agent) => modelAvailability?.get(agent)?.available === false);
 	const executableAgents = agents.filter((agent) => modelAvailability?.get(agent)?.available !== false);
 	const externalCliAvailability = capabilityMode ? externalCliAvailabilityForAgents([...agents, ...restrictedAgents]) : undefined;
+	const unavailableModels = new Set(visibleAgents.filter((agent) => modelAvailability?.get(agent)?.available === false));
 	const formatLine = capabilityMode
-		? (agent: AgentConfig, names: Set<string> | undefined) => formatAgentCapabilitiesLine(agent, names, externalCliAvailability)
+		? (agent: AgentConfig, names: Set<string> | undefined) => formatAgentCapabilitiesLine(agent, names, externalCliAvailability, unavailableModels)
 		: formatAgentListLine;
 	const lines = [
 		capabilityMode ? "Executable agents (capabilities):" : "Executable agents:",
 		...formatAgentListSections(executableAgents, providerNameSet, formatLine),
 	];
-	if (unavailableAgents.length) lines.push("", "Unavailable agents (model preflight):", ...unavailableAgents.map((agent) => `- ${agent.name}: ${modelAvailability!.get(agent)!.unavailableReason}`));
+	if (unavailableAgents.length) lines.push("", "Unavailable agents (model preflight):", ...unavailableAgents.map((agent) => `${formatLine(agent, providerNameSet)}\n  ${modelAvailability!.get(agent)!.unavailableReason}`));
 	appendRestrictedAgentLines({ lines, agents: restrictedAgents, sources: restrictedSources, providerNames: providerNameSet, formatLine });
 	appendExternalJobRegistryLine(lines, [...agents, ...restrictedAgents], providerStatus);
 	appendAgentDiagnosticLines(lines, d.agentDiagnostics);
@@ -1037,6 +1041,13 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 
 const formatModelSource = formatModelConfigurationSource;
 
+// User then project overrides are layered, so the override's top-level scope can name a file that did not set `model`.
+function modelOverrideFile(override: NonNullable<AgentConfig["override"]>): { scope: "user" | "project"; path: string } {
+	const scopes = override.fieldScopes?.model;
+	const scope = scopes?.includes("project") ? "project" : scopes?.includes("user") ? "user" : override.scope;
+	return { scope, path: override.paths?.[scope] ?? override.path };
+}
+
 function handleModels(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const requestedAgent = params.agent?.trim();
 	const scope = normalizeListScope(params.agentScope);
@@ -1048,7 +1059,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const availableModels = toModelInfos(ctx.modelRegistry.getAvailable());
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 
 	let selectedAgents = effectiveAgents;
 	if (requestedAgent) {
@@ -1081,18 +1092,20 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		: [{ agent, name: agent.name }, ...(agent.aliases ?? []).map((name) => ({ agent, name }))]);
 	for (const { agent, name } of modelEntries) {
 		const resolvedModel = resolveSubagentModelOverride(agent.model, currentModel, availableModels, agent.modelProvider ?? preferredProvider);
+		const shownModel = resolvedModel === undefined ? "(unresolved)"
+			: (agent.runner === undefined || agent.runner.type === "pi") && isUnavailableSubagentModel(agent.model, availableModels, agent.modelProvider ?? preferredProvider) ? `${resolvedModel} ${UNAVAILABLE_MODEL_MARKER}` : resolvedModel;
 		const effectiveThinking = resolveEffectiveThinking(resolvedModel, agent.thinking)
 			?? (agent.thinking === false ? "off" : undefined);
 		const source = `${formatModelSource(agent, currentModel)}${agent.disabled ? "; disabled" : ""}${isAgentAllowedByCapabilityCeiling(agent.name, capabilityCeiling) ? "" : "; restricted"}`;
 		if (requestedAgent) {
 			lines.push(`Agent: ${requestedAgent}`);
 			lines.push("Effective model:");
-			lines.push(`  ${resolvedModel ?? "(unresolved)"}`);
+			lines.push(`  ${shownModel}`);
 			lines.push(`Source: ${source}`);
 			lines.push(`Thinking: ${effectiveThinking ?? "default"}`);
 			if (agent.override) {
 				lines.push("Override file:");
-				lines.push(`  ${agent.override.path}`);
+				lines.push(`  ${modelOverrideFile(agent.override).path}`);
 			}
 			if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 				lines.push("Requested model setting:");
@@ -1106,12 +1119,12 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		}
 		lines.push(name);
 		lines.push("  model:");
-		lines.push(`    ${resolvedModel ?? "(unresolved)"}`);
+		lines.push(`    ${shownModel}`);
 		lines.push(`  source: ${source}`);
 		lines.push(`  thinking: ${effectiveThinking ?? "default"}`);
 		if (agent.override) {
 			lines.push("  override file:");
-			lines.push(`    ${agent.override.path}`);
+			lines.push(`    ${modelOverrideFile(agent.override).path}`);
 		}
 		if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 			lines.push("  requested model setting:");

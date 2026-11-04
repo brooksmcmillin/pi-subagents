@@ -27,7 +27,7 @@ import { registerRuntimeAgentEventListener } from "../agents/runtime-agent-event
 import { ensureAccessibleDir } from "../shared/accessible-dir.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
-import { recordSessionReplacement } from "../shared/session-succession.ts";
+import { recordSessionReplacement, recordSessionStart } from "../shared/session-succession.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import { isStaleExtensionContextError, MODEL_ONLY_TOOL, withCachedUiContext } from "../shared/extension-context.ts";
 import { currentCompletionOwnerId } from "../shared/completion-owner.ts";
@@ -109,6 +109,7 @@ import {
 	type SubagentControlMessageDetails,
 } from "./control-notices.ts";
 import { showUpgradeNotice } from "./upgrade-notice.ts";
+import { registerSubagentLaunchTool } from "./subagent-launch-tool.ts";
 
 const SLOW_RELOAD_PHASE_MS = 250;
 // Long enough for Pi to finish starting; loading the executor blocks the event loop for tens of ms.
@@ -409,6 +410,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	let advertisedAgents: AgentConfig[] = [];
 	let advertisedContext: Pick<ExtensionContext, "cwd" | "model"> & { projectTrusted?: boolean } | undefined;
 	let advertisementGeneration = 0;
+	let advertisementLookup: AbortController | undefined;
 	let globalRoot: string | null = null;
 	let advertisementReady: Promise<void | { error: unknown }> = Promise.resolve();
 	let notifySessionChange = () => {};
@@ -430,12 +432,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	const beginAdvertisement = (ctx: ExtensionContext) => {
 		const generation = ++advertisementGeneration;
+		advertisementLookup?.abort();
+		advertisementLookup = new AbortController();
 		notifySessionChange();
 		sessionChanged = new Promise<void>((resolve) => { notifySessionChange = resolve; });
 		advertisedAgents = [];
 		advertisedContext = { cwd: ctx.cwd, model: ctx.model, projectTrusted: typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined };
 		globalRoot = null;
-		advertisementReady = resolveGlobalNpmRoot().then((root) => {
+		advertisementReady = resolveGlobalNpmRoot({ signal: advertisementLookup.signal }).then((root) => {
 			if (generation !== advertisementGeneration) return;
 			globalRoot = root;
 			refreshAdvertisedAgents();
@@ -796,6 +800,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	registerPinnedTool(pi, tool);
 	// Declared with the same definition children use, so a fork's tool list equals this session's.
 	registerPinnedTool(pi, topLevelSupervisorTool());
+	registerSubagentLaunchTool(pi);
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		await waitForAdvertisement();
@@ -807,7 +812,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const activeRuns = config.activeRunsPrompt === true ? buildActiveRunsSection(state.asyncJobs.values(), sessionId) : undefined;
 		if (activeRuns) event.systemPromptOptions.sections.active_subagents = activeRuns;
 		if (!event.systemPromptOptions.selectedTools.includes("subagent")) return;
-		const catalog = buildAdvertisedAgentCatalog(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(sessionId), recordedPromptSection(pi, "advertised_subagents"));
+		const catalog = buildAdvertisedAgentCatalog(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionId() ?? undefined), recordedPromptSection(pi, "advertised_subagents"));
 		if (catalog) event.systemPromptOptions.sections.advertised_subagents = catalog;
 	});
 
@@ -960,11 +965,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		);
 	};
 
-	const resetSessionState = (ctx: ExtensionContext, recovering: boolean, previousSessionFile?: string) => {
+	const resetSessionState = (ctx: ExtensionContext, recovering: boolean, startup: boolean, previousSessionFile?: string) => {
 		state.widgetsSuspended = false;
 		state.baseCwd = ctx.cwd;
 		goalTurnId = 0;
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		recordSessionStart(state.currentSessionId, startup);
 		// Pi passes previousSessionFile only for new/resume/fork, after tearing that session down in this process.
 		if (previousSessionFile) recordSessionReplacement(state.currentSessionId, previousSessionFile);
 		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
@@ -1054,6 +1060,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		cleanup(shutdownReason) {
 			if (runtimeCleaned) return;
 			runtimeCleaned = true;
+			++advertisementGeneration;
+			advertisementLookup?.abort();
+			advertisedAgents = [];
+			advertisedContext = undefined;
+			notifySessionChange();
 			// Synchronously, so a reload's new runtime finds these runs unclaimed when it scans.
 			cancelPendingWorkflowAutoResumes((entry) => entry.owner === autoResumeOwner);
 			programStatus.dispose(shutdownReason);
@@ -1222,7 +1233,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		startSessionMaintenance();
 		scheduleModulePreload();
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
-		resetSessionState(ctx, recovering, event.previousSessionFile);
+		resetSessionState(ctx, recovering, event.reason === "startup", event.previousSessionFile);
 		releaseHostSessionLiveness();
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1271,7 +1282,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		hasPendingSupervisorRequest: () => [...supervisorChannel.pending.values()].some((request) => request.expectsReply),
 		advertisedPrompt: async () => {
 			await waitForAdvertisement();
-			return buildAdvertisedAgentPrompt(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(state.currentSessionId ?? undefined));
+			return buildAdvertisedAgentPrompt(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(state.supervisorOwnerSessionId ?? undefined));
 		},
 	});
 }

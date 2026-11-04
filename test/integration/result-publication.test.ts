@@ -21,11 +21,17 @@ function fileBarrier(file: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		// libuv on Windows compares long event paths against this watch path; expand TEMP's 8.3 aliases.
 		const watcher = fs.watch(fs.realpathSync.native(path.dirname(file)), check);
-		const deadline = setTimeout(() => { watcher.close(); reject(new Error(`Missing barrier: ${file}`)); }, 15_000);
+		// Native notifications can miss writes immediately after watcher registration.
+		const poll = setInterval(check, 25);
+		const deadline = setTimeout(() => { cleanup(); reject(new Error(`Missing barrier: ${file}`)); }, 15_000);
+		function cleanup() {
+			clearTimeout(deadline);
+			clearInterval(poll);
+			watcher.close();
+		}
 		function check() {
 			if (!fs.existsSync(file)) return;
-			clearTimeout(deadline);
-			watcher.close();
+			cleanup();
 			resolve();
 		}
 		check();
@@ -293,6 +299,15 @@ describe("native runner result publication", { skip: !available ? "pi packages u
 			}
 		});
 	}
+	it("reconciles a barrier when native notifications are missing", async (t) => {
+		let closed = false;
+		t.mock.method(fs, "watch", (() => ({ close() { closed = true; } })) as typeof fs.watch);
+		const file = path.join(tempDir, "unnotified-barrier");
+		const ready = fileBarrier(file);
+		fs.writeFileSync(file, "");
+		await ready;
+		assert.equal(closed, true);
+	});
 	it("watches the canonical barrier directory through a path alias", async (t) => {
 		const directory = path.join(tempDir, "barrier-directory");
 		const alias = path.join(tempDir, "barrier-alias");
