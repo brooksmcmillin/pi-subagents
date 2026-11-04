@@ -87,7 +87,9 @@ describe("result watcher", () => {
 			writeIndexedResult(path.join(resultsDir, "dispatch.json"), { id: "dispatch", runId: "dispatch", mode: "workflow", state: "complete", success: true, sessionId: "session-1",
 				results: [{ workflowKey: "child", runId: "child-run", state: "running", output: "", outputState: "absent" }],
 			});
-			assert.equal(await waitForPredicate(() => completed.length === 1), true);
+			await watcher.deliverPendingResults();
+			assert.equal(completed.length, 1);
+			assert.equal(delivered.length, 1);
 			for (const value of [...delivered, ...completed]) {
 				assert.equal(value.results[0].status, "running");
 				assert.equal(value.results[0].success, undefined);

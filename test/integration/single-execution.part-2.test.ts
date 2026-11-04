@@ -2120,7 +2120,8 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			[makeAgent("echo", { allowedAgents: ["researcher"] }), makeAgent("researcher")],
 			{}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), undefined, callerRuntime,
 		);
-		const ctx = makeMinimalCtx(tempDir);
+		const minimalCtx = makeMinimalCtx(tempDir);
+		const ctx = { ...minimalCtx, modelRegistry: { ...minimalCtx.modelRegistry, getRegisteredProviderIds: () => [] } };
 		mockPi.onCall({ output: "Initial foreground work" });
 		const firstResult = await executor.execute(
 			"foreground-authority-first",

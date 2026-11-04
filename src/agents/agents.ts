@@ -134,6 +134,7 @@ interface BuiltinAgentOverrideInfo {
 	base: BuiltinAgentOverrideBase;
 	fields?: string[];
 	fieldScopes?: Record<string, Array<"user" | "project">>;
+	paths?: Partial<Record<"user" | "project", string>>;
 }
 
 export interface AgentModelSourceInfo {
@@ -1532,6 +1533,7 @@ function applyBuiltinOverride(
 		base: agent.override?.base ?? cloneOverrideBase(agent),
 		fields: [...new Set([...(agent.override?.fields ?? []), ...Object.keys(override)])].sort(),
 		fieldScopes: Object.fromEntries(Object.entries({ ...agent.override?.fieldScopes }).map(([field, scopes]) => [field, [...scopes]])),
+		paths: { ...agent.override?.paths, [meta.scope]: meta.path },
 	};
 	for (const field of Object.keys(override)) {
 		const scopes = overrideInfo.fieldScopes![field] ?? [];
@@ -1607,10 +1609,15 @@ function applyBuiltinOverrides(
 
 	return builtinAgents.map((agent) => {
 		const projectOverride = projectSettings.overrides[agent.name];
+		const userOverride = userSettings.overrides[agent.name];
 		if (projectOverride && projectSettingsPath) {
+			// Apply user then project so project fields win without dropping user-only fields.
+			const withUserOverride = userOverride
+				? applyBuiltinOverride(agent, userOverride, { scope: "user", path: userSettingsPath })
+				: agent;
 			return applyGlobalThinking(
-				applyBuiltinOverride(agent, projectOverride, { scope: "project", path: projectSettingsPath }),
-				projectOverride.thinking !== undefined,
+				applyBuiltinOverride(withUserOverride, projectOverride, { scope: "project", path: projectSettingsPath }),
+				projectOverride.thinking !== undefined || (!projectThinkingConfigured && userOverride?.thinking !== undefined),
 			);
 		}
 
@@ -1621,7 +1628,6 @@ function applyBuiltinOverrides(
 			);
 		}
 
-		const userOverride = userSettings.overrides[agent.name];
 		if (userOverride) {
 			return applyGlobalThinking(
 				applyBuiltinOverride(agent, userOverride, { scope: "user", path: userSettingsPath }),
@@ -2782,8 +2788,7 @@ function buildAgentDiscoverySources(cwd: string, preferredModelProvider: string 
 	const watchPaths = new Set<string>([
 		userSettingsPath,
 		...(projectSettingsPath ? [projectSettingsPath] : []),
-		...projectDiscoveryWatchPaths(effectiveCwd),
-		...findProjectRootCandidates(effectiveCwd).map((root) => path.join(getProjectConfigDir(root), "settings.json")),
+		...(projectTrusted ? [...projectDiscoveryWatchPaths(effectiveCwd), ...findProjectRootCandidates(effectiveCwd).map((root) => path.join(getProjectConfigDir(root), "settings.json"))] : []),
 		...userScanDirs.watchPaths,
 		...projectScanDirs.watchPaths,
 		...packageSubagentPaths.watchPaths,
@@ -2848,7 +2853,7 @@ function getAgentDiscoverySources(cwd: string, preferredModelProvider?: string, 
 	const key = discoveryCacheKey(cwd, preferredModelProvider, globalNpmRoot, projectTrusted);
 	const cached = agentDiscoveryCache.get(key);
 	if (cached && cached.fingerprint === discoveryFingerprint(cached.sources)) {
-		if (includeChains) {
+		if (includeChains && !cached.sources.userChains) {
 			ensureDiscoveryChains(cached.sources);
 			cached.fingerprint = discoveryFingerprint(cached.sources);
 		}

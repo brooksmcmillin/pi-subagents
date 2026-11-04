@@ -315,6 +315,44 @@ describe("agent management config parsing", () => {
 		assert.deepEqual(rows.find((agent) => agent.name === "open-worker")?.acceptance, { policy: false });
 	});
 
+	it("marks a model pin the active registry cannot resolve in capabilities and models", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "gone-pin.md"), "---\nname: gone-pin\ndescription: Gone pin\nmodel: openai/gone-model\n---\n\nGone.\n");
+		fs.writeFileSync(path.join(agentsDir, "live-pin.md"), "---\nname: live-pin\ndescription: Live pin\nmodel: openai/gpt-5-mini:high\n---\n\nLive.\n");
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] } };
+
+		const listed = handleManagementAction("list", { agentScope: "project", capabilities: true }, ctx);
+		const text = readText(listed);
+		assert.match(text, /- gone-pin \(project\): .*; Model: openai\/gone-model \(unavailable in the active model registry\);/);
+		assert.match(text, /- live-pin \(project\): .*; Model: openai\/gpt-5-mini:high;/);
+		const rows = listed.details?.agentCapabilities?.agents;
+		const gone = rows?.find((agent) => agent.name === "gone-pin");
+		assert.equal(gone?.executable, false);
+		assert.equal(gone?.model?.value, "openai/gone-model");
+		assert.equal(gone?.model?.unavailable, true);
+		assert.equal(gone?.model?.available, false);
+		assert.equal(gone?.model?.source, "project agent config");
+		assert.match(gone?.model?.unavailableReason ?? "", /Unknown subagent model/);
+		assert.doesNotMatch(text.split("Unavailable agents (model preflight):")[0], /gone-pin/);
+		const live = rows?.find((agent) => agent.name === "live-pin");
+		assert.equal(live?.executable, true);
+		assert.equal(live?.model?.value, "openai/gpt-5-mini:high");
+		assert.equal(live?.model?.available, true);
+		assert.equal(live?.model?.unavailable, undefined);
+
+		const models = readText(handleManagementAction("models", { agent: "gone-pin", agentScope: "project" }, ctx));
+		assert.match(models, /Effective model:\n  openai\/gone-model \(unavailable in the active model registry\)\n/);
+
+		const emptyRegistry = handleManagementAction("list", { agentScope: "project", capabilities: true }, { cwd: tempDir, modelRegistry: { getAvailable: () => [] } });
+		assert.match(readText(emptyRegistry), /unavailable in the active model registry/);
+		for (const name of ["gone-pin", "live-pin"]) {
+			const row = emptyRegistry.details?.agentCapabilities?.agents.find((agent) => agent.name === name);
+			assert.equal(row?.executable, false);
+			assert.equal(row?.model?.unavailable, true);
+		}
+	});
+
 	it("reports optional review gates as optional in capabilities", () => {
 		const agentsDir = path.join(tempDir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });

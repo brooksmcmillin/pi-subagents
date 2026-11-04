@@ -837,13 +837,21 @@ export interface SteeringRecoveryDescriptor {
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	runFanoutBudget: RunFanoutBudgetDescriptor;
 	sourceRunId: string;
+	/** The session that launched the run; only it, or a session that replaced it, may resume the run. */
+	sessionId?: string;
 	agentContract?: AgentContract;
 	agent: string;
 	sessionFile?: string;
+	/**
+	 * The managed worktree the launch chose, so a resume never takes its cwd from the run's own
+	 * handoff.json alone: the native cwd the parent computed, or the Worktrunk branch it requested.
+	 */
+	managedWorktree?: { provider: "native"; cwd: string } | { provider: "worktrunk"; branch: string };
 	/** Git ref used to allocate managed worktrees for this run. */
 	baseRef?: string;
-	/** Launcher name the run was wrapped with; resume re-reads its argv from current user config. Absence means unwrapped. */
-	launcher?: string;
+	/** Launcher name the run was wrapped with, or null when it ran unwrapped; resume re-reads its argv from current user config.
+	 *  Absence (descriptors written before null was recorded) means unknown: resume uses the agent file's current launcher. */
+	launcher?: string | null;
 	cwd: string;
 	model?: string;
 	modelProvider?: string;
@@ -1438,7 +1446,7 @@ export interface AgentCapabilityRow {
 	aliases?: string[];
 	runner: { type: "pi" } | { type: "external-cli"; adapter?: string; command: string; machine?: string; available: boolean; unavailableReason?: string; capabilities: ExternalCliCapabilities } | { type: "external-job"; provider: string; available?: boolean; capabilities: ExternalJobRunnerStatus["capabilities"] };
 	tools: { ambient: boolean; names: string[]; excludeTools?: string[]; mcpDirectTools: string[]; mutationTools?: string[] };
-	model?: { value?: string; thinking?: string | false; effective?: string; source?: string; available?: boolean; unavailableReason?: string };
+	model?: { value?: string; thinking?: string | false; effective?: string; source?: string; available?: boolean; unavailableReason?: string; unavailable?: true };
 	execution?: { defaultAsync?: boolean; timeoutMs?: number };
 	acceptance?: { policy?: AcceptanceInput; role?: AcceptanceRole };
 	output?: { path?: string; mode?: OutputMode };
@@ -2016,7 +2024,7 @@ export interface AsyncStatus {
 		label?: string;
 		workflowKey?: string;
 		lane?: WorkflowLaneMetadata;
-		/** Display-only worktree path copied at launch; handoff remains authoritative. */
+		/** Worktree path copied at setup; the handoff stays authoritative for the cwd. */
 		worktreePath?: string;
 		/** Display-only branch copied at launch; handoff remains authoritative. */
 		branch?: string;
