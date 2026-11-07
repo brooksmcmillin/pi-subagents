@@ -16,6 +16,17 @@ pi install npm:pi-subagents
 
 That is the only required step. pi-subagents needs Pi 1.2.0 or newer. Background children use the host's SDK: npm Pi keeps its detached Node runner; the official Pi 1.2.0 Linux x64 standalone release loads the same runner through Pi's embedded SDK, without a separate SDK install. See [Standalone background execution](docs/standalone-background.md) for the supported boundary and validation gate.
 
+## Contributing
+
+After `npm ci`, install [pre-commit](https://pre-commit.com/#install) and run
+`pre-commit install --allow-missing-config` in your checkout (other worktrees
+without this config remain usable). The hook runs `npm run check:budgets`
+before every commit: guide section limits (including disabled-feature output)
+and cold/activated tool-description budgets. It checks staged content with
+unstaged changes temporarily stashed; existing hooks are preserved by
+pre-commit's default migration mode. Node and npm must be on your Git hook's PATH.
+Run `npm run check:budgets` directly for the same checks without committing.
+
 ## Try this first
 
 You do not need to create agents, write config, or learn slash commands. After installing, ask Pi in plain language:

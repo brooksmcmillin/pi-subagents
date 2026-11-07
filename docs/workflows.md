@@ -100,6 +100,8 @@ Omitting a child's `async` preserves awaited final-result semantics, even if the
 
 A workflow can finish dispatch while these children remain running. Its summary and child rows identify that distinction, and launch receipts do not generate child-completion notices. Consume the later child result before treating its work or report as complete.
 
+### Script validation and arguments
+
 Every script launch automatically runs static validation before allocating an async run, discovering agents, or launching children. This applies to reply-block and file-backed scripts; callers do not need a separate validation step. Dynamic values still receive runtime checks. Use `action: "validate"` only for a side-effect-free diagnostic preview:
 
 ```js workflow
