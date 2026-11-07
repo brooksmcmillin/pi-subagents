@@ -69,7 +69,8 @@ describe("registered subagent tool description", () => {
 		for (const description of [DEFAULT_SUBAGENT_TOOL_DESCRIPTION, FULL_SUBAGENT_TOOL_DESCRIPTION, COMPACT_SUBAGENT_TOOL_DESCRIPTION]) {
 			for (const contract of [
 				/One child: \{agent,task\}/,
-				/exactly one top-level subagent workflow call with async:true; write one ```js workflow block in this reply, then call subagent\(\{workflow:true\}\)/,
+				/exactly one top-level subagent workflow call with async:true; prefer options:\{script:"\.\.\."\} for inline code; omit workflow/,
+				/Lost block: replace workflow with options\.script; keep other fields\/options\. Never pass both/,
 				/\{action,id\?,options:\{\.\.\.\}\}; fields not in this schema go in options/,
 				/Launch agents by name and pass models as exact provider\/id; an unknown agent or model returns the valid choices/,
 				/Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it/,

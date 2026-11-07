@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: prompt-budgets
+        name: Guide and activated-tool budgets
+        entry: npm run check:budgets
+        language: system
+        pass_filenames: false
+        always_run: true

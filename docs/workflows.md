@@ -76,7 +76,9 @@ Use direct `{ agent, task }` for one bounded child. Use a workflow script when t
 
 Use top-level `await`, plain helper functions, or Promise chains; nested async functions, async arrows, and async methods are rejected (see [opt-in bounded workflows](#opt-in-bounded-workflows)).
 
-The `workflow` field selects the script source:
+For inline source, prefer `subagent({ options: { script: "return await runs.run('check', { agent: 'worker', task: 'Run focused checks' });" }, async: true })` with no `workflow` field. This keeps the source in tool arguments even on hosts that drop reply code fences. `options.script` and `workflow` are mutually exclusive: when retrying a lost reply block, remove `workflow` entirely, set `options.script`, and preserve other fields and options. Inline source has the same raw-script authority limits as reply-block and file scripts.
+
+Alternatively, the `workflow` field selects the script source:
 
 - `workflow: true` runs the one ```` ```js workflow ```` fenced block written in the same assistant reply as the `subagent` call. The script is plain text in the reply, so it needs no JSON string escaping. A reply can carry exactly one such block and one `workflow: true` call; zero or several blocks fail. A reply with no tagged block may instead carry exactly one plain ```` ```js ```` block, which then runs. A line containing only ```` ``` ```` (three or more backticks, optionally followed by spaces or tabs) ends the block, so keep Markdown fences inside quoted strings.
 - A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file.
@@ -97,6 +99,8 @@ This wraps the VM, not an OS sandbox: Node 22/24 network access remains open; ch
 Omitting a child's `async` preserves awaited final-result semantics, even if the child runs in the background. Explicit child `async: true` intentionally returns after launch: its receipt has `state: "running"`, `ok: false`, an empty `output`, and no completion error or final `outputReference`. `ok` confirms successful child completion, not successful dispatch. It does not confirm that the task's intent was carried out: a child that declines or cannot do the work can still end normally. When later steps depend on the work having happened, give the child an `outputSchema` with an explicit status field (and check `structuredOutput` in the script) or a host-run `gate`, and treat only that verdict as success. Use `runId` and `asyncDir` to inspect the running child; `artifactPaths` may include runtime directories and is not a list of final reports. Reusing the same workflow key returns the same receipt, not a refreshed result.
 
 A workflow can finish dispatch while these children remain running. Its summary and child rows identify that distinction, and launch receipts do not generate child-completion notices. Consume the later child result before treating its work or report as complete.
+
+### Script validation and arguments
 
 Every script launch automatically runs static validation before allocating an async run, discovering agents, or launching children. This applies to reply-block and file-backed scripts; callers do not need a separate validation step. Dynamic values still receive runtime checks. Use `action: "validate"` only for a side-effect-free diagnostic preview:
 
