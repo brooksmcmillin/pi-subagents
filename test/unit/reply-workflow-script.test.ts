@@ -22,8 +22,8 @@ describe("reply workflow block", () => {
 	it("fails instead of guessing when the block or its owning call is ambiguous or missing", () => {
 		const block = "```js workflow\nreturn 1;\n```";
 		for (const [manager, pattern] of [
-			[branch({ type: "text", text: "no block" }, call("call-1")), /exact line "```js workflow".*found 0\. If the block is in your reply: .*options: \{ script: "\.\.\." \} in place of workflow: true/],
-			[branch({ type: "thinking", thinking: "```js workflow\nreturn 1;\n```" }, call("call-1")), /no text in the session, so any ```js workflow block written with it is not in it\. .*options: \{ script: "\.\.\." \} in place of workflow: true/],
+			[branch({ type: "text", text: "no block" }, call("call-1")), /exact line "```js workflow".*found 0\. If the block is in your reply: .*options: \{ script: "\.\.\." \}\. Remove the workflow field entirely; do not pass both workflow and options\.script/],
+			[branch({ type: "thinking", thinking: "```js workflow\nreturn 1;\n```" }, call("call-1")), /no text in the session, so any ```js workflow block written with it is not in it\. .*options: \{ script: "\.\.\." \}\. Remove the workflow field entirely; do not pass both workflow and options\.script/],
 			[branch({ type: "text", text: "```js\na();\n```\n```js\nb();\n```" }, call("call-1")), /found 0\. This reply has 2 untagged js blocks/],
 			[branch({ type: "text", text: `${block}\n${block}` }, call("call-1")), /found 2/],
 			[branch({ type: "text", text: "```js workflow\nreturn 1;" }, call("call-1")), /not closed/],
@@ -44,6 +44,6 @@ describe("reply workflow block", () => {
 			message("assistant", call("call-1")),
 		] } as never;
 		const result = readReplyWorkflowScript(turn, "call-1");
-		assert.ok("error" in result && /A ```js block is in an earlier message of this turn, but workflow: true reads only the message that issues the call\. Pass that script's source as options: \{ script: "\.\.\." \}/.test(result.error), JSON.stringify(result));
+		assert.ok("error" in result && /A ```js block is in an earlier message of this turn, but workflow: true reads only the message that issues the call\. Pass that script's source as options: \{ script: "\.\.\." \} and remove the workflow field entirely; do not pass both workflow and options\.script/.test(result.error), JSON.stringify(result));
 	});
 });

@@ -43,12 +43,17 @@ and their resolved `tools` allow `subagent`.
 | Council of advisors | `../council-mode/SKILL.md` |
 | Management, status, steering, authoring, or inspection | `action` |
 
-To launch a workflow script, write it as one ```` ```js workflow ```` fenced
-block in your reply, then call `subagent({ workflow: true, ... })` in the same
-reply. Use `workflow: "./path/to/script.js"` for a script file and
-`workflow: "<name>"` for a named resource. If the reply block is lost, pass its
-source as `options: { script: "..." }` instead of `workflow: true` for the rest
-of the turn.
+For inline workflow scripts, prefer `subagent({ options: { script: "..." },
+async: true, ... })` and omit `workflow` entirely. Tool arguments preserve the
+source even on hosts that drop reply code fences. Use
+`workflow: "./path/to/script.js"` for a script file and `workflow: "<name>"`
+for a named resource.
+
+`workflow: true` is an alternative only when one ```` ```js workflow ````
+fenced block reaches the session in the same reply as the tool call. If that
+block is lost, remove the `workflow` field and put its source in `options.script`,
+preserving other fields and options. Never pass both `workflow` and
+`options.script`; retry with the argument form for the rest of the turn.
 
 A workflow script is code-driven: `runs.run(...)` for keyed steps,
 `runs.all([...])` for fanout, plain JavaScript for branching and aggregation.

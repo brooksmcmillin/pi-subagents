@@ -7,7 +7,7 @@ const OPEN_FENCE = /^(`{3,}|~{3,})/;
 const CLOSE_FENCE = /^(`{3,}|~{3,})[ \t]*$/;
 // Through the Claude Agent SDK (pi-claude-bridge#35), text written after a tool call in the same turn reaches the session
 // only as a server summary, which drops fenced blocks; retrying the block fails again. Tool arguments arrive intact.
-const SUMMARY_NOTE = "On some hosts, text written after a tool call in the same turn reaches the session only as a summary without code blocks, so for the rest of this turn pass the script's source as a tool argument: options: { script: \"...\" } in place of workflow: true, with the call's other fields unchanged.";
+const SUMMARY_NOTE = "On some hosts, text written after a tool call in the same turn reaches the session only as a summary without code blocks, so for the rest of this turn pass the script's source as a tool argument: options: { script: \"...\" }. Remove the workflow field entirely; do not pass both workflow and options.script. Preserve the call's other fields and options.";
 
 export type ReplyWorkflowScript = { script: string } | { error: string };
 
@@ -47,7 +47,7 @@ function scriptFromReply(content: AssistantMessage["content"], earlierBlock: () 
 		&& (block.arguments?.workflow === true || block.arguments?.workflow === "true")).length;
 	if (replyCalls > 1) return { error: `This reply has ${replyCalls} subagent calls with workflow: true; a reply can carry only one. Pass other scripts as workflow file paths.` };
 	if (!content.some((block) => block.type === "text")) {
-		if (earlierBlock()) return { error: "The assistant message that issued this call has no text. A ```js block is in an earlier message of this turn, but workflow: true reads only the message that issues the call. Pass that script's source as options: { script: \"...\" } in place of workflow: true, with the call's other fields unchanged, or write the block and the call in one message." };
+		if (earlierBlock()) return { error: "The assistant message that issued this call has no text. A ```js block is in an earlier message of this turn, but workflow: true reads only the message that issues the call. Pass that script's source as options: { script: \"...\" } and remove the workflow field entirely; do not pass both workflow and options.script. Preserve the call's other fields and options." };
 		return { error: `The assistant message that issued this call has no text in the session, so any \`\`\`js workflow block written with it is not in it. ${SUMMARY_NOTE}` };
 	}
 	const text = content.flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []).join("\n");
