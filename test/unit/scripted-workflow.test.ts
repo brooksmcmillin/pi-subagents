@@ -383,6 +383,23 @@ describe("scripted workflow runtime", () => {
 		);
 	});
 
+	it("points to the missing schema brace and bounds long syntax diagnostics", () => {
+		const malformed = 'const schema={type:"object",additionalProperties:false,required:["summary","evidence","recommendations"],properties:{summary:{type:"string"},evidence:{type:"array",maxItems:8,items:{type:"string"}},recommendations:{type:"array",maxItems:6,items:{type:"string"}}};';
+		const [error] = validateWorkflowScript(malformed).errors;
+		assert.equal(error?.line, 1);
+		assert.equal(error?.column, 263);
+		const [source, caret] = error!.excerpt!.split("\n");
+		assert.equal(source![caret!.indexOf("^")], ";");
+		assert.ok(error!.excerpt!.length < 250);
+		assert.deepEqual(validateWorkflowScript(malformed.replace(/};$/, "}};")), { ok: true, errors: [] });
+		const [long] = validateWorkflowScript(`const value = "${"x".repeat(10_000)}"; return (;`).errors;
+		assert.ok(long!.excerpt!.length < 250);
+		const [eof] = validateWorkflowScript("const value = {").errors;
+		assert.equal(eof?.line, 1);
+		assert.equal(eof?.column, 16);
+		assert.equal(eof?.excerpt, "const value = {\n               ^");
+	});
+
 	it("validates workflow syntax and portable structure offline", () => {
 		const syntax = validateWorkflowScript(["const value = 1;", "return (;"].join("\n"));
 		assert.equal(syntax.ok, false);

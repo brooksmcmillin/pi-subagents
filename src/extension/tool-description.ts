@@ -18,15 +18,16 @@ export const SUBAGENT_SAFETY_GUIDANCE = `SAFETY-CRITICAL SUBAGENT GUIDANCE:
 - Delegate only when the operator asked, directly or through applicable user/project instructions; size, complexity or risk alone is not authorization.
 - Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it.
 - One writer per cwd/worktree; isolate concurrent writers.
-- After a launch or runtime failure, stop and report it; never silently switch to interactive_shell, pi -ne or another CLI.`;
+- Validate authored scripts first: action:'validate', same inputs; launch after passing. Only launchState:'not_started' permits two correction/revalidation attempts without approval, overriding blanket stop rules.
+- Otherwise stop/report failures; inspect status before retry. Never blindly relaunch or switch to interactive_shell, pi -ne or another CLI.`;
 
-const scriptCalls = "One child: {agent,task}. Independent parallel children: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Dependent multi-step work: exactly one top-level subagent workflow call with async:true; prefer options:{script:\"...\"} for inline code; omit workflow. Launch children inside it. workflow:true needs a same-reply ```js workflow block. Lost block: replace workflow with options.script; keep other fields/options. Never pass both.";
+const scriptCalls = "One child: {agent,task}. Parallel: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Multi-step: exactly one top-level subagent workflow call with async:true; prefer options:{script:\"...\"} for inline code; omit workflow. workflow:true needs a same-reply ```js workflow block. Lost block: replace workflow with options.script; keep other fields/options. Never pass both.";
 const structuredCalls = "One child: {agent,task}. Parallel: tasks:[{agent,task,cwd?,model?},...]. In order: chain:[{agent,task?,as?,cwd?,model?} or {parallel:[{agent,task,cwd?,model?},...]}]; step tasks can use {task}, {previous} and {outputs.name}. Use exactly one top-level subagent chain or tasks call with async:true.";
 
 const essentials = (on: FeatureText) => `${on("workflow-scripts", scriptCalls, structuredCalls)}
 Management: {action,id?,options:{...}}; fields not in this schema go in options.
 Launch agents by name and pass models as exact provider/id; an unknown agent or model returns the valid choices.
-Details: guide workflows/recommended-orchestration-pattern (async, review, failure recovery), ${on("workflow-scripts", "guide workflows/scripted-workflows, ")}guide tool-reference/retained-children, guide tool-reference/external-cli-agent-profiles.
+Details: guide ${on("workflow-scripts", "workflows or ")}tool-reference.
 
 ${SUBAGENT_SAFETY_GUIDANCE}`;
 

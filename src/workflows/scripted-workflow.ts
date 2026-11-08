@@ -23,6 +23,8 @@ export interface WorkflowScriptValidationError {
 	message: string;
 	line?: number;
 	column?: number;
+	/** Bounded source line with a caret at the parser error. */
+	excerpt?: string;
 	kind?: "spawn-budget" | "agent";
 }
 
@@ -1105,7 +1107,17 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 		const message = /^\S+$/.test(source) && (/^(?:~|\.{1,2})?\//.test(source) || /\.(?:[cm]?[jt]s|json)$/.test(source))
 			? `${parserMessage}. The script looks like a file path ('${source}'): options.script takes the script's source text; pass a script file as workflow: "${source}".`
 			: parserMessage;
-		return { ok: false, errors: [{ message, ...(typeof location?.line === "number" ? { line: Math.max(1, location.line - 1) } : {}), ...(typeof location?.column === "number" ? { column: location.column + 1 } : {}) }] };
+		const lines = script.split(/\r\n|[\n\r\u2028\u2029]/);
+		const line = typeof location?.line === "number" ? Math.min(lines.length, Math.max(1, location.line - 1)) : undefined;
+		const sourceLine = line === undefined ? undefined : lines[line - 1];
+		// Errors in the wrapper's closing line point to the end of the user's source.
+		const column = typeof location?.column === "number"
+			? (typeof location?.line === "number" && location.line - 1 > lines.length ? sourceLine!.length : location.column) + 1
+			: undefined;
+		const start = Math.max(0, (column ?? 1) - 81);
+		const excerpt = sourceLine === undefined || column === undefined ? undefined
+			: `${start > 0 ? "…" : ""}${sourceLine.slice(start, start + 160).replace(/\t/g, " ")}${sourceLine.length > start + 160 ? "…" : ""}\n${" ".repeat(column - 1 - start + (start > 0 ? 1 : 0))}^`;
+		return { ok: false, errors: [{ message, ...(line === undefined ? {} : { line }), ...(column === undefined ? {} : { column }), ...(excerpt === undefined ? {} : { excerpt }) }] };
 	}
 
 	const wrapper = astNode(root.body) ? undefined : Array.isArray(root.body) && astNode(root.body[0]) && astNode(root.body[0].expression) && astNode(root.body[0].expression.callee)

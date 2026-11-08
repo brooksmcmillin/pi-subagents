@@ -55,6 +55,22 @@ block is lost, remove the `workflow` field and put its source in `options.script
 preserving other fields and options. Never pass both `workflow` and
 `options.script`; retry with the argument form for the rest of the turn.
 
+Before launching authored workflow code, call `subagent({ action: "validate",
+options: { script: "..." }, args: { ... } })` with the exact source and args you
+will launch. For files, use the same `workflow: "./path.js"`; for `workflow:true`,
+repeat the same fenced source with each call. Validation starts no workflow or
+children. Launch only after it passes; revalidate after changing the source or args.
+A failure reporting `launchState: "not_started"` permits at most two corrections
+and revalidations within the original scope without approval. Report the failure
+if those attempts fail. Runtime failures or uncertain launch state require status
+inspection before a same-protocol retry, never a blind relaunch or CLI fallback.
+
+Reuse a selected agent's `outputSchema` default when it fits (inspect `action:
+"get"` first). Otherwise pass one JSON schema through `args.outputSchema` and
+reference it on each child instead of reconstructing nested JavaScript schema
+literals. Keep each child's unique `output` and `outputMode: "file-only"`.
+See [the tested scouting example](../../docs/workflows.md#reuse-scouting-output-contracts).
+
 A workflow script is code-driven: `runs.run(...)` for keyed steps,
 `runs.all([...])` for fanout, plain JavaScript for branching and aggregation.
 Keep scripts portable: use top-level `await`, plain helpers, or explicit Promise
@@ -134,7 +150,7 @@ is not a reason to load the entire reference catalog.
 - Before launching a writer for substantial mutation work, classify it as single-seam or multi-seam and partition multi-seam work across exclusive component owners, gates, and durable handoffs before an integration-only owner. See `references/multi-lane-orchestration.md`.
 - For mutation work, use an isolated lane/worktree when isolation, overlap, or concurrent juggling matters; keep one writer per cwd/worktree. `worktree: true` refuses to launch unless the source checkout is clean (untracked files count; `.pi/subagents/` does not), so commit your own changes first or plan the lane without managed isolation. See `references/multi-lane-orchestration.md` for lane mechanics.
 - Keep long/high-output validation out of chat: prefer `interactive_shell` dispatch/background monitors, bounded logs, or subagent-owned reports; return a concise summary plus report path unless same-turn output is required. Do not use `interactive_shell` as an implicit fallback for a failed `subagent` lane; see `references/execution-controls.md`.
-- Treat subagent workflow, child launch, prompt runtime, extension load, and child tooling setup failures as lane infrastructure blockers. Stop, report the exact failure and run/worktree state, verify a clean worktree or capture a partial diff, and use only a clear same-protocol retry or an owner-approved execution-mode fallback.
+- Confirmed prelaunch validation failures follow the bounded correction rule above, not the stop-on-launch-failure rule. For child launch, prompt runtime, extension load, child tooling setup, or uncertain-state failures, stop and report the exact failure and run/worktree state, inspect status, verify a clean worktree or capture a partial diff, and use only a clear same-protocol retry or an owner-approved execution-mode fallback.
 - Recover report-format mismatches in the parent when the supported report preserves required evidence; otherwise request only missing evidence using the supported schema. Same-protocol recovery within existing authority needs no user approval; never rewrite a failed run as successful or bypass acceptance gates. See `references/execution-controls.md#report-format-recovery`.
 - For cross-codebase work, record the repo, explicit `cwd`, authority boundary, and expected output before launch.
 - Make parallel prompts distinct by source seam, evidence, and decision. Do not clone prompts with only item numbers swapped.
