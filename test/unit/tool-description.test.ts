@@ -15,6 +15,7 @@ import {
 	SUBAGENT_TOOL_PROMPT_SNIPPET,
 } from "../../src/extension/tool-description.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
+import { resolveDisabledFeatureSurface } from "../../src/shared/disabled-features.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -49,6 +50,12 @@ describe("registered subagent tool description", () => {
 		const fallbackCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-authority-fallback-"));
 		assert.ok(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd: fallbackCwd, agentDir, warn() {} }).includes(authorityGate));
 		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir }), /Operator-owned custom guidance/);
+		const disabledFeatures = resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] });
+		const customDisabled = buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir, disabledFeatures });
+		assert.match(customDisabled, /Operator-owned custom guidance/);
+		assert.match(customDisabled, /Never blindly relaunch/);
+		assert.doesNotMatch(customDisabled, /action:'validate'|launchState:'not_started'/);
+		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir }), /action:'validate'/);
 	});
 
 	it("uses a one-line snippet only by default", () => {

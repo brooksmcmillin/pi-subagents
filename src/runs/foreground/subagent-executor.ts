@@ -3028,8 +3028,10 @@ function buildWorkflowValidationResult(
 		...(validation.ok ? {} : { recovery: "No workflow run or children started. Correct the input and revalidate with action:'validate' using the same source form (at most two correction attempts); launch only after validation passes. Do not change execution modes." }),
 		...(preflight ? { preflight } : {}),
 	};
+	const { errors, ...metadata } = payload;
+	const excerpts = errors.flatMap((error) => error.excerpt ? [error.excerpt] : []);
 	return {
-		content: [{ type: "text", text: message ? `${message}\n${JSON.stringify(payload)}` : JSON.stringify(payload) }],
+		content: [{ type: "text", text: message ? [message, ...excerpts, JSON.stringify(metadata)].join("\n") : JSON.stringify(payload) }],
 		...(validation.ok ? {} : { isError: true }),
 		details: { mode, results: [], ...(mode === "workflow" && !validation.ok ? { workflow: { failureKind: "validation" as const, trace: [], emits: [], console: [] } } : {}) },
 	};

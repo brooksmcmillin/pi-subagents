@@ -4,10 +4,10 @@ import { it } from "node:test";
 import { runWorkflowScript, validateWorkflowScript } from "../../src/workflows/scripted-workflow.ts";
 import { normalizeWorkflowArgs } from "../../src/workflows/workflow-resources.ts";
 
-it("validates and executes the documented scout fanout with one shared JSON schema", async () => {
-	const docs = readFileSync(new URL("../../docs/workflows.md", import.meta.url), "utf8");
-	const section = docs.split("### Reuse scouting output contracts\n")[1]!.split("### Named workflow resources")[0]!;
-	const input = JSON.parse(section.match(/```json\n([\s\S]*?)\n```/)![1]!);
+for (const lineEnding of ["\n", "\r\n"]) it(`executes the shared-schema scout example with ${lineEnding === "\n" ? "LF" : "CRLF"} line endings`, async () => {
+	const docs = readFileSync(new URL("../../docs/workflows.md", import.meta.url), "utf8").replace(/\r?\n/g, lineEnding);
+	const section = docs.split(/### Reuse scouting output contracts\r?\n/)[1]!.split("### Named workflow resources")[0]!;
+	const input = JSON.parse(section.match(/```json\r?\n([\s\S]*?)\r?\n```/)![1]!);
 	assert.equal(input.action, "validate");
 	assert.equal("error" in normalizeWorkflowArgs(input.args), false);
 	assert.equal(validateWorkflowScript(input.options.script).ok, true);

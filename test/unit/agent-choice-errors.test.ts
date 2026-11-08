@@ -64,6 +64,18 @@ describe("agent choice errors at launch", () => {
 		assert.match(result, /Unknown agent 'reviwer'\. Did you mean 'reviewer'\? Available agents:\n- /);
 		assert.match(result, /Unknown agent 'nobody'\./);
 		assert.equal(result.split("Available agents:").length - 1, 1);
+		const metadata = JSON.parse(result.split("\n").at(-1)!);
+		assert.equal(metadata.launchState, "not_started");
+		assert.match(metadata.recovery, /at most two correction attempts/);
+		assert.equal(metadata.errors, undefined, "human diagnostics must not repeat in JSON metadata");
+	});
+
+	it("retains syntax source excerpts alongside prelaunch recovery metadata", async () => {
+		const result = text(await launch({ async: false, workflowScript: "return (;" }));
+		assert.match(result, /line 1:9: Unexpected token/);
+		assert.equal(result.split("Unexpected token").length - 1, 1);
+		assert.match(result, /return \(;\n {8}\^/);
+		assert.equal(JSON.parse(result.split("\n").at(-1)!).launchState, "not_started");
 	});
 
 	it("names a disabled agent as disabled and lists the agents that can run instead", async () => {

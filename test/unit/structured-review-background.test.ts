@@ -14,10 +14,13 @@ import { DEFAULT_ARTIFACT_CONFIG, DIRS } from "../../src/shared/types.ts";
 import { createEventBus } from "../support/helpers.ts";
 import { report } from "../fixtures/structured-review/provider.ts";
 
-async function waitForJson(file: string): Promise<any> {
+async function waitForJson(file: string, ready: (value: any) => boolean = () => true): Promise<any> {
 	const deadline = Date.now() + 30_000;
 	while (Date.now() < deadline) {
-		if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+		if (fs.existsSync(file)) {
+			const value = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (ready(value)) return value;
+		}
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 	throw new Error(`Fixture timed out waiting for ${file}`);
@@ -59,33 +62,36 @@ it("delivers a real named quick-review structured report through the background 
 				shareEnabled: false, maxSubagentDepth: 1, waitToolEnabled: false, timeoutMs: 25_000,
 			});
 			assert.notEqual(launch.isError, true, JSON.stringify(launch));
-			const payload = await waitForJson(resultFilePath(DIRS.results, id));
-			assert.equal(payload.success, true, JSON.stringify(payload));
-			const request = await waitForJson(path.join(cwd, "request.json"));
-			assert.notEqual(request.pid, process.pid, "a real detached runner hosted the child");
-			assert.equal(request.tools.includes("structured_output"), structured);
-			assert.equal((await waitForJson(path.join(cwd, "shutdown.json"))).requests, 1, "no report-only recovery or extra provider call");
-			const notices: Array<{ content: string }> = [];
-			const notifier = registerSubagentNotify({ events, isHeld: () => false, sendMessage: (message) => { notices.push(message); return false; } },
-				{ currentSessionId: sessionId, completionOwnerId: owner }, { batchConfig: { enabled: false } });
 			try {
-				assert.equal(await notifier.deliver(payload as CompletionNotification), true);
-				assert.equal(notices.length, 1);
-				if (structured) {
-					assert.deepEqual(payload.results[0].structuredOutput, report);
-					assert.deepEqual(request.parameters.properties.value, schema, "the first request declares the required schema");
-					assert.deepEqual(JSON.parse(fs.readFileSync(path.join(cwd, "report.json"), "utf8")), report);
-					assert.match(notices[0]!.content, /report\.json/);
-				} else {
-					assert.equal(payload.results[0].structuredOutput, undefined);
-					assert.match(notices[0]!.content, /ordinary fixture response/);
-				}
-			} finally { notifier.dispose(); }
-			await waitForJson(path.join(launch.details.asyncDir!, "process-terminal.json"));
+				const payload = await waitForJson(resultFilePath(DIRS.results, id));
+				assert.equal(payload.success, true, JSON.stringify(payload));
+				const request = await waitForJson(path.join(cwd, "request.json"));
+				assert.notEqual(request.pid, process.pid, "a real detached runner hosted the child");
+				assert.equal(request.tools.includes("structured_output"), structured);
+				assert.equal((await waitForJson(path.join(cwd, "shutdown.json"))).requests, 1, "no report-only recovery or extra provider call");
+				const notices: Array<{ content: string }> = [];
+				const notifier = registerSubagentNotify({ events, isHeld: () => false, sendMessage: (message) => { notices.push(message); return false; } },
+					{ currentSessionId: sessionId, completionOwnerId: owner }, { batchConfig: { enabled: false } });
+				try {
+					assert.equal(await notifier.deliver(payload as CompletionNotification), true);
+					assert.equal(notices.length, 1);
+					if (structured) {
+						assert.deepEqual(payload.results[0].structuredOutput, report);
+						assert.deepEqual(request.parameters.properties.value, schema, "the first request declares the required schema");
+						assert.deepEqual(JSON.parse(fs.readFileSync(path.join(cwd, "report.json"), "utf8")), report);
+						assert.match(notices[0]!.content, /report\.json/);
+					} else {
+						assert.equal(payload.results[0].structuredOutput, undefined);
+						assert.match(notices[0]!.content, /ordinary fixture response/);
+					}
+				} finally { notifier.dispose(); }
+			} finally {
+				await waitForJson(path.join(launch.details.asyncDir!, "process-terminal.json"), (proof) => proof.state === "observed");
+			}
 		}
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
-		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 	}
 });
