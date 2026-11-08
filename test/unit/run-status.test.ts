@@ -12,6 +12,7 @@ import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/neste
 import { claimRunFanoutBatch, createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 import { TEMP_ROOT_DIR, type AsyncStatus, type SubagentState } from "../../src/shared/types.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../src/shared/artifacts.ts";
+import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
 
 function errno(code: string): NodeJS.ErrnoException {
 	const error = new Error(code) as NodeJS.ErrnoException;
@@ -447,7 +448,7 @@ describe("async run status inspection", () => {
 			const asyncRoot = path.join(root, "runs");
 			const asyncDir = path.join(asyncRoot, "run-poll-guard");
 			fs.mkdirSync(asyncDir, { recursive: true });
-			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			writeAtomicJson(path.join(asyncDir, "status.json"), {
 				runId: "run-poll-guard",
 				sessionId: "session-current",
 				mode: "single",
@@ -457,7 +458,7 @@ describe("async run status inspection", () => {
 				lastUpdate: 100,
 				currentStep: 0,
 				steps: [{ agent: "reviewer", status: "running", startedAt: 100 }],
-			}, null, 2), "utf-8");
+			});
 			const state: SubagentState = {
 				baseCwd: root,
 				currentSessionId: "session-current",
@@ -506,7 +507,7 @@ describe("async run status inspection", () => {
 			const persisted = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
 			persisted.state = "queued";
 			persisted.steps[0].status = "pending";
-			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			writeAtomicJson(statusPath, persisted);
 			now = 32_001;
 			const queued = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
 			assert.equal(queued.isError, true);
@@ -516,20 +517,20 @@ describe("async run status inspection", () => {
 			const queuedLater = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
 			assert.equal(queuedLater.isError, undefined);
 			persisted.state = "paused";
-			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			writeAtomicJson(statusPath, persisted);
 			now = 63_000;
 			const terminal = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
 			assert.equal(terminal.isError, undefined);
 
 			persisted.state = "running";
 			persisted.steps[0].status = "running";
-			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			writeAtomicJson(statusPath, persisted);
 			now = 63_001;
 			const afterTerminal = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
 			assert.equal(afterTerminal.isError, undefined);
 
 			persisted.sessionId = "session-other";
-			fs.writeFileSync(statusPath, JSON.stringify(persisted, null, 2), "utf-8");
+			writeAtomicJson(statusPath, persisted);
 			now = 63_002;
 			const otherSession = inspectSubagentStatus({ id: "run-poll-guard" }, deps);
 			assert.equal(otherSession.isError, undefined);
