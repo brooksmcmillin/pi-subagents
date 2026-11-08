@@ -100,6 +100,44 @@ Omitting a child's `async` preserves awaited final-result semantics, even if the
 
 A workflow can finish dispatch while these children remain running. Its summary and child rows identify that distinction, and launch receipts do not generate child-completion notices. Consume the later child result before treating its work or report as complete.
 
+### Copyable script input examples
+
+These JSON objects are `subagent` tool arguments, not scripts. Prefer the inline
+form; it does not depend on a reply code block surviving the host:
+
+```json
+{
+  "options": {
+    "script": "return await runs.run('review', { agent: 'reviewer', task: 'Review the patch', label: 'Review patch' });",
+    "acceptance": { "level": "none", "reason": "Read-only review; no writer acceptance gate" }
+  },
+  "async": true
+}
+```
+
+Alternatively, put this script block in the **same assistant reply** as the call:
+
+```js workflow
+return await runs.run('review', { agent: 'reviewer', task: 'Review the patch', label: 'Review patch' });
+```
+
+Use these arguments for that reply-block form, without `options.script`:
+
+```json
+{
+  "workflow": true,
+  "options": {
+    "acceptance": { "level": "none", "reason": "Read-only review; no writer acceptance gate" }
+  },
+  "async": true
+}
+```
+
+Normally omit acceptance for read-only/reviewer calls and use inferred policy.
+If explicitly selecting `level: "none"`, a nonempty `reason` is required.
+These examples and their parser tests establish invocation validity only, not
+reviewer runtime availability or review acceptance.
+
 ### Script validation and arguments
 
 Every script launch automatically runs static validation before allocating an async run, discovering agents, or launching children. This applies to reply-block and file-backed scripts; callers do not need a separate validation step. Dynamic values still receive runtime checks. Use `action: "validate"` only for a side-effect-free diagnostic preview:
