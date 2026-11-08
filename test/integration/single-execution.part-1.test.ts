@@ -1183,10 +1183,11 @@ Answer only from the supplied synthetic text.
 
 		assert.equal(result.isError, true);
 		assert.equal(result.details.mode, "management");
-		assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), {
-			ok: false,
-			errors: [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }],
-		});
+		const validationPayload = JSON.parse(result.content[0]?.text ?? "null");
+		assert.equal(validationPayload.ok, false);
+		assert.equal(validationPayload.launchState, "not_started");
+		assert.match(validationPayload.recovery, /at most two correction attempts/);
+		assert.deepEqual(validationPayload.errors, [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }]);
 		const budgetValidation = await executor.executePublic(
 			"offline-budget-validation",
 			{ action: "validate", maxSubagentSpawnsPerRun: 1, workflowScript: `await runs.run("first", { agent: "echo" }); return runs.run("second", { agent: "echo" });` },
@@ -1220,6 +1221,47 @@ Answer only from the supplied synthetic text.
 		assert.match(JSON.stringify(offlinePreflightValidation.errors ?? []), /preflight\.lanes\[0\]\.key/);
 		assert.equal(mockPi.callCount(), 0);
 		assert.deepEqual(fs.readdirSync(tempDir).sort(), before);
+	});
+
+	it("repairs a missing schema brace through validation before launching once", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const malformed = 'const schema={type:"object",additionalProperties:false,required:["summary","evidence","recommendations"],properties:{summary:{type:"string"},evidence:{type:"array",maxItems:8,items:{type:"string"}},recommendations:{type:"array",maxItems:6,items:{type:"string"}}};\nreturn runs.run("scout", {agent:"echo",task:"Inspect"});';
+		const before = fs.readdirSync(tempDir, { recursive: true }).sort();
+		const callsBefore = mockPi.callCount();
+		for (const action of ["validate", undefined]) {
+			const result = await executor.executePublic("missing-brace", { action, workflowScript: malformed }, new AbortController().signal, undefined, ctx);
+			const payload = JSON.parse(result.content[0]?.text ?? "null");
+			assert.equal(result.isError, true);
+			assert.equal(payload.launchState, "not_started");
+			assert.equal(payload.errors[0].line, 1);
+			assert.equal(payload.errors[0].column, 263);
+			assert.match(payload.errors[0].excerpt, /\n +\^$/);
+			assert.equal(result.details.asyncId, undefined);
+		}
+		const fixed = malformed.replace('items:{type:"string"}}};', 'items:{type:"string"}}}};');
+		const validation = await executor.executePublic("fixed-validation", { action: "validate", workflowScript: fixed }, new AbortController().signal, undefined, ctx);
+		assert.equal(validation.isError, undefined, validation.content[0]?.text);
+		assert.equal(mockPi.callCount(), callsBefore);
+		assert.deepEqual(fs.readdirSync(tempDir, { recursive: true }).sort(), before);
+		const launched = await executor.executePublic("fixed-launch", { async: false, workflowScript: fixed }, new AbortController().signal, undefined, ctx);
+		assert.equal(launched.isError, undefined, launched.content[0]?.text);
+		assert.equal(mockPi.callCount(), callsBefore + 1);
+	});
+
+	it("never advertises prelaunch recovery for runtime or completion-time failures", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		for (const [failureKind, workflowScript] of [
+			["script", `await runs.run("ran", { agent: "echo", task: "Inspect" }); throw new Error("runtime failure");`],
+			["validation", `runs.run("unobserved", { agent: "echo", task: "Inspect" }); await runs.run("observed", { agent: "echo", task: "Inspect" }); return "done";`],
+		] as const) {
+			const callsBefore = mockPi.callCount();
+			const result = await executor.executePublic(`late-${failureKind}`, { async: false, workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(result.isError, true);
+			assert.equal(result.details.workflow?.failureKind, failureKind);
+			assert.ok(mockPi.callCount() > callsBefore, "failure must occur after child execution");
+			assert.doesNotMatch(JSON.stringify(result), /not_started|No workflow run or children started|correction attempts/);
+		}
 	});
 
 	it("rejects malformed public async workflows before creating run state", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1684,10 +1726,11 @@ Answer only from the supplied synthetic text.
 		);
 
 		assert.equal(result.isError, true);
-		assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), {
-			ok: false,
-			errors: [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }],
-		});
+		const payload = JSON.parse(result.content[0]?.text ?? "null");
+		assert.equal(payload.ok, false);
+		assert.equal(payload.launchState, "not_started");
+		assert.match(payload.recovery, /No workflow run or children started/);
+		assert.deepEqual(payload.errors, [{ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", line: 1, column: 17 }]);
 		assert.equal(mockPi.callCount(), 0);
 	});
 
@@ -1702,10 +1745,16 @@ Answer only from the supplied synthetic text.
 			const result = await executor.executePublic("args-validation", { action: "validate", workflowScript, args }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(result.isError, true);
 			assert.equal(result.details.mode, "management");
-			assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), { ok: false, errors: [scriptError, { message: argsError }] });
+			const payload = JSON.parse(result.content[0]?.text ?? "null");
+			assert.equal(payload.ok, false);
+			assert.equal(payload.launchState, "not_started");
+			assert.deepEqual(payload.errors, [scriptError, { message: argsError }]);
 		}
 		const argsOnly = await executor.executePublic("args-only-validation", { action: "validate", workflowScript: "return 1;", args: oversize }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
-		assert.deepEqual(JSON.parse(argsOnly.content[0]?.text ?? "null"), { ok: false, errors: [{ message: "workflow args exceed 16384 bytes." }] });
+		const argsPayload = JSON.parse(argsOnly.content[0]?.text ?? "null");
+		assert.equal(argsPayload.ok, false);
+		assert.equal(argsPayload.launchState, "not_started");
+		assert.deepEqual(argsPayload.errors, [{ message: "workflow args exceed 16384 bytes." }]);
 		assert.equal(mockPi.callCount(), 0);
 	});
 

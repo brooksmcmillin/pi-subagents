@@ -30,11 +30,17 @@ Child-safety boundaries are enforced at runtime:
 
 ### Failed lane recovery and execution-mode boundaries
 
-A failure in the subagent workflow, child launch, prompt runtime, extension loading, or child tooling setup is a lane infrastructure blocker. It is not permission to silently retry through `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external execution mode.
+A validation result with `launchState: "not_started"` confirms that this call created no workflow run or children. Correct the input and revalidate at most twice within the original scope without asking permission; launch only after validation passes. If both corrections fail, report the diagnostics. This is a prelaunch input repair, not a retry of running work. Do not infer this state from `failureKind: "validation"` alone, which can also occur at completion.
+
+A child launch, prompt runtime, extension loading, child tooling setup, or uncertain-launch-state failure is a lane infrastructure blocker. Inspect recorded status before any same-protocol retry; never blindly relaunch. It is not permission to silently retry through `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external execution mode.
 
 Stop and report the exact failure, run/status, and repository/cwd/worktree/branch/ref state. Before a same-protocol retry or asking the owner, verify the worktree is clean or capture the partial diff. Retry or fix the `subagent` path only through a clear same-protocol action. For backlog lanes and other subagent-governed workflows, external/foreground/CLI fallback requires explicit owner approval. `interactive_shell` remains valid when the user explicitly requests visible foreground/CLI work or the task is outside the governed subagent protocol.
 
 Failed workflow details and async `status.json` include `workflow.failureKind` as `validation`, `script`, `child`, `return-serialization`, `timeout`, `detached-child`, or `runtime`. `validation` means the host rejected the script before it ran (syntax or portability) or at completion (unawaited calls); errors thrown into a running script, including rejected `runs.run` parameters and runtime `SyntaxError`s, are `script` because the script could catch them, and failed children are `child`. `runtime` covers host setup and infrastructure failures, such as an unavailable cwd or a crashed worker. A workflow that is stopped or reloaded is not a failure and has no `failureKind`.
+
+For interrupted workflows, see [runtime replacement and resume](#runtime-replacement-and-resume). Pi core's generic `pi -ne` extension-load hint is an out-of-repo hint, not protocol-approved fallback.
+
+### Runtime replacement and resume
 
 When `/reload`, a session resume, or a pi-web project switch replaces the extension runtime, a running async workflow stops with `workflow.stopCause: "runtime-replaced"` in `status.json`, and its awaited async children keep running. Its in-process foreground children are stopped, including ones that detached to ask their supervisor. When the same workflow script is launched again with the same `args` in that session, a `runs.run` with the same key and params returns a child that already finished successfully without launching it, and waits for a child that is still running instead of starting another. Those results carry `reused: true`, their step and trace entry are marked `reused`, and the new run records `workflow.reusedFrom`. Failed and stopped children, and children that ran in-process, launch again. Reuse applies only when the newest run of that script and args in the session was stopped this way; a user stop or a completed run ends it. From another session, such as one that took over after a handoff, relaunch the same script as an async workflow with `options: { reuseFrom: "<stopped run id>" }`; the run must have stopped this way in the same cwd, and `args` may differ, because each child is still reused only when its key and params match.
 
@@ -140,7 +146,11 @@ reviewer runtime availability or review acceptance.
 
 ### Script validation and arguments
 
-Every script launch automatically runs static validation before allocating an async run, discovering agents, or launching children. This applies to reply-block and file-backed scripts; callers do not need a separate validation step. Dynamic values still receive runtime checks. Use `action: "validate"` only for a side-effect-free diagnostic preview:
+Every script launch automatically runs static validation before allocating an async run or launching children. Before launching authored code, also call `action: "validate"` with the exact source, args, cwd and options you intend to launch, then wait for it to pass. Revalidate after changing those inputs. This side-effect-free preflight applies to `options.script`, reply-block and file-backed scripts; it never executes the script or launches children. It is not a reservation or proof of runtime success: dynamic values still receive runtime checks.
+
+Syntax failures include 1-based line/column coordinates and a bounded source excerpt with a caret. Validation results include `launchState: "not_started"`; failed prelaunch validation also includes bounded correction instructions. Follow [prelaunch recovery](#failed-lane-recovery-and-execution-mode-boundaries), not the runtime-failure stop rule.
+
+For example, validate this reply-block script:
 
 ```js workflow
 const results = await runs.all([{ key: "scan", agent: "scout", task: "Scan" }]);
@@ -154,8 +164,9 @@ subagent({ action: "validate", workflow: true });
 For a script stored in a file, pass its path:
 
 ```js
-subagent({ workflow: "./workflows/review.js", cwd: "/path/to/project" });
-subagent({ action: "validate", workflow: "./workflows/review.js" });
+subagent({ action: "validate", workflow: "./workflows/review.js", cwd: "/path/to/project" });
+// After validation passes:
+subagent({ workflow: "./workflows/review.js", cwd: "/path/to/project", async: true });
 ```
 
 Relative paths resolve against the request `cwd`; absolute paths pass through. The host reads the file before validation, schedule creation, or workflow sandbox execution. The sandbox still has no filesystem access. Missing, unreadable, and empty files return file input errors instead of script syntax errors.
@@ -169,6 +180,49 @@ return runs.run("review", { agent: "reviewer", task: `Review ${args.target}` });
 ```
 
 Omitted arguments are an empty object. The `args` object, its nested objects, and its arrays are frozen in the sandbox. Arguments are data only: they do not grant `runs.host` or other authority. Normalized arguments are persisted with workflow and schedule evidence for replay and diagnosis, so do not put secrets in them. Routine status text does not render argument values.
+
+### Reuse scouting output contracts
+
+Inspect the selected agent with `action: "get"` first. If its `outputSchema`
+already matches the report you need, omit the override and inherit it. Otherwise,
+pass one schema as JSON in `args.outputSchema` and reuse it on each child, rather
+than hand-writing nested JavaScript schema literals. Keep a unique output path
+and `outputMode: "file-only"` on every item. Do not assume a role name implies a
+schema; the packaged `scout` has no structured-output default.
+
+This small parallel-scout example keeps the schema and lane assignments in data.
+Replace its task scopes before use. Validate these arguments first, then remove
+only `action` and launch with `async: true` after validation passes:
+
+```json
+{
+  "action": "validate",
+  "options": {
+    "script": "const results = await runs.all(args.lanes.map(lane => ({ ...lane, agent: 'scout', context: 'fresh', outputMode: 'file-only', outputSchema: args.outputSchema }))); return results.map(r => ({ key: r.key, report: r.structuredOutput, artifacts: r.artifactPaths, runId: r.runId }));"
+  },
+  "args": {
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary", "evidence"],
+      "properties": {
+        "status": { "type": "string", "enum": ["ready", "blocked"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "array", "maxItems": 8, "items": { "type": "string" } }
+      }
+    },
+    "lanes": [
+      { "key": "boundary", "label": "Inspect approval boundary", "task": "Read-only: inspect server approval enforcement; cite path:line evidence. Do not edit or inspect secrets. Report blockers rather than guessing. Finish only with structured_output.", "output": "boundary.json" },
+      { "key": "client", "label": "Inspect client integration", "task": "Read-only: inspect client prompt and settings integration; cite path:line evidence. Do not edit or inspect secrets. Report blockers rather than guessing. Finish only with structured_output.", "output": "client.json" }
+    ]
+  }
+}
+```
+
+The parent checks each report's status and evidence; `ok` alone is not task
+acceptance. Arguments are persisted, so never put credentials in the schema or
+tasks. This reuses the existing `args` and `outputSchema` contracts, not a new
+schema registry or execution mode.
 
 ### Named workflow resources for permission extensions
 

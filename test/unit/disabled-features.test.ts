@@ -176,8 +176,9 @@ describe("disabled feature discovery", () => {
 		for (const toolDescriptionMode of [undefined, "full"] as const) {
 			const description = buildSubagentToolDescription({ toolDescriptionMode }, { disabledFeatures });
 			for (const text of featureText) assert.ok(!description.includes(text), `${toolDescriptionMode ?? "default"} description still has ${text}`);
-			// Every safety line stays; with workflow-scripts disabled only the script-writing wording changes.
-			for (const line of SUBAGENT_SAFETY_GUIDANCE.split("\n").filter((text) => !/runs\.|workflow call/.test(text))) assert.ok(description.includes(line), `${toolDescriptionMode ?? "default"} description lacks safety line ${line}`);
+			// Shared safety rules stay; disabled scripts have no authored-script validation step.
+			for (const line of SUBAGENT_SAFETY_GUIDANCE.split("\n").filter((text) => !text.startsWith("- Validate authored scripts"))) assert.ok(description.includes(line), `${toolDescriptionMode ?? "default"} description lacks safety line ${line}`);
+			assert.doesNotMatch(description, /action:'validate'|launchState:'not_started'/);
 			if (toolDescriptionMode === "full") assert.match(description, /Thinking uses model suffix\./);
 		}
 		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "full" }, { disabledFeatures }), /Management discovery: list\/get\/models\/guide; doctor\. Use guide topics agents, observability, tool-reference, configuration, models or extension-api for/);

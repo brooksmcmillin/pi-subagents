@@ -3022,9 +3022,16 @@ function buildWorkflowValidationResult(
 	preflight?: import("../../shared/types.ts").WorkflowPreflight,
 	message?: string,
 ): AgentToolResult<Details> {
-	const payload = preflight ? { ...validation, preflight } : validation;
+	const payload = {
+		...validation,
+		launchState: "not_started",
+		...(validation.ok ? {} : { recovery: "No workflow run or children started. Correct the input and revalidate with action:'validate' using the same source form (at most two correction attempts); launch only after validation passes. Do not change execution modes." }),
+		...(preflight ? { preflight } : {}),
+	};
+	const { errors, ...metadata } = payload;
+	const excerpts = errors.flatMap((error) => error.excerpt ? [error.excerpt] : []);
 	return {
-		content: [{ type: "text", text: message ?? JSON.stringify(payload) }],
+		content: [{ type: "text", text: message ? [message, ...excerpts, JSON.stringify(metadata)].join("\n") : JSON.stringify(payload) }],
 		...(validation.ok ? {} : { isError: true }),
 		details: { mode, results: [], ...(mode === "workflow" && !validation.ok ? { workflow: { failureKind: "validation" as const, trace: [], emits: [], console: [] } } : {}) },
 	};
@@ -5646,11 +5653,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (requestParams.action?.trim() === "validate") {
 				const validation = validateWorkflowRequest();
 				const invalidValidation = { ...validation, ok: false, errors: [...validation.errors, { message }] };
-				return {
-					content: [{ type: "text", text: JSON.stringify(invalidValidation) }],
-					isError: true,
-					details: { mode: "management", results: [] },
-				};
+				return buildWorkflowValidationResult(invalidValidation, "management");
 			}
 			return buildRequestedModeError(requestParams, message);
 		}

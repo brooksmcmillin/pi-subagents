@@ -15,6 +15,7 @@ import {
 	SUBAGENT_TOOL_PROMPT_SNIPPET,
 } from "../../src/extension/tool-description.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
+import { resolveDisabledFeatureSurface } from "../../src/shared/disabled-features.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -49,6 +50,12 @@ describe("registered subagent tool description", () => {
 		const fallbackCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-authority-fallback-"));
 		assert.ok(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd: fallbackCwd, agentDir, warn() {} }).includes(authorityGate));
 		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir }), /Operator-owned custom guidance/);
+		const disabledFeatures = resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] });
+		const customDisabled = buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir, disabledFeatures });
+		assert.match(customDisabled, /Operator-owned custom guidance/);
+		assert.match(customDisabled, /Never blindly relaunch/);
+		assert.doesNotMatch(customDisabled, /action:'validate'|launchState:'not_started'/);
+		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir }), /action:'validate'/);
 	});
 
 	it("uses a one-line snippet only by default", () => {
@@ -75,11 +82,23 @@ describe("registered subagent tool description", () => {
 				/Launch agents by name and pass models as exact provider\/id; an unknown agent or model returns the valid choices/,
 				/Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it/,
 				/One writer per cwd\/worktree/,
-				/After a launch or runtime failure, stop and report it; never silently switch to interactive_shell, pi -ne or another CLI/,
-				/guide workflows\/recommended-orchestration-pattern.*guide workflows\/scripted-workflows.*guide tool-reference\/retained-children.*guide tool-reference\/external-cli-agent-profiles/,
+				/Validate authored scripts first: action:'validate', same inputs; launch after passing/,
+				/Only launchState:'not_started' permits two correction\/revalidation attempts without approval/,
+				/Otherwise stop\/report failures; inspect status before retry. Never blindly relaunch or switch to interactive_shell, pi -ne or another CLI/,
+				/Details: guide workflows or tool-reference/,
 			]) assert.match(description, contract);
 			assert.ok(description.endsWith(SUBAGENT_SAFETY_GUIDANCE) || description.includes(`${SUBAGENT_SAFETY_GUIDANCE}\n\nDETAILS:`));
 		}
+	});
+
+	it("aligns canonical recovery guidance with bounded prelaunch repair", () => {
+		const workflows = fs.readFileSync(path.join(projectRoot, "docs/workflows.md"), "utf8");
+		assert.match(workflows, /Before launching authored code, also call `action: "validate"` with the exact source, args, cwd and options/);
+		assert.match(workflows, /launchState: "not_started".*created no workflow run or children/);
+		assert.match(workflows, /revalidate at most twice within the original scope without asking permission/);
+		assert.match(workflows, /Do not infer this state from `failureKind: "validation"` alone/);
+		assert.match(workflows, /Inspect recorded status before any same-protocol retry; never blindly relaunch/);
+		assert.doesNotMatch(workflows, /callers do not need a separate validation step/);
 	});
 
 	it("keeps full mode supplemental details and moves recipes to shipped guides", () => {
@@ -157,7 +176,7 @@ describe("registered subagent tool description", () => {
 
 		const description = buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir });
 
-		assert.equal(description.split("never silently switch to interactive_shell").length - 1, 1);
+		assert.equal(description.split("Never blindly relaunch or switch to interactive_shell").length - 1, 1);
 		assert.ok(description.endsWith(SUBAGENT_SAFETY_GUIDANCE));
 	});
 

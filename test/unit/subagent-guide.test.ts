@@ -51,14 +51,16 @@ describe("subagent guide", () => {
 	it("documents failed-lane recovery boundaries in packaged guide topics", () => {
 		const workflows = readSubagentGuide("workflows/failed-lane-recovery-and-execution-mode-boundaries");
 		const toolReference = readSubagentGuide("tool-reference/failed-lane-recovery-and-execution-mode-boundaries");
-		assert.match(workflows, /subagent workflow[\s\S]*child launch[\s\S]*prompt runtime[\s\S]*extension loading[\s\S]*child tooling setup[\s\S]*lane infrastructure blocker/);
+		assert.match(workflows, /launchState: "not_started"[\s\S]*revalidate at most twice/);
+		assert.match(workflows, /child launch[\s\S]*prompt runtime[\s\S]*extension loading[\s\S]*child tooling setup[\s\S]*lane infrastructure blocker/);
 		assert.match(workflows, /exact failure[\s\S]*run\/status[\s\S]*(?:repo|repository)\/cwd\/worktree\/branch\/ref/);
 		assert.match(workflows, /clean[\s\S]*partial diff/);
 		assert.match(workflows, /same-protocol retry/);
 		assert.match(workflows, /asking the owner/);
 		assert.match(workflows, /external\/foreground\/CLI fallback requires explicit owner approval/);
 		assert.match(workflows, /Pi core[\s\S]*pi -ne[\s\S]*out-of-repo hint[\s\S]*not protocol-approved fallback/);
-		assert.match(toolReference, /lane infrastructure blocker[\s\S]*external\/foreground\/CLI fallback requires explicit owner approval[\s\S]*interactive_shell[\s\S]*pi -ne/);
+		assert.match(toolReference, /launchState: "not_started"[\s\S]*two input corrections/);
+		assert.match(toolReference, /lane infrastructure blockers[\s\S]*external\/foreground\/CLI fallback requires explicit owner approval[\s\S]*interactive_shell[\s\S]*pi -ne/);
 	});
 
 	it("keeps advanced workflow details in the packaged guide", () => {
