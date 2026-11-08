@@ -606,7 +606,7 @@ function registerToolBudget(pi: ExtensionAPI, budget: ResolvedToolBudget | undef
 	});
 }
 
-function activateRequiredChildTools(pi: ExtensionAPI, requiredTools: readonly string[] | undefined): void {
+export function activateRequiredChildTools(pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">, requiredTools: readonly string[] | undefined): void {
 	if (!requiredTools?.length) return;
 	const api = pi as ExtensionAPI & { getActiveTools?: () => string[]; setActiveTools?: (toolNames: string[]) => void };
 	if (typeof api.setActiveTools !== "function") return;
@@ -620,7 +620,7 @@ function activateRequiredChildTools(pi: ExtensionAPI, requiredTools: readonly st
 	api.setActiveTools([...new Set([...(active ?? []), ...requiredTools])]);
 }
 
-function assertRequiredChildToolsActive(pi: ExtensionAPI, requiredTools: readonly string[] | undefined): void {
+export function assertRequiredChildToolsActive(pi: Pick<ExtensionAPI, "getActiveTools">, requiredTools: readonly string[] | undefined): void {
 	if (!requiredTools?.length) return;
 	const getActiveTools = (pi as { getActiveTools?: () => string[] }).getActiveTools;
 	if (typeof getActiveTools !== "function") return;

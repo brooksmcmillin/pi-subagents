@@ -7,6 +7,7 @@
  * without the real runtime; the default implementation wraps
  * `createAgentSession` from a pi package module.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,6 +23,8 @@ import { PI_CODING_AGENT_PACKAGE, resolveHostPiPackageRoot } from "./pi-spawn.ts
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { PlacementMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
+import { activateRequiredChildTools, assertRequiredChildToolsActive } from "./subagent-prompt-runtime.ts";
+import { evaluateChildToolDiagnostic } from "./child-runtime-config.ts";
 
 export interface ChildSessionEvent {
 	type: string;
@@ -506,6 +509,20 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 		async create(launch) {
 			const disposalsAtStart = disposals;
 			const pi = await loadPiCodingAgent();
+			const structuredStartupErrors: Array<{ event: string; kind: string; fingerprint: string }> = [];
+			const recordStructuredStartupError = (event: string, error: unknown) => {
+				const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				structuredStartupErrors.push({ event, kind: /^(?:Error|TypeError|SyntaxError|ReferenceError|RangeError)\b/.exec(text)?.[0] ?? "ExtensionError", fingerprint: createHash("sha256").update(text).digest("hex") });
+			};
+			const startupFailure = (phase: string, registered: string[], active: string[]): Error => {
+				const names = (values: readonly string[]) => values.slice(0, 128).map((value) => value.slice(0, 80));
+				return new Error(`Structured-output child startup failed: ${JSON.stringify({
+					phase, required: names(launch.runtime.requiredTools ?? ["structured_output"]), registered: names(registered), active: names(active),
+					extension: CHILD_PROMPT_RUNTIME_EXTENSION_PATH, extensionErrors: structuredStartupErrors.slice(0, 8),
+					sdk: `${PI_CODING_AGENT_PACKAGE}@${pi.VERSION ?? "unknown"}`, runner: "in-process", pid: process.pid, node: process.version,
+					runId: launch.runtime.runId, agent: launch.runtime.agent, childIndex: launch.runtime.childIndex,
+				})}`);
+			};
 			const builtinMcpTools = launch.builtinMcpTools ?? [];
 			let readinessTool: ToolDefinition | undefined;
 			const builtinMcp = builtinMcpTools.length ? selectedBuiltinMcpExtension(pi, builtinMcpTools, () => readinessTool) : undefined;
@@ -597,6 +614,12 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const openSession = async () => {
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
 				await loader.reload();
+				if (launch.runtime.structuredOutput) {
+					for (const error of loader.getExtensions().errors) {
+						if (error.path === CHILD_PROMPT_RUNTIME_EXTENSION_PATH) recordStructuredStartupError("load", error.error);
+					}
+					if (structuredStartupErrors.length) throw startupFailure("extension-load", loader.getExtensions().extensions.flatMap((extension) => [...extension.tools.keys()]), []);
+				}
 				if (requiredPaths.size > 0) for (const extension of loader.getExtensions().extensions) resolvedExtensionPaths.set(extension.path, extension.resolvedPath);
 				const loadErrors = requiredPaths.size > 0
 					? loader.getExtensions().errors.filter(({ path }) => isRequiredSource(path)) : [];
@@ -654,6 +677,10 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					await session.bindExtensions({
 						mode: "print",
 						onError: (error) => {
+							if (binding && launch.runtime.structuredOutput && error.extensionPath === CHILD_PROMPT_RUNTIME_EXTENSION_PATH) {
+								recordStructuredStartupError(error.event, error.error);
+								return;
+							}
 							if (binding && isRequiredSource(error.extensionPath)) requiredStartupErrors.push(`${error.extensionPath} (${error.event}): ${error.error}`);
 							launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error });
 						},
@@ -703,6 +730,25 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				})();
 				mcpWaits.set(cancel, ready);
 				try { await ready; } finally { mcpWaits.delete(cancel); }
+			}
+			if (launch.runtime.structuredOutput) {
+				// Extension event exceptions are advisory in Pi. This host-owned gate must
+				// reject before prompt(), even when the inline guard never loaded.
+				const tools = {
+					getActiveTools: () => session.getActiveToolNames(),
+					setActiveTools: (names: string[]) => session.setActiveToolsByName(names),
+				};
+				try {
+					activateRequiredChildTools(tools, ["structured_output"]);
+					const diagnostic = evaluateChildToolDiagnostic({ ...launch.runtime, requiredTools: ["structured_output"] }, session.getAllTools().map((tool) => tool.name));
+					launch.runtime.toolDiagnostic?.(diagnostic);
+					assertRequiredChildToolsActive(tools, ["structured_output"]);
+					if (diagnostic || structuredStartupErrors.length) throw startupFailure("tool-readiness", session.getAllTools().map((tool) => tool.name), tools.getActiveTools());
+				} catch {
+					const failure = startupFailure("tool-readiness", session.getAllTools().map((tool) => tool.name), tools.getActiveTools());
+					await shutdown();
+					throw failure;
+				}
 			}
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
