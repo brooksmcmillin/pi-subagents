@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { SUBAGENT_OPTION_KEYS } from "../../src/extension/schemas.ts";
 import { flattenSubagentToolOptions } from "../../src/extension/subagent-options.ts";
+import { normalizePublicSubagentExecution } from "../../src/extension/public-execution.ts";
+import { validateAcceptanceInput } from "../../src/runs/shared/acceptance.ts";
 import { resolveDisabledFeatureSurface } from "../../src/shared/disabled-features.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/subagent-wait.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
@@ -68,6 +70,54 @@ describe("subagent tool options", () => {
 		});
 	});
 });
+
+for (const [label, newline] of [["LF", "\n"], ["CRLF", "\r\n"]] as const) {
+	describe(`documented script input examples (${label})`, () => {
+		const source = fs.readFileSync(path.join(projectRoot, "docs/workflows.md"), "utf8").replace(/\r?\n/g, newline);
+		const guide = source.replace(/\r\n/g, "\n");
+		const section = guide.split("### Copyable script input examples\n")[1]?.split("\n### ")[0] ?? "";
+		const examples = [...section.matchAll(/```json\n([\s\S]*?)\n```/g)].map((match) => JSON.parse(match[1]!));
+
+		it("normalizes the actual inline and reply-block payloads independently", () => {
+			assert.equal(examples.length, 2);
+			const script = section.match(/```js workflow\n([\s\S]*?)\n```/)?.[1];
+			assert.ok(script);
+			for (const [index, example] of examples.entries()) {
+				const flat = flattenSubagentToolOptions(example);
+				assert.deepEqual(normalizePublicSubagentExecution(flat), { ok: true, params: flat });
+				assert.deepEqual(validateAcceptanceInput(flat.acceptance), []);
+				assert.equal(flat.async, true);
+				if (index === 0) {
+					assert.equal(flat.workflow, undefined);
+					assert.equal(flat.workflowScript, script);
+				} else {
+					assert.equal(flat.workflow, true);
+					assert.equal(flat.workflowScript, undefined);
+				}
+			}
+		});
+
+		it("rejects combining the documented selectors before execution", () => {
+			assert.equal(examples.length, 2);
+			assert.throws(() => flattenSubagentToolOptions({ ...examples[0], workflow: examples[1].workflow }),
+				/options\.script replaces workflow; pass only one of them/);
+		});
+
+		it("requires the documented explicit acceptance-none reason for either form", () => {
+			assert.equal(examples.length, 2);
+			for (const example of examples) {
+				for (const reason of [undefined, "", "   ", "Read-only invocation probe"]) {
+					const flat = flattenSubagentToolOptions({
+						...example, options: { ...example.options, acceptance: { level: "none", reason } },
+					});
+					assert.equal(normalizePublicSubagentExecution(flat).ok, true);
+					assert.deepEqual(validateAcceptanceInput(flat.acceptance), reason?.trim()
+						? [] : ["acceptance.reason is required when level is none."]);
+				}
+			}
+		});
+	});
+}
 
 describe("registered subagent tools with options", () => {
 	it("run management, control, schedule, and launch fields from options or the top level end to end", () => {
