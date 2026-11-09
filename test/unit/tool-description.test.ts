@@ -14,8 +14,8 @@ import {
 	SUBAGENT_SAFETY_GUIDANCE,
 	SUBAGENT_TOOL_PROMPT_SNIPPET,
 } from "../../src/extension/tool-description.ts";
-import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
 import { resolveDisabledFeatureSurface } from "../../src/shared/disabled-features.ts";
+import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -178,6 +178,19 @@ describe("registered subagent tool description", () => {
 
 		assert.equal(description.split("Never blindly relaunch or switch to interactive_shell").length - 1, 1);
 		assert.ok(description.endsWith(SUBAGENT_SAFETY_GUIDANCE));
+	});
+
+	it("renders custom placeholders without disabled features", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-disabled-custom-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-agent-"));
+		fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, ".pi", "subagent-tool-description.md"), "{{compactDescription}}\n\n{{fullDescription}}", "utf-8");
+
+		const description = buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir, disabledFeatures: resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] }) });
+
+		assert.ok(!description.includes("```js workflow"));
+		assert.ok(!description.includes("runs.lanes"));
+		assert.ok(description.includes("chain:[{agent,task?,as?,cwd?,model?}"));
 	});
 
 	it("keeps mandatory safety guidance last when custom prose embeds it before an override", () => {

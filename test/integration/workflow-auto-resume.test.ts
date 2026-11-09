@@ -10,7 +10,8 @@ import registerSubagentExtension from "../../src/extension/index.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
 import { DIRS, type AsyncStatus } from "../../src/shared/types.ts";
-import { workflowLaunchRecordDir, writeWorkflowLaunchRecord, type WorkflowLaunch } from "../../src/workflows/workflow-launch-record.ts";
+import { runLaunchDir } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeWorkflowLaunchRecord, type WorkflowLaunch } from "../../src/workflows/workflow-launch-record.ts";
 import { readWorkflowResumeClaim } from "../../src/workflows/workflow-resume-claim.ts";
 import { resolveWorkflowResource } from "../../src/workflows/workflow-resources.ts";
 import { registerWorkflowResource } from "../../src/api/workflow-resources.ts";
@@ -44,11 +45,9 @@ const waitUntil = async <T>(label: string, read: () => T | undefined | false, ti
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 };
-/** Runs that resumed `sourceRunId`. */
 const resumedRuns = (sourceRunId: string) => fs.readdirSync(DIRS.async)
 	.filter((entry) => readStatusFile(entry)?.workflow?.resumeOrigin?.sourceRunId === sourceRunId);
 const claimFiles = (runId: string) => fs.readdirSync(path.join(DIRS.async, runId)).filter((name) => name.startsWith("resumed-by.")).sort();
-/** The completion notices delivered for `runId`. */
 const noticesFor = (sent: SentMessage[], runId: string) => sent
 	.filter((entry) => entry.message.customType === "subagent-notify" && typeof entry.message.content === "string" && entry.message.content.split("\n").includes(`Workflow run: ${runId}`))
 	.map((entry) => entry.message.content as string);
@@ -404,7 +403,7 @@ describe("auto-resuming interrupted workflows at session start", { skip: !availa
 			const sessionId = `session-${nonce}-reload`;
 			const before = await startRuntime("startup", sessionId);
 			const refusedId = await launchHeld(before);
-			fs.rmSync(workflowLaunchRecordDir(DIRS.async, refusedId), { recursive: true });
+			fs.rmSync(runLaunchDir(DIRS.async, refusedId), { recursive: true });
 			await before.shutDown("reload");
 			const reloaded = await startRuntime("reload", sessionId);
 			const refusal = JSON.parse(fs.readFileSync(path.join(DIRS.async, refusedId, "resume-refused.json"), "utf-8")) as { reason: string; byHand: string };

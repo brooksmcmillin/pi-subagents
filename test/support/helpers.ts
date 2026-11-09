@@ -132,7 +132,6 @@ export function makeMinimalCtx(
 }
 
 /**
- * Try to dynamically import a module.
  * - Bare specifiers are imported as-is.
  * - Relative paths (e.g., "./src/shared/utils.ts") are resolved from the project root.
  *

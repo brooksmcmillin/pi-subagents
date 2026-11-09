@@ -10,7 +10,7 @@ import { resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "./pi-spawn.
 import type { JsonSchemaObject } from "../../shared/types.ts";
 import type { ResolvedAcceptanceReportMode } from "./acceptance.ts";
 import type { ChildStructuredOutput } from "./child-runtime-config.ts";
-import { snapshotTrackedMutations, collectTrackedMutationEvidence } from "./mutation-evidence.ts";
+import { snapshotTrackedMutations } from "./mutation-evidence.ts";
 
 export const MISSING_STRUCTURED_OUTPUT_CALL_ERROR = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
 export const STRUCTURED_OUTPUT_COMPLETION_PROMPT = `${MISSING_STRUCTURED_OUTPUT_CALL_ERROR} Continue in this same session using the evidence already gathered; do not repeat implementation or inspection. Only structured_output is permitted in this report-only attempt. Submit your report through structured_output as your only final action. If evidence is insufficient, report that limitation using the declared schema rather than claiming success.`;
@@ -88,8 +88,8 @@ export function beginStructuredOutputCompletion(structured: ChildStructuredOutpu
 			if (!current || current.root !== baseline.root || current.ref !== baseline.ref) return "Structured completion recovery failed: Git subject changed or became unavailable.";
 			if (captureIndexTree(baseline.root) !== indexTree) return "Structured completion recovery failed: staged subject changed or became unavailable.";
 			if (hasHiddenTrackedFiles(baseline.root) !== false) return "Structured completion recovery failed: tracked-file flags hide the subject or became unavailable.";
-			const evidence = collectTrackedMutationEvidence(mutations, baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000));
-			if (evidence.unavailable || evidence.truncated || evidence.attemptedMutation) return "Structured completion recovery failed: tracked subject changed or became unavailable.";
+			const currentMutations = snapshotTrackedMutations(baseline.root, Math.min(deadlineAt ?? Infinity, Date.now() + 2_000));
+			if (currentMutations.unavailable || currentMutations.truncated || JSON.stringify(currentMutations) !== JSON.stringify(mutations)) return "Structured completion recovery failed: tracked subject changed or became unavailable.";
 			return undefined;
 		},
 	};
@@ -489,11 +489,8 @@ export async function validateStructuredOutputValue(schema: JsonSchemaObject, va
  */
 export function prepareStructuredOutputArguments(schema: JsonSchemaObject, args: unknown): unknown {
 	if (!args || typeof args !== "object" || !("value" in args)) return args;
-	if (!loadedCompile) {
-		if (compileLoadError !== undefined) throw compileLoadError;
-		throw new Error("Structured output validator is still loading; call structured_output again.");
-	}
-	const validation = validateWithCompile(loadedCompile, schema, (args as { value: unknown }).value);
+	if (!loadedCompile) throw compileLoadError ?? new Error("Structured output validator is still loading; call structured_output again.");
+	const validation = validateWithCompile(loadedCompile, schema, args.value);
 	if (validation.status === "invalid") throw new Error(`Structured output validation failed: ${validation.message}`);
 	return args;
 }
@@ -505,8 +502,14 @@ function validateWithCompile(compile: CompileJsonSchema, schema: JsonSchemaObjec
 	} catch (error) {
 		return { status: "invalid", message: `invalid outputSchema: ${error instanceof Error ? error.message : String(error)}` };
 	}
-	if (validator.Check(value)) return { status: "valid" };
-	const originalErrors = [...validator.Errors(value)];
+	let originalErrors: JsonSchemaValidationError[];
+	try {
+		if (validator.Check(value)) return { status: "valid" };
+		originalErrors = [...validator.Errors(value)];
+	} catch (error) {
+		// A recursive $ref compiles but overflows the stack when checked.
+		return { status: "invalid", message: `outputSchema cannot be validated (cyclic or too deep): ${error instanceof Error ? error.message : String(error)}` };
+	}
 	const errors: string[] = [];
 	const uniqueErrors = new Set<string>();
 	const seen = new Set<string>();

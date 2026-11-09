@@ -36,6 +36,7 @@ import { createCapturedChildHooks, withChildSessionErrorReporting } from "./chil
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
 import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { DEFAULT_WAIT_TOOL_NAME, waitToolName } from "../../shared/wait-tool-name.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
 export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
@@ -150,7 +151,6 @@ export function createReportedChildSessionInput(launch: InProcessChildLaunch, tr
 	return withChildSessionErrorReporting(launch.session, transcriptWriter);
 }
 
-/** Escape XML-significant characters in a string for safe attribute interpolation. */
 function escapeXmlAttr(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -291,6 +291,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		waitTool: {
 			enabled: input.waitToolEnabled ?? true,
 			...(input.waitToolDefaultTimeoutMs !== undefined ? { defaultTimeoutMs: input.waitToolDefaultTimeoutMs } : {}),
+			...(waitToolName() !== DEFAULT_WAIT_TOOL_NAME ? { name: waitToolName() } : {}),
 		},
 		...(input.fileHandoffPath ? { fileHandoffPath: input.fileHandoffPath } : {}),
 		...(input.structuredOutput

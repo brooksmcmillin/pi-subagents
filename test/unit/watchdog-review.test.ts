@@ -78,6 +78,7 @@ function createCtx(input: {
 		getSystemPrompt: () => "Parent system prompt",
 		modelRegistry: {
 			getAvailable: () => allModels.filter((entry) => authenticated.has(`${entry.provider}/${entry.id}`)),
+			getAll: () => allModels,
 			find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
 			hasConfiguredAuth: (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`),
 			getApiKeyAndHeaders: async (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`)
@@ -160,6 +161,15 @@ describe("main watchdog review adapter", () => {
 
 		assert.deepEqual(warnings, []);
 		assert.equal(result?.stopReason, "stop");
+	});
+
+	it("sends the parent session id with the review's model request", async () => {
+		const current = model("openai", "gpt-session");
+		const { streamFn, calls } = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
+
+		await createMainWatchdogReview(createCtx({ current }), { streamFn })(request(enabledConfig(), []));
+
+		assert.equal(calls[0]?.options?.sessionId, "watchdog-review-session");
 	});
 
 	it("sends complete review instructions and the helper cwd in the leading system message", async () => {

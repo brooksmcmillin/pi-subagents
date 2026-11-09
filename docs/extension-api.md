@@ -275,6 +275,8 @@ const result = await resolveSubagentLaunchContract({
   cwd: ctx.cwd,
   sessionRoot: "/tmp/my-extension-preflight-session-root",
   availableModels: ctx.modelRegistry.getAvailable(),
+  // Every provider Pi knows, so `anthropic/...` never resolves to another provider's copy.
+  knownProviders: () => ctx.modelRegistry.getAll().map((model) => model.provider),
 });
 
 if (!result.ok) {
@@ -313,6 +315,21 @@ Boundaries:
 - It is side-effect-free for launch state: it does not create child sessions, temp prompt files, structured-output runtimes, tool-diagnostic files, or run artifacts.
 - Some host-owned facts, such as exact fork snapshots, nested async roots, and live model registries, can only be proven by the Pi host; those appear as `host_required` diagnostics instead of silently pretending to be exact.
 - Preflight reads the extension config, so `defaultSubagentContext: "fresh"` or `"fork"` affects omitted context in the same way as execution. Explicit `context` still wins.
+
+### Requiring a launcher
+
+An extension that approved one agent definition for one [launcher](agents.md#sandboxing-background-children-with-a-launcher) can make the launch depend on that approval. Read `contract.agent.definitionDigest` from preflight, then pass it with the launcher name in the call, for example by adding it to the `subagent` tool call's input in your `tool_call` handler:
+
+```ts
+event.input.options = { ...event.input.options, requireLauncher: { name: "net", definitionDigest } };
+```
+
+pi-subagents checks the requirement after every `tool_call` handler has run, against the agent and launcher it is about to start, and again when it spawns the runner. The launch is refused if the agent has no launcher, uses another launcher, or has a different definition digest (for example because the agent file changed, or a project agent now shadows it). It never falls back to running without the launcher, and a refusal starts nothing. The runner records the checked digest.
+
+- Only a top-level single-agent call (`agent` + `task`) accepts it, and it runs in the background because launcher agents always do. `tasks`, `chain`, workflows, workflow children (`runs.run`), actions and `resume` are refused.
+- The requirement travels in the call. Another extension's `tool_call` handler that runs after yours can remove it, and pi-subagents cannot tell. Register your handler so it runs last, or check the run's `status.json` (`launcher.name`) afterwards.
+- Releases without this option reject `options.requireLauncher` as an unknown option, so an older install fails the call instead of ignoring it.
+- The run's recovery record keeps the requirement, and `resume` checks it again: it is refused if the agent is gone, names another launcher, or has a different definition digest, and attaching a chain to the run is refused.
 
 ## Structured delegation API
 

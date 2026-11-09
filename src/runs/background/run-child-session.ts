@@ -9,7 +9,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, assistantMessageError, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
 import { qualifyModelWithProvider } from "../../shared/model-info.ts";
-import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
+import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SteeringFailureKind, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
 	acceptChildWatchdogEvent,
 	applyChildWatchdogMessage,
@@ -65,9 +65,9 @@ export interface ChildEvent {
 	willRetry?: unknown;
 }
 
-/** Outcome of handing a steer request to a live child session. */
 export interface SteerDelivery {
 	state: "delivered" | "queued" | "failed";
+	failureKind?: SteeringFailureKind;
 	deliveryStatus?: SteerDeliveryStatus;
 	message: string;
 }
@@ -99,7 +99,7 @@ export interface RunChildSessionInput {
 	onContextWindow?: (contextWindow: number) => void;
 	transcriptWriter?: ChildTranscriptWriter;
 	toolTimeoutMs?: number;
-	runDeadlineAt?: number;
+	runDeadlineAt?: () => number | undefined;
 	expectedModelForVerification?: string;
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
 	modelResponseAliases?: Record<string, string[]>;
@@ -414,8 +414,6 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const armToolTimeout = (event: { toolCallId?: unknown; toolName: string }): void => {
 			const timeoutForTool = effectiveToolTimeoutMs(event.toolName, input.toolTimeoutMs);
 			if (timeoutForTool === undefined) return;
-			const runRemaining = input.runDeadlineAt === undefined ? undefined : Math.max(0, input.runDeadlineAt - Date.now());
-			if (runRemaining !== undefined && timeoutForTool >= runRemaining) return;
 			const key = toolTimeoutCallKey(event, ++toolTimeoutSequence);
 			const toolName = event.toolName;
 			const timer = setTimeout(() => {
@@ -589,12 +587,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			return commandError;
 		};
 
-		/** The child run ended (or was forced to end); fold in the outcome once the child's shutdown work is done. */
 		const failUnconsumedSteers = (): void => {
 			for (const entry of acceptedSteers.splice(0)) {
-				input.onSteerOutcome?.(entry.request, { state: "failed", message: unconsumedSteerReason(entry.request.mode) });
+				input.onSteerOutcome?.(entry.request, { state: "failed", failureKind: "unconsumed", message: unconsumedSteerReason(entry.request.mode) });
 			}
 		};
+		/** The child run ended (or was forced to end); fold in the outcome once the child's shutdown work is done. */
 		const settle = (promptError: unknown, forced = false): void => {
 			if (settled) return;
 			settled = true;
@@ -705,12 +703,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				const steer = created.steer.bind(created);
 				const followUp = created.followUp.bind(created);
 				created.steer = async (text) => {
+					await steer(text);
 					if (cleanTerminalAssistantStopReceived || agentSettledReceived) queuedDrainHold = true;
-					return steer(text);
 				};
 				created.followUp = async (text) => {
+					await followUp(text);
 					if (cleanTerminalAssistantStopReceived || agentSettledReceived) queuedDrainHold = true;
-					return followUp(text);
 				};
 				unsubscribe = created.subscribe(processEvent);
 				input.registerWatchdogStatus?.((event) => processEvent(event as unknown as ChildSessionEvent));
@@ -730,13 +728,14 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					} catch (steerError) {
 						const index = acceptedSteers.indexOf(accepted);
 						if (index >= 0) acceptedSteers.splice(index, 1);
-						return { state: "failed", message: steerError instanceof Error ? steerError.message : String(steerError) };
+						return { state: "failed", failureKind: "rejected", message: steerError instanceof Error ? steerError.message : String(steerError) };
 					}
 					return queued;
 				});
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
 				await created.prompt(input.prompt);
+				const completionDeadlineAt = input.runDeadlineAt?.();
 				if (shouldRecoverStructuredOutputCompletion({
 					required: Boolean(input.launch.config?.structuredOutput),
 					toolInvoked: structuredOutputToolInvoked,
@@ -744,8 +743,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					blocked: settled || interrupted || timedOut || stopped || forcedTermination || unfinishedToolAtTerminal
 						|| Boolean(error || assistantError || currentTool || input.launch.capture?.toolDiagnostic())
 						|| created.shutDown === true || childSessionHasQueuedMessages(created)
-						|| (input.runDeadlineAt !== undefined && Date.now() >= input.runDeadlineAt),
-				}) && !input.launch.session.machine && beginStructuredOutputCompletion(input.launch.config.structuredOutput, messages, input.launch.session.cwd, input.runDeadlineAt)) {
+						|| (completionDeadlineAt !== undefined && Date.now() >= completionDeadlineAt),
+				}) && !input.launch.session.machine && beginStructuredOutputCompletion(input.launch.config.structuredOutput, messages, input.launch.session.cwd, completionDeadlineAt)) {
 					applyChildLifecycle("cancel-drain");
 					input.writeOutputLine("Recovering missing structured_output: one same-session completion turn.");
 					appendChildEvent({ type: "structured_output_completion_recovery", attempt: 1, originalError: MISSING_STRUCTURED_OUTPUT_CALL_ERROR, sessionId: created.sessionId });

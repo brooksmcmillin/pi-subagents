@@ -104,7 +104,7 @@ for (const mode of ["foreground", "background"] as const) {
 						timeoutMs: scenario === "timeout" || scenario === "deadline-during" ? 100 : undefined, deadlineAt,
 					})
 					: await runChildSession({
-						factory, launch, prompt: "Review the change", appendChildEvent() {}, writeOutputLine() {}, runDeadlineAt: deadlineAt,
+						factory, launch, prompt: "Review the change", appendChildEvent() {}, writeOutputLine() {}, runDeadlineAt: () => deadlineAt,
 						registerStop(handler) { stop = handler; }, registerInterrupt(handler) { interrupt = handler; },
 						registerTimeout(handler) {
 							timeout = handler;
