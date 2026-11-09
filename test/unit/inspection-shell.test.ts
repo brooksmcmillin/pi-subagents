@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { buildInspectionArgs, validateInspectionCommand } from "../../src/extension/inspection-shell.ts";
 
@@ -7,6 +11,55 @@ describe("inspection shell", () => {
 		assert.deepEqual(validateInspectionCommand({ program: "git", args: ["diff", "origin/main...HEAD"] }), { ok: true });
 		assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["pr", "checks", "123"] }), { ok: true });
 		assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["api", "/repos/acme/project/pulls/123"] }), { ok: true });
+	});
+
+	it("parses directory options before validating and hardening the subcommand", () => {
+		for (const prefix of [
+			["-C", "/tmp/pi-audit-3-20261109/checkout"],
+			["-C", "/tmp/review checkout"],
+			["--no-pager", "-C", "/tmp", "-C", "checkout", "--no-optional-locks"],
+			["-C", "log"],
+		]) {
+			for (const command of ["log", "diff", "show"]) {
+				const args = [...prefix, command, "HEAD"];
+				assert.deepEqual(validateInspectionCommand({ program: "git", args }), { ok: true });
+				assert.deepEqual(buildInspectionArgs("git", args), [
+					"-c", "core.fsmonitor=false", "-c", "core.pager=cat", "--no-pager",
+					...prefix, command, "--no-textconv", "HEAD",
+				]);
+			}
+			assert.equal(validateInspectionCommand({ program: "git", args: [...prefix, "commit"] }).ok, false);
+		}
+	});
+
+	it("executes a hardened history query in the selected checkout", () => {
+		const directory = mkdtempSync(join(tmpdir(), "inspection-history-"));
+		try {
+			execFileSync("git", ["init", "--quiet", directory]);
+			execFileSync("git", ["-C", directory, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+				"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "fixture history"]);
+			for (const prefix of [["-C", directory], ["-C", directory, "-C", "."]]) {
+				const args = [...prefix, "log", "-1", "--format=%s"];
+				assert.deepEqual(validateInspectionCommand({ program: "git", args }), { ok: true });
+				assert.equal(execFileSync("git", buildInspectionArgs("git", args), { cwd: tmpdir(), encoding: "utf8" }).trim(), "fixture history");
+			}
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects missing subcommands and unsupported global options", () => {
+		for (const args of [
+			["-C"], ["-C", "log"], ["-C/tmp"], ["-C/tmp", "log"],
+			["--unknown", "log"], ["--help", "log"],
+			["-C", "log", "reset", "--hard"],
+			["-Clog", "reset", "--hard"],
+			["-C", "/tmp", "-c", "alias.log=commit", "log"],
+			["-C", "/tmp", "--paginate", "log"],
+			["-C", "/tmp", "log", "--textconv"],
+		]) {
+			assert.equal(validateInspectionCommand({ program: "git", args }).ok, false, JSON.stringify(args));
+		}
 	});
 
 	it("blocks baseline-mutating scanners and GitHub mutation paths", () => {
