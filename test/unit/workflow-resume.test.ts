@@ -4,17 +4,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { currentBootId } from "../../src/runs/background/boot-id.ts";
-import { workflowLaunchRecordDir, writeWorkflowLaunchRecord, type WorkflowLaunchRecord } from "../../src/workflows/workflow-launch-record.ts";
+import { runLaunchDir } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeWorkflowLaunchRecord, type WorkflowLaunchRecord } from "../../src/workflows/workflow-launch-record.ts";
 import { readWorkflowResumeClaim } from "../../src/workflows/workflow-resume-claim.ts";
 import { prepareWorkflowResume } from "../../src/workflows/workflow-resume.ts";
 import { workflowScriptDigest } from "../../src/workflows/workflow-reuse.ts";
+import { writeFileCreatingDir } from "../support/helpers.ts";
 
 const SCRIPT = "return args;";
 const scriptLaunch: WorkflowLaunchRecord = { version: 2, sessionId: "session", source: "script", params: { workflowScript: SCRIPT, args: { n: 1 }, cwd: "/repo" }, scriptDigest: workflowScriptDigest(SCRIPT) };
 const relaunch = (runId: string) => `Relaunch it by hand with options: { reuseFrom: "${runId}" }.`;
 
 describe("prepareWorkflowResume", () => {
-	const withRoot = (body: (root: string, writeRun: (runId: string, options?: { stopCause?: string; attempt?: number; state?: string; launch?: WorkflowLaunchRecord | string | null; ceiling?: unknown }) => void) => void) => {
+	const withRoot = (body: (root: string, writeRun: (runId: string, options?: { stopCause?: string; attempt?: number; state?: string; launch?: WorkflowLaunchRecord | string | null; ceiling?: unknown; drainRequestedAt?: number }) => void) => void) => {
 		const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-workflow-resume-"));
 		const root = path.join(tempRoot, "async-subagent-runs");
 		try {
@@ -25,12 +27,11 @@ describe("prepareWorkflowResume", () => {
 				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 					runId, sessionId: "session", mode: "workflow", state: options.state ?? "failed", startedAt: 1, endedAt: 2, cwd: "/repo",
 					...(options.ceiling ? { admissionCapabilityCeiling: options.ceiling } : {}),
-					workflow: { trace: [], emits: [], console: [], scriptDigest: workflowScriptDigest(SCRIPT), ...(stopCause ? { stopCause } : {}), ...(options.attempt !== undefined ? { resumeOrigin: { sourceRunId: "older", attempt: options.attempt } } : {}) },
+					workflow: { trace: [], emits: [], console: [], scriptDigest: workflowScriptDigest(SCRIPT), ...(stopCause ? { stopCause } : {}), ...(options.attempt !== undefined ? { resumeOrigin: { sourceRunId: "older", attempt: options.attempt } } : {}), drainRequestedAt: options.drainRequestedAt },
 				}));
 				const launch = options.launch === undefined ? scriptLaunch : options.launch;
 				if (typeof launch === "string") {
-					fs.mkdirSync(workflowLaunchRecordDir(root, runId), { recursive: true });
-					fs.writeFileSync(path.join(workflowLaunchRecordDir(root, runId), "launch.json"), launch);
+					writeFileCreatingDir(path.join(runLaunchDir(root, runId), "launch.json"), launch);
 				} else if (launch) writeWorkflowLaunchRecord(root, runId, launch);
 			});
 		} finally {
@@ -83,6 +84,7 @@ describe("prepareWorkflowResume", () => {
 				["structured", { launch: { version: 2, sessionId: "session", source: "structured", scriptDigest: "d" } }, "structured", "launched from tasks/chain"],
 				["internal", { launch: { version: 2, sessionId: "session", source: "internal", scriptDigest: "d" } }, "internal", "launched by a schedule or prompt-template delegation"],
 				["edited", { launch: { ...scriptLaunch, params: { ...scriptLaunch.params, workflowScript: "return 2;" } } }, "launch-invalid", "launch.json is invalid: its script does not match its scriptDigest"],
+				["drained", { stopCause: "owner-exited", drainRequestedAt: 5 }, "drained", "it was being drained when it was interrupted"],
 			];
 			for (const [runId, options, code, reason] of cases) {
 				writeRun(runId, options);

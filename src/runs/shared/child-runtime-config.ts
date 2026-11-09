@@ -101,7 +101,6 @@ export interface ChildRuntimeConfig {
 	permissions?: ChildPermissions;
 	toolBudget?: ResolvedToolBudget;
 	childWatchdog?: ChildWatchdogConfig;
-	/** Receives child watchdog status events. */
 	watchdogStatus?: (event: ChildWatchdogStatusEvent) => void;
 	waitTool: ResolvedWaitToolConfig;
 	runtimeState?: SubagentState;

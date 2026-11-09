@@ -11,85 +11,87 @@ function git(cwd: string, args: string[]): void {
 	execFileSync("git", args, { cwd, stdio: "ignore" });
 }
 
-function withRepo(run: (repo: string) => void): void {
+function withRepo(run: (repo: string) => void | Promise<void>): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-mutation-evidence-"));
-	try {
-		git(repo, ["init"]);
-		git(repo, ["config", "user.email", "test@example.com"]);
-		git(repo, ["config", "user.name", "Test User"]);
-		fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
-		git(repo, ["add", "tracked.txt"]);
-		git(repo, ["commit", "-m", "base"]);
-		run(repo);
-	} finally {
-		fs.rmSync(repo, { recursive: true, force: true });
-	}
+	return (async () => {
+		try {
+			git(repo, ["init"]);
+			git(repo, ["config", "user.email", "test@example.com"]);
+			git(repo, ["config", "user.name", "Test User"]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
+			git(repo, ["add", "tracked.txt"]);
+			git(repo, ["commit", "-m", "base"]);
+			await run(repo);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	})();
 }
 
 describe("tracked mutation evidence", () => {
-	it("detects edits to a tracked file that was already dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects edits to a tracked file that was already dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n", "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n", "utf-8");
 			fs.writeFileSync(path.join(repo, "untracked.txt"), "ignored by evidence\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("detects a child reverting a tracked file that was dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects a child reverting a tracked file that was dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n", "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("detects staged edits to a tracked file that was already staged dirty at child start", () => {
-		withRepo((repo) => {
+	it("detects staged edits to a tracked file that was already staged dirty at child start", async () => {
+		await withRepo(async (repo) => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "staged before child\n", "utf-8");
 			git(repo, ["add", "tracked.txt"]);
 			const snapshot = snapshotTrackedMutations(repo);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "staged after child\n", "utf-8");
 			git(repo, ["add", "tracked.txt"]);
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("distinguishes unchanged and changed tracked diffs that exceed the fast buffer", () => {
-		withRepo((repo) => {
+	it("distinguishes unchanged and changed tracked diffs that exceed the fast buffer", async () => {
+		await withRepo(async (repo) => {
 			const largeBefore = `${"before\n".repeat(180_000)}before-tail\n`;
 			const largeAfter = `${"after\n".repeat(180_000)}after-tail\n`;
 			fs.writeFileSync(path.join(repo, "tracked.txt"), largeBefore, "utf-8");
 			const snapshot = snapshotTrackedMutations(repo);
-			const unchangedEvidence = collectTrackedMutationEvidence(snapshot, repo);
+			const unchangedEvidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(unchangedEvidence.attemptedMutation, false);
 			assert.deepEqual(unchangedEvidence.changedFiles, []);
 
 			fs.writeFileSync(path.join(repo, "tracked.txt"), largeAfter, "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(evidence.attemptedMutation, true);
 			assert.deepEqual(evidence.changedFiles, ["tracked.txt"]);
 		});
 	});
 
-	it("does not invoke repository fsmonitor while collecting mutation evidence", () => {
-		withRepo((repo) => {
+	it("does not invoke repository fsmonitor while collecting mutation evidence", async () => {
+		await withRepo(async (repo) => {
 			const marker = path.join(repo, "fsmonitor-invoked");
 			const hook = path.join(repo, "fsmonitor-hook.cjs");
 			fs.writeFileSync(hook, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "invoked\\n");\n`, "utf-8");
@@ -101,7 +103,7 @@ describe("tracked mutation evidence", () => {
 
 			const snapshot = snapshotTrackedMutations(repo);
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n", "utf-8");
-			const evidence = collectTrackedMutationEvidence(snapshot, repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo);
 
 			assert.equal(snapshot.unavailable, undefined);
 			assert.equal(evidence.attemptedMutation, true);
@@ -109,8 +111,8 @@ describe("tracked mutation evidence", () => {
 		});
 	});
 
-	it("fingerprints raw bytes without invoking a configured textconv", () => {
-		withRepo((repo) => {
+	it("fingerprints raw bytes without invoking a configured textconv", async () => {
+		await withRepo(async (repo) => {
 			const marker = path.join(repo, "textconv-invoked");
 			const converter = path.join(repo, "converter.cjs");
 			fs.writeFileSync(converter, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "invoked"); throw new Error("converter should not run");\n`);
@@ -119,16 +121,16 @@ describe("tracked mutation evidence", () => {
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n");
 			const snapshot = snapshotTrackedMutations(repo, Date.now() + 10_000);
 			assert.equal(snapshot.unavailable, undefined);
-			assert.equal(collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000).attemptedMutation, false);
+			assert.equal((await collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000)).attemptedMutation, false);
 			fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty after child\n");
-			assert.equal(collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000).attemptedMutation, true);
+			assert.equal((await collectTrackedMutationEvidence(snapshot, repo, Date.now() + 10_000)).attemptedMutation, true);
 			assert.equal(fs.existsSync(marker), false);
 		});
 	});
 
 	for (const fault of ["timeout", "overflow", "overflow-expired"]) {
-		it(`bounds fingerprint ${fault} without an unbounded fallback`, (t) => {
-			withRepo((repo) => {
+		it(`bounds fingerprint ${fault} without an unbounded fallback`, async (t) => {
+			await withRepo((repo) => {
 				fs.writeFileSync(path.join(repo, "tracked.txt"), "dirty before child\n");
 				t.mock.timers.enable({ apis: ["Date"], now: 10_000 });
 				const original = childProcess.execFileSync;
@@ -155,6 +157,15 @@ describe("tracked mutation evidence", () => {
 			});
 		});
 	}
+
+	it("fails closed when async collection starts after its deadline", async () => {
+		await withRepo(async (repo) => {
+			const snapshot = snapshotTrackedMutations(repo);
+			const evidence = await collectTrackedMutationEvidence(snapshot, repo, Date.now() - 1);
+			assert.match(evidence.unavailable ?? "", /deadline expired/);
+			assert.equal(evidence.attemptedMutation, false);
+		});
+	});
 
 	it("formats bounded timeout recovery data", () => {
 		const summary = buildTimeoutRecoverySummary({

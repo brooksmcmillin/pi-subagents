@@ -21,6 +21,7 @@ import { validateIntercomBridgeConfig } from "../../intercom/intercom-bridge.ts"
 import { validateModelResponseAliases } from "../../shared/model-response-aliases.ts";
 import { readWorkflowLaunchRecord } from "../../workflows/workflow-launch-record.ts";
 import { recoveryDescriptorPath } from "../shared/run-launch-folder.ts";
+import { missingForkCopyNote } from "../../shared/artifacts.ts";
 
 export interface AsyncResumeParams {
 	id?: string;
@@ -331,7 +332,7 @@ export function readAsyncRecoveryDescriptor(runsRoot: string, runId: string): St
 		"subagentOnlyExtensions", "mcpDirectTools", "excludeTools", "mutationTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills",
 		"skillPath", "agentFilePath", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
 		"artifactsDir", "maxOutput", "controlConfig", "context", "intercomBridge", "absoluteDeadlineAt", "initialTurnBudget", "initialToolBudget", "maxSubagentDepth", "share", "capabilityCeiling",
-		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef", "launcher", "sessionId", "managedWorktree",
+		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef", "launcher", "requiredLauncher", "sessionId", "managedWorktree",
 		"extensionBindings",
 		"requiredExtensions",
 	]);
@@ -344,6 +345,14 @@ export function readAsyncRecoveryDescriptor(runsRoot: string, runId: string): St
 	}
 	if (parsed.version !== 1) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': version must be 1.`);
 	if (parsed.launcher !== undefined && parsed.launcher !== null && (typeof parsed.launcher !== "string" || !RUNNER_LAUNCHER_NAME_PATTERN.test(parsed.launcher))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': launcher must be a launcher name or null.`);
+	if (parsed.requiredLauncher !== undefined) {
+		const required = parsed.requiredLauncher as Record<string, unknown> | null;
+		if (!required || typeof required !== "object" || Array.isArray(required) || Object.keys(required).some((key) => key !== "name" && key !== "definitionDigest")
+			|| typeof required.name !== "string" || !RUNNER_LAUNCHER_NAME_PATTERN.test(required.name)
+			|| typeof required.definitionDigest !== "string" || !/^[0-9a-f]{64}$/.test(required.definitionDigest)) {
+			throw new Error(`Invalid async recovery descriptor '${descriptorPath}': requiredLauncher must be { name, definitionDigest }.`);
+		}
+	}
 	try {
 		parsed.runFanoutBudget = validateRunFanoutBudgetDescriptor(parsed.runFanoutBudget);
 	} catch (error) {
@@ -462,12 +471,10 @@ export function readAsyncRecoveryDescriptor(runsRoot: string, runId: string): St
  * native path the parent computed, or a worktree git itself lists on the requested Worktrunk branch.
  */
 function assertLaunchedWorktreeCwd(runId: string, launchCwd: string, launched: NonNullable<SteeringRecoveryDescriptor["managedWorktree"]>, handoffCwd: string): string {
+	const listed = launched.provider === "native" ? undefined : findListedWorktreeOnBranch(launchCwd, launched.branch);
 	const matches = launched.provider === "native"
 		? isComparablePathInside(launched.cwd, handoffCwd) && isComparablePathInside(handoffCwd, launched.cwd)
-		: (() => {
-			const listed = findListedWorktreeOnBranch(launchCwd, launched.branch);
-			return listed !== undefined && isComparablePathInside(listed, handoffCwd);
-		})();
+		: listed !== undefined && isComparablePathInside(listed, handoffCwd);
 	if (!matches) throw new Error(`Async run '${runId}' managed worktree ${handoffCwd} is not the worktree its launch created.`);
 	return handoffCwd;
 }
@@ -475,18 +482,16 @@ function assertLaunchedWorktreeCwd(runId: string, launchCwd: string, launched: N
 /** A run launched in a worktree resumes in it, never in the source checkout, even when handoff.json is missing. */
 function launchedWorktreeCwdWithoutHandoff(runId: string, launchCwd: string, launched: NonNullable<SteeringRecoveryDescriptor["managedWorktree"]>): string {
 	const cwd = launched.provider === "native" ? launched.cwd : findListedWorktreeAgentCwd(launchCwd, launched.branch);
-	let isDirectory = false;
-	try { isDirectory = cwd !== undefined && fs.statSync(cwd).isDirectory(); } catch { /* reported below */ }
-	if (!isDirectory) {
+	if (cwd === undefined || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
 		throw new Error(`Async run '${runId}' ran in a managed worktree (${launched.provider === "native" ? launched.cwd : `branch ${launched.branch}`}) that no longer exists; it cannot resume in the source checkout.`);
 	}
-	return cwd!;
+	return cwd;
 }
 
 function validateResumeSessionFile(runId: string, sessionFile: string): string {
 	if (path.extname(sessionFile) !== ".jsonl") throw new Error(`Async run '${runId}' session file must be a .jsonl file: ${sessionFile}`);
 	const resolved = path.resolve(sessionFile);
-	if (!fs.existsSync(resolved)) throw new Error(`Async run '${runId}' session file does not exist: ${sessionFile}`);
+	if (!fs.existsSync(resolved)) throw new Error(`Async run '${runId}' session file does not exist: ${sessionFile}${missingForkCopyNote(resolved)}`);
 	return resolved;
 }
 

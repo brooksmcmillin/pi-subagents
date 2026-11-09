@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { it } from "node:test";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { runSync } from "../../src/runs/foreground/execution.ts";
@@ -12,6 +15,15 @@ const launch = { capture: { finalDrainHeld: () => false, toolDiagnostic: () => u
 	hooks: [], noSkills: true, noContextFiles: true,
 	runtime: { fanoutChild: false, fast: false, depth: 1, waitTool: { enabled: false } },
 } } as InProcessChildLaunch;
+
+async function runForegroundFixture(task: string, options: Parameters<typeof runSync>[4]) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "child-session-"));
+	try {
+		return await runSync(cwd, makeAgentConfigs(["worker"]), "worker", task, options);
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+}
 
 // Without the abort backstop this run never settles, so bound the test instead of hanging the suite.
 it("settles a timed-out run whose session creation never returns, and contains late disposal rejection", { timeout: 10_000 }, async () => {
@@ -93,7 +105,7 @@ for (const control of ["stop", "timeout", "interrupt"] as const) {
 			},
 			async dispose() {},
 		};
-		const result = await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "must not reach the model", {
+		const result = await runForegroundFixture("must not reach the model", {
 			childSessionFactory: factory,
 			...(control === "stop" ? { signal: controller.signal } : control === "interrupt" ? { interruptSignal: controller.signal } : { timeoutMs: 100 }),
 		});
@@ -156,7 +168,7 @@ for (const mode of ["foreground", "background"] as const) {
 		};
 		const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
 		const result = mode === "foreground"
-			? await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Finish", { childSessionFactory: factory })
+			? await runForegroundFixture("Finish", { childSessionFactory: factory })
 			: await runChildSession({ factory, launch, prompt: "Finish", timeoutMessage: "timed out", appendChildEvent() {}, writeOutputLine() {} });
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /unfinished commands: service/);
@@ -232,7 +244,7 @@ async function runPartialScenario(mode: "foreground" | "background", scenario: P
 	};
 	const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
 	return mode === "foreground"
-		? runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Finish", { childSessionFactory: factory, timeoutMs: 100 })
+		? runForegroundFixture("Finish", { childSessionFactory: factory, timeoutMs: 100 })
 		: runChildSession({
 			factory, launch, prompt: "Finish", timeoutMessage: "Subagent timed out.",
 			appendChildEvent() {}, writeOutputLine() {},
@@ -297,7 +309,7 @@ for (const mode of ["foreground", "background"] as const) {
 		};
 		const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
 		const result = mode === "foreground"
-			? await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Study", { childSessionFactory: factory })
+			? await runForegroundFixture("Study", { childSessionFactory: factory })
 			: await runChildSession({ factory, launch, prompt: "Study", appendChildEvent() {}, writeOutputLine() {} });
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.error, "Provider finish_reason: content_filter\nReply text: Blocked by the provider's usage policy.");

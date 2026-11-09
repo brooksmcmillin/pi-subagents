@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult
 import { CHILD_COMMAND_TOOL, createChildCommandRuntime } from "./child-commands.ts";
 import { supervisorChannelDir } from "./child-tool-plan.ts";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
+import { parseAcceptanceReport } from "./acceptance.ts";
 import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveHostPiPackageRoot } from "./pi-spawn.ts";
@@ -138,9 +139,9 @@ export interface ChildSession {
 	readonly machineEvidence?: { provider: PlacementMachineReference["provider"]; machineId: string; initial?: HerdrRemoteGitStatus; final?: HerdrRemoteGitStatus };
 	/** Event-updated pane-native status; reading it performs no network work. */
 	readonly placementSnapshot?: unknown;
-	/** Set by the foreground host once the run detached; `factory.dispose()` leaves such children running. */
+	/** Set by the foreground host once the run detached; factory disposal leaves such children running. */
 	detached?: boolean;
-	/** Set by `factory.dispose()` before it aborts the child, so the host can report the stop truthfully. */
+	/** Set by factory disposal before it aborts the child, so the host can report the stop truthfully. */
 	shutDown?: boolean;
 }
 
@@ -156,6 +157,8 @@ export interface ChildSessionFactory {
 	create(launch: ChildSessionLaunch): Promise<ChildSession>;
 	/** Abort and dispose every live attached child; detached children keep running and hold the shared runtime. */
 	dispose(): Promise<void>;
+	/** `dispose()` for only the children `parentSessionFile`'s session launched (undefined: sessions without a file); pi-web shuts sessions down one at a time. */
+	disposeForParent(parentSessionFile: string | undefined): Promise<void>;
 }
 
 export type PiCodingAgentModule = typeof import("@earendil-works/pi-coding-agent");
@@ -492,12 +495,15 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	const loadPiCodingAgent = options.loadPiCodingAgent ?? loadHostPiCodingAgent;
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
 	let runtime: ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]> | undefined;
-	const live = new Set<ChildSession>();
+	const live = new Map<ChildSession, string | undefined>();
 	/** Extension shutdowns still running for disposed children; `dispose()` waits for them. */
 	const shutdowns = new Set<Promise<void>>();
 	/** Launches still waiting for their MCP tools; `dispose()` ends the wait and waits for their shutdown. */
-	const mcpWaits = new Map<AbortController, Promise<void>>();
-	let disposals = 0;
+	const mcpWaits = new Map<AbortController, { ready: Promise<void>; parent: string | undefined }>();
+	let globalDisposals = 0;
+	/** Per-parent disposal epochs: a child's launch aborts only when its own parent's scope (or the whole process) was disposed while it started. */
+	const parentDisposals = new Map<string | undefined, number>();
+	const parentDisposalEpoch = (parent: string | undefined) => parentDisposals.get(parent) ?? 0;
 	const sharedRuntime = async (pi: PiCodingAgentModule) => {
 		runtime ??= pi.ModelRuntime.create().catch((error: unknown) => {
 			runtime = undefined;
@@ -505,9 +511,25 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 		});
 		return runtime;
 	};
+	const disposeMatching = async (matches: (parent: string | undefined) => boolean) => {
+		for (const [cancel, wait] of mcpWaits) if (matches(wait.parent)) cancel.abort();
+		const children = [...live.keys()].filter((child) => !child.detached && matches(live.get(child)));
+		for (const child of children) child.shutDown = true;
+		await Promise.allSettled(children.map((child) => child.abort()));
+		for (const child of children) {
+			try { void child.dispose(); } catch { /* best effort */ }
+		}
+		await Promise.allSettled([
+			...shutdowns,
+			...[...mcpWaits.values()].filter((wait) => matches(wait.parent)).map((wait) => wait.ready),
+		]);
+		if (live.size === 0) runtime = undefined;
+	};
 	return {
 		async create(launch) {
-			const disposalsAtStart = disposals;
+			const globalDisposalsAtStart = globalDisposals;
+			const parentEpochAtStart = parentDisposalEpoch(launch.parentSessionFile);
+			const disposedSinceStart = () => globalDisposals !== globalDisposalsAtStart || parentDisposalEpoch(launch.parentSessionFile) !== parentEpochAtStart;
 			const pi = await loadPiCodingAgent();
 			const structuredStartupErrors: Array<{ event: string; kind: string; fingerprint: string }> = [];
 			const recordStructuredStartupError = (event: string, error: unknown) => {
@@ -715,11 +737,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			if (builtinMcp) {
 				const cancel = new AbortController();
 				const signal = launch.signal ? AbortSignal.any([cancel.signal, launch.signal]) : cancel.signal;
-				if (disposals !== disposalsAtStart) cancel.abort();
+				if (disposedSinceStart()) cancel.abort();
 				const ready = (async () => {
 					try {
 						await builtinMcp.waitForTools(signal, () => loader.getExtensions().errors.find(({ path }) => path === "builtin:mcp")?.error);
-						if (disposals !== disposalsAtStart) throw new Error("The child session factory was disposed while the child waited for its MCP tools.");
+						if (disposedSinceStart()) throw new Error("The child session factory was disposed while the child waited for its MCP tools.");
 						if (signal.aborted) throw new Error("The child launch was cancelled while waiting for its MCP tools.");
 						const missing = missingBuiltinMcpTools(session, builtinMcpTools.map(({ name }) => name));
 						if (missing.length) throw new Error(`Selected built-in MCP tools did not register in the child session: ${missing.join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.`);
@@ -728,7 +750,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						throw error;
 					}
 				})();
-				mcpWaits.set(cancel, ready);
+				mcpWaits.set(cancel, { ready, parent: launch.parentSessionFile });
 				try { await ready; } finally { mcpWaits.delete(cancel); }
 			}
 			if (launch.runtime.structuredOutput) {
@@ -750,12 +772,32 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					throw failure;
 				}
 			}
+			let reportCompleted = false;
+			const assertAcceptsGuidance = (): void => {
+				if (reportCompleted) throw new Error("Child completed its acceptance report; resume it for further guidance.");
+			};
 			const child: ChildSession = {
-				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
+				subscribe: (listener) => session.subscribe((event) => {
+					if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "stop") {
+						const text = event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+						const report = parseAcceptanceReport(text);
+						if (report.report || report.malformed) {
+							reportCompleted = true;
+							session.clearQueue();
+							const rejectQueuedGuidance = (): never => {
+								session.clearQueue();
+								throw new Error("Child completed its acceptance report; resume it for further guidance.");
+							};
+							session.agent.steer = rejectQueuedGuidance;
+							session.agent.followUp = rejectQueuedGuidance;
+						}
+					}
+					listener(event as unknown as ChildSessionEvent);
+				}),
 				prompt: (text) => session.prompt(text),
 				...(commands ? { finishCommands: () => commands.finish() } : {}),
-				steer: async (text) => { await session.steer(text); },
-				followUp: async (text) => { await session.followUp(text); },
+				steer: async (text) => { assertAcceptsGuidance(); await session.steer(text); },
+				followUp: async (text) => { assertAcceptsGuidance(); await session.followUp(text); },
 				abort: () => session.abort(),
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
@@ -777,20 +819,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get virtualModelId() { return session.model?.api === "pi-virtual" ? `${session.model.provider}/${session.model.id}` : undefined; },
 				get contextWindow() { return session.model?.contextWindow; },
 			};
-			live.add(child);
+			live.set(child, launch.parentSessionFile);
 			return child;
 		},
 		async dispose() {
-			disposals += 1;
-			for (const cancel of mcpWaits.keys()) cancel.abort();
-			const children = [...live].filter((child) => !child.detached);
-			for (const child of children) child.shutDown = true;
-			await Promise.allSettled(children.map((child) => child.abort()));
-			for (const child of children) {
-				try { void child.dispose(); } catch { /* best effort */ }
-			}
-			await Promise.allSettled([...shutdowns, ...mcpWaits.values()]);
-			if (live.size === 0) runtime = undefined;
+			globalDisposals += 1;
+			await disposeMatching(() => true);
+		},
+		async disposeForParent(parentSessionFile) {
+			parentDisposals.set(parentSessionFile, parentDisposalEpoch(parentSessionFile) + 1);
+			await disposeMatching((parent) => parent === parentSessionFile);
 		},
 	};
 }
@@ -809,7 +847,8 @@ function createLazyPlacementFactory(local: ChildSessionFactory): ChildSessionFac
 	const factory = async () => placed ??= (await import("./herdr-placed-run.ts")).createPlacementAwareChildSessionFactory(local);
 	return {
 		async create(launch) { return launch.machine ? (await factory()).create(launch) : local.create(launch); },
-		async dispose() { if (placed) await placed.dispose(); else await local.dispose(); },
+		async dispose() { await (placed ?? local).dispose(); },
+		async disposeForParent(parentSessionFile) { await (placed ?? local).disposeForParent(parentSessionFile); },
 	};
 }
 
@@ -839,9 +878,6 @@ export function setChildSessionFactoryModule(modulePath: string | undefined): vo
 	activeFactoryModule = modulePath;
 }
 
-/** Abort and dispose every live in-process child and release the shared runtime. */
-export async function disposeChildSessions(): Promise<void> {
-	const factory = activeFactory;
-	if (!factory) return;
-	await factory.dispose();
+export async function disposeChildSessionsForParent(parentSessionFile: string | undefined): Promise<void> {
+	await activeFactory?.disposeForParent(parentSessionFile);
 }

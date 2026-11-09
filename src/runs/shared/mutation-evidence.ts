@@ -1,8 +1,9 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import type { ArtifactPaths, TimeoutRecoveryProjection, TimeoutRecoverySummary, TrackedMutationEvidence, TrackedMutationFingerprint, TrackedMutationSnapshot } from "../../shared/types.ts";
 
 const MAX_TRACKED_PATHS = 500;
@@ -23,6 +24,33 @@ function remainingTime(deadlineAt?: number): number | undefined {
 
 function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES, deadlineAt?: number): string {
 	return execFileSync("git", gitArguments(args), { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], maxBuffer, timeout: remainingTime(deadlineAt), windowsHide: true });
+}
+
+const execFileAsync = promisify(execFile);
+
+/** The collection path runs while sibling children settle, so git runs off the event loop. */
+async function gitOutputAsync(cwd: string, args: string[], deadlineAt?: number): Promise<string> {
+	return (await execFileAsync("git", gitArguments(args), { cwd, encoding: "utf-8", maxBuffer: MAX_HASH_BYTES, timeout: remainingTime(deadlineAt), windowsHide: true })).stdout;
+}
+
+/** Yields to the event loop every 2 MiB so hashing a large diff does not stall other work. */
+async function hashFileAsync(diffPath: string, deadlineAt?: number): Promise<string> {
+	const hash = createHash("sha256");
+	const fd = fs.openSync(diffPath, "r");
+	try {
+		const buffer = Buffer.alloc(64 * 1024);
+		let chunks = 0;
+		for (;;) {
+			remainingTime(deadlineAt);
+			const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			hash.update(bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead));
+			if (++chunks % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	return hash.digest("hex");
 }
 
 function splitNul(output: string): string[] {
@@ -53,8 +81,10 @@ function hashLargeDiff(cwd: string, relativePath: string, deadlineAt?: number): 
 	}
 }
 
-function listChangedTrackedFiles(cwd: string, deadlineAt?: number): { paths: string[]; truncated: boolean } {
-	const paths = splitNul(gitOutput(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "HEAD", "--"], MAX_HASH_BYTES, deadlineAt));
+const CHANGED_FILES_ARGS = ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "HEAD", "--"];
+
+function changedTrackedFiles(nameOnlyOutput: string): { paths: string[]; truncated: boolean } {
+	const paths = splitNul(nameOnlyOutput);
 	return { paths: paths.slice(0, MAX_TRACKED_PATHS), truncated: paths.length > MAX_TRACKED_PATHS };
 }
 
@@ -75,7 +105,7 @@ function sameFingerprint(left: TrackedMutationFingerprint | undefined, right: Tr
 
 export function snapshotTrackedMutations(cwd: string, deadlineAt?: number): TrackedMutationSnapshot {
 	try {
-		const changed = listChangedTrackedFiles(cwd, deadlineAt);
+		const changed = changedTrackedFiles(gitOutput(cwd, CHANGED_FILES_ARGS, MAX_HASH_BYTES, deadlineAt));
 		const fingerprints: Record<string, TrackedMutationFingerprint> = {};
 		for (const file of changed.paths) fingerprints[file] = fingerprintPath(cwd, file, deadlineAt);
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: changed.paths, fingerprints, truncated: changed.truncated };
@@ -84,12 +114,29 @@ export function snapshotTrackedMutations(cwd: string, deadlineAt?: number): Trac
 	}
 }
 
-export function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot, cwd = snapshot.cwd, deadlineAt?: number): TrackedMutationEvidence {
+async function fingerprintPathAsync(cwd: string, relativePath: string, deadlineAt?: number): Promise<TrackedMutationFingerprint> {
+	try {
+		const diff = await gitOutputAsync(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--", relativePath], deadlineAt);
+		return { kind: "diff", digest: createHash("sha256").update(diff).digest("hex") };
+	} catch (error) {
+		if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw error;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mutation-evidence-"));
+		try {
+			const diffPath = path.join(tempDir, "diff.bin");
+			await gitOutputAsync(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath], deadlineAt);
+			return { kind: "diff", digest: await hashFileAsync(diffPath, deadlineAt) };
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	}
+}
+
+export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot, cwd = snapshot.cwd, deadlineAt?: number): Promise<TrackedMutationEvidence> {
 	if (snapshot.unavailable) {
 		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: snapshot.unavailable };
 	}
 	try {
-		const current = listChangedTrackedFiles(cwd, deadlineAt);
+		const current = changedTrackedFiles(await gitOutputAsync(cwd, CHANGED_FILES_ARGS, deadlineAt));
 		const startDirty = new Set(snapshot.dirtyFiles);
 		const candidates = new Set([...snapshot.dirtyFiles, ...current.paths]);
 		const changedFiles: string[] = [];
@@ -98,7 +145,7 @@ export function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot
 				if (!snapshot.truncated) changedFiles.push(file);
 				continue;
 			}
-			if (!sameFingerprint(snapshot.fingerprints[file], fingerprintPath(cwd, file, deadlineAt))) changedFiles.push(file);
+			if (!sameFingerprint(snapshot.fingerprints[file], await fingerprintPathAsync(cwd, file, deadlineAt))) changedFiles.push(file);
 		}
 		changedFiles.sort();
 		return {

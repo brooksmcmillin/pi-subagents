@@ -31,7 +31,7 @@ function writeUserAgent(home: string, name: string, body: string): void {
 }
 
 function modelsText(cwd: string, agent: string): string {
-	const result = handleManagementAction("models", { agent }, { cwd, modelRegistry: { getAvailable: () => [] } });
+	const result = handleManagementAction("models", { agent }, { cwd, modelRegistry: { getAvailable: () => [], getAll: () => [] } });
 	const first = result.content[0];
 	assert.ok(first?.type === "text");
 	return first.text.replaceAll("\\", "/");
@@ -696,9 +696,7 @@ describe("builtin agent overrides", () => {
 		// file with no model/thinking in frontmatter) that gets its
 		// model pin exclusively from a *user*-scope agentOverrides entry must keep
 		// that pin when a *project*-scope override adds an unrelated field (here:
-		// subagentOnlyExtensions). Previously the project override for this agent
-		// name replaced the user override wholesale, silently dropping model /
-		// thinking with no error.
+		// subagentOnlyExtensions).
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
@@ -731,14 +729,6 @@ describe("builtin agent overrides", () => {
 	});
 
 	it("lets a project override flip `disabled` on a custom agent even after a user override already set it", () => {
-		// Regression test for a bug caught in review of the layering fix above:
-		// applyCustomAgentOverride's `disabled` handling used a stray
-		// `agent.disabled === undefined` guard (a no-op before layering existed,
-		// since this function only ever ran once against the pristine base
-		// agent). Once user-then-project layering was introduced, that guard
-		// silently blocked the project override from ever changing `disabled`
-		// once the user override had already set it — breaking this PR's own
-		// "project wins" precedence for that one field. Cover both directions.
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
