@@ -74,6 +74,21 @@ function invalid(reason: string): { ok: false; reason: string } {
 	return { ok: false, reason };
 }
 
+function gitSubcommandIndex(args: string[]): number {
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "-C") {
+			if (args[index + 1] === undefined) return -1;
+			index++;
+		} else if (arg === "--no-pager" || arg === "--no-optional-locks") {
+			continue;
+		} else {
+			return arg.startsWith("-") ? -1 : index;
+		}
+	}
+	return -1;
+}
+
 function hasBlockedGhArgument(args: string[]): boolean {
 	return args.some((arg) => GH_BLOCKED_FLAGS.has(arg)
 		|| /^(?:-X|-f|-F|-R)/.test(arg)
@@ -97,7 +112,11 @@ export function validateInspectionCommand({ program, args }: InspectionParams): 
 		})) {
 			return invalid("Git options that can alter configuration, write output, or execute external commands are not available in the inspection shell.");
 		}
-		const subcommand = args.find((arg) => !arg.startsWith("-"));
+		const subcommandIndex = gitSubcommandIndex(args);
+		if (subcommandIndex < 0) {
+			return invalid("Expected a Git subcommand after supported global options: -C <directory>, --no-pager, --no-optional-locks.");
+		}
+		const subcommand = args[subcommandIndex];
 		if (!subcommand || !SAFE_GIT_SUBCOMMANDS.has(subcommand)) {
 			return invalid(`Git subcommand '${subcommand ?? ""}' is not allowlisted for read-only inspection.`);
 		}
@@ -125,7 +144,7 @@ export function validateInspectionCommand({ program, args }: InspectionParams): 
 
 export function buildInspectionArgs(program: "git" | "gh", args: string[]): string[] {
 	if (program === "gh") return args;
-	const subcommandIndex = args.findIndex((arg) => !arg.startsWith("-"));
+	const subcommandIndex = gitSubcommandIndex(args);
 	const gitArgs = NO_TEXTCONV_GIT_SUBCOMMANDS.has(args[subcommandIndex] ?? "")
 		? [...args.slice(0, subcommandIndex + 1), "--no-textconv", ...args.slice(subcommandIndex + 1)]
 		: args;
