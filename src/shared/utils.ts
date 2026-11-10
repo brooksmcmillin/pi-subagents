@@ -485,12 +485,11 @@ export function hasEmptyTerminalAssistantResponse(messages: Message[]): boolean 
 			|| (messages.at(-1) === lastAssistant
 				&& lastAssistant.stopReason === "stop"
 				&& !lastAssistant.errorMessage
-				&& lastAssistant.content.length > 0
 				// Token accounting can be nonzero even when no response text was emitted.
-				&& lastAssistant.content.every((part) => part.type === "text" && part.text === "")));
+				&& lastAssistant.content.every((part) => part.type === "text" && !part.text.trim())));
 }
 
-export function formatEmptyTerminalAssistantResponseError(messages: Message[]): string {
+export function formatEmptyTerminalAssistantResponseError(messages: Message[], outputPath?: string): string {
 	const lastAssistant = messages.findLast((message) => message.role === "assistant");
 	const errorMessage = lastAssistant && "errorMessage" in lastAssistant && typeof lastAssistant.errorMessage === "string" && lastAssistant.errorMessage.trim()
 		? lastAssistant.errorMessage.trim()
@@ -499,9 +498,15 @@ export function formatEmptyTerminalAssistantResponseError(messages: Message[]): 
 	const stopReason = lastAssistant && "stopReason" in lastAssistant && typeof lastAssistant.stopReason === "string" && lastAssistant.stopReason.trim()
 		? lastAssistant.stopReason.trim()
 		: undefined;
-	return stopReason && stopReason !== "stop"
-		? `Subagent produced no output after terminal assistant stopReason "${stopReason}".`
-		: "Subagent produced no output (possible model cold-start or empty response).";
+	if (stopReason && stopReason !== "stop") return `Subagent produced no output after terminal assistant stopReason "${stopReason}".`;
+	const turns = messages.filter((message) => message.role === "assistant").length;
+	const tools = messages.filter((message) => message.role === "toolResult").length;
+	const execution = turns || tools
+		? `Subagent ended without final response text after ${turns} assistant turns and ${tools} tool results.`
+		: "Subagent ended without an assistant response or tool results.";
+	return outputPath
+		? `${execution} No verified child-authored report at ${outputPath}. Inspect the transcript and designated artifact before retrying; file existence alone does not prove completion.`
+		: execution;
 }
 
 /**

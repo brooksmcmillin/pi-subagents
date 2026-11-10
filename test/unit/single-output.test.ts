@@ -16,6 +16,7 @@ import {
 	resolveSingleOutput,
 	resolveSingleOutputPath,
 	validateFileOnlyOutputMode,
+	verifiedChildWrittenOutput,
 } from "../../src/runs/shared/single-output.ts";
 import { serializeStructuredOutput } from "../../src/runs/shared/structured-output.ts";
 
@@ -257,6 +258,27 @@ describe("extractChildWrittenOutput", () => {
 		toolCall(id, "write", { path: writePath, content }),
 		toolResult(id),
 	];
+
+	for (const scenario of ["valid", "missing", "empty", "stale", "mismatch", "other-path", "failed-write", "symlink", "claim-mismatch"] as const) {
+		it(`verifies ${scenario} authored report evidence`, () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "verified-output-"));
+			tempDirs.push(dir);
+			const outputPath = path.join(dir, "report.md");
+			const content = scenario === "empty" ? " " : "review report";
+			if (scenario === "stale") fs.writeFileSync(outputPath, content);
+			const before = captureSingleOutputSnapshot(outputPath);
+			if (scenario === "symlink") {
+				fs.writeFileSync(path.join(dir, "other.md"), content);
+				fs.symlinkSync(path.join(dir, "other.md"), outputPath);
+			} else if (scenario !== "missing" && scenario !== "stale") {
+				fs.writeFileSync(outputPath, scenario === "mismatch" ? "sibling output" : content);
+			}
+			const messages = completedWrite("w1", scenario === "other-path" ? path.join(dir, "elsewhere.md") : outputPath, content);
+			if (scenario === "failed-write") messages[1] = toolResult("w1", true);
+			assert.equal(verifiedChildWrittenOutput(messages, outputPath, before, dir,
+				scenario === "claim-mismatch" ? path.join(dir, "wrong.md") : undefined), scenario === "valid" ? content : undefined);
+		});
+	}
 
 	it("returns the last successfully written content for the configured path", () => {
 		const messages = [

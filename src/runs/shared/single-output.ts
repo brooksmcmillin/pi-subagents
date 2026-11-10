@@ -72,6 +72,36 @@ export function extractChildWrittenOutput(
 	return content;
 }
 
+/** Empty final text is complete only when this child authored the exact, fresh artifact. */
+export function verifiedChildWrittenOutput(
+	messages: Message[],
+	outputPath: string | undefined,
+	beforeRun: SingleOutputSnapshot | undefined,
+	cwd: string,
+	expectedClaimPath?: string,
+): string | undefined {
+	if (!outputPath || !beforeRun || beforeRun.error) return undefined;
+	const content = extractChildWrittenOutput(messages, outputPath, cwd);
+	if (!content?.trim() || Buffer.byteLength(content, "utf8") > MAX_FULL_OUTPUT_FILE_BYTES) return undefined;
+	let fd: number | undefined;
+	try {
+		if (outputClaimError(outputPath, expectedClaimPath)) return undefined;
+		fd = fs.openSync(outputPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > MAX_FULL_OUTPUT_FILE_BYTES
+			|| (beforeRun.exists && stat.mtimeMs === beforeRun.mtimeMs && stat.size === beforeRun.size)) return undefined;
+		const expected = Buffer.from(content, "utf8");
+		if (stat.size !== expected.length) return undefined;
+		const actual = Buffer.alloc(expected.length + 1);
+		const bytes = fs.readSync(fd, actual, 0, actual.length, 0);
+		return bytes === expected.length && actual.subarray(0, bytes).equals(expected) ? content : undefined;
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
 export function normalizeSingleOutputOverride(
 	output: string | boolean | undefined,
 	defaultOutput: string | undefined,
@@ -124,7 +154,12 @@ export function injectSingleOutputInstruction(task: string, outputPath: string |
 	if (!outputPath) return task;
 	const remote = machine !== undefined && !isRexLocalMachine(machine);
 	const delivery = !remote && (!capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools))
-		? `Write your findings to exactly this path: ${outputPath}`
+		? [
+			`Write your findings to exactly this path: ${outputPath}`,
+			!capabilities?.tools || capabilities.tools.includes("write")
+				? "Use the write tool for this artifact so the runtime can verify authorship even if your final response is empty."
+				: "After saving the artifact, return its complete contents in your final response.",
+		].join("\n")
 		: [
 			"Return the complete artifact in your final response.",
 			`The runtime will persist it to exactly this path: ${outputPath}`,
