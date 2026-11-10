@@ -70,7 +70,7 @@ import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, formatInheritedProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
 import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
-import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, isSettlementFatalOutputError, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, isSettlementFatalOutputError, resolveSingleOutput, validateFileOnlyOutputMode, verifiedChildWrittenOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	formatSubagentModelVerificationError,
 	formatModelConfigurationSource,
@@ -1592,20 +1592,24 @@ async function runSingleAttempt(
 			result.structuredOutputFailed = true;
 		}
 	}
+	let authoredReport: string | undefined;
 	if (result.exitCode === 0 && !result.error) {
 		const messages = result.messages ?? [];
-		const finalText = getFinalOutput(messages);
+		if (!options.structuredOutput && getTerminalAssistantStopReason(messages) === "stop" && hasEmptyTerminalAssistantResponse(messages)) {
+			authoredReport = verifiedChildWrittenOutput(messages, options.outputPath, shared.outputSnapshot, options.cwd ?? runtimeCwd, options.outputClaimPath);
+		}
+		const finalText = authoredReport ?? getFinalOutput(messages);
 		const errorMessages = validatedStructuredOutput
 			? messages.slice(structuredOutputMessageStartIndex ?? messages.length)
 			: messages;
 		const errInfo = detectSubagentError(errorMessages);
 		const missingOutput = !finalText?.trim() && !validatedStructuredOutput;
-		const terminalEmptyAfterUsefulWork = !validatedStructuredOutput
+		const terminalEmptyAfterUsefulWork = !validatedStructuredOutput && authoredReport === undefined
 			&& hasEmptyTerminalAssistantResponse(messages)
 			&& (progress.toolCount > 0 || Boolean(finalText?.trim()));
 		if ((missingOutput || terminalEmptyAfterUsefulWork) && (!errInfo.hasError || hasEmptyTerminalAssistantResponse(messages))) {
 			result.exitCode = 1;
-			result.error = formatEmptyTerminalAssistantResponseError(messages);
+			result.error = formatEmptyTerminalAssistantResponseError(messages, options.outputPath);
 		} else if (errInfo.hasError) {
 			result.exitCode = errInfo.exitCode ?? 1;
 			result.error = errInfo.details
@@ -1637,7 +1641,7 @@ async function runSingleAttempt(
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	const structuredText = result.structuredOutput === undefined ? undefined : JSON.stringify(result.structuredOutput, null, 2);
-	let fullOutput = stripAcceptanceReport(acceptanceOutput);
+	let fullOutput = stripAcceptanceReport(authoredReport ?? acceptanceOutput);
 	if (!fullOutput.trim() && structuredText !== undefined) fullOutput = structuredText;
 	// Text still streaming when the child timed out or its session threw never reached
 	// a completed message. Keep it, labeled; the run still fails and the text never
@@ -1678,12 +1682,12 @@ async function runSingleAttempt(
 	if (options.outputPath && result.exitCode === 0) {
 		const outputForPersistence = validatedStructuredOutput
 			? serializeStructuredOutput(result.structuredOutput)
-			: fullOutput;
+			: authoredReport ?? fullOutput;
 		const resolvedOutput = resolveSingleOutput(
 			options.outputPath,
 			outputForPersistence,
 			shared.outputSnapshot,
-			{ authoritative: validatedStructuredOutput, expectedClaimPath: options.outputClaimPath, immutable: options.outputMode === "file-only" },
+			{ authoritative: validatedStructuredOutput || authoredReport !== undefined, expectedClaimPath: options.outputClaimPath, immutable: options.outputMode === "file-only" },
 		);
 		fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 		result.savedOutputPath = resolvedOutput.savedPath;
@@ -1700,7 +1704,7 @@ async function runSingleAttempt(
 			progress.error = result.error;
 		}
 		if (resolvedOutput.savedPath) {
-			result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
+			result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, authoredReport ?? fullOutput);
 			if (result.outputState === "absent") result.outputState = "unknown";
 		}
 	}

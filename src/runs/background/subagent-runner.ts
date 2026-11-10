@@ -17,7 +17,7 @@ import { closeSteerInbox, closeStopInbox, consumeInterruptRequest, consumeSteerR
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths, writeArtifact, writeMetadata } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
-import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectSingleOutputInstruction, isSettlementFatalOutputError, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectSingleOutputInstruction, isSettlementFatalOutputError, resolveSingleOutput, verifiedChildWrittenOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import { timedOutRunSummary } from "../shared/partial-output.ts";
 import { runSetupCommand } from "../shared/worktree-setup-command.ts";
 import {
@@ -1079,6 +1079,7 @@ export async function runSingleStepInner(
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunChildSessionResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
+	let finalAuthoredReport: string | undefined;
 	let structuredAcceptanceReport: unknown;
 	let structuredAcceptanceReportError: string | undefined;
 	let toolBudget = step.toolBudget ? initialToolBudgetState(step.toolBudget) : undefined;
@@ -1293,6 +1294,10 @@ export async function runSingleStepInner(
 		const hiddenError = terminalDiagnosticsEligible && run.exitCode === 0 && !run.error && !toolAvailabilityError && !structuredError && !midToolExitError
 			? detectSubagentError(errorMessages)
 			: null;
+		const authoredReport = terminalDiagnosticsEligible && run.exitCode === 0 && !run.error && !effectiveStructuredOutput
+			&& getTerminalAssistantStopReason(run.messages) === "stop" && hasEmptyTerminalAssistantResponse(run.messages)
+			? verifiedChildWrittenOutput(run.messages, step.outputPath, outputSnapshot, step.cwd ?? ctx.cwd, step.outputClaimPath)
+			: undefined;
 		const terminalEmptyAfterUsefulWork = !validatedStructuredOutput
 			&& hasEmptyTerminalAssistantResponse(run.messages)
 			&& (run.toolCount > 0 || Boolean(run.finalOutput.trim()));
@@ -1301,9 +1306,10 @@ export async function runSingleStepInner(
 			&& !toolAvailabilityError
 			&& !structuredError
 			&& !validatedStructuredOutput
+			&& authoredReport === undefined
 			&& (!run.finalOutput.trim() || terminalEmptyAfterUsefulWork)
 			&& (!hiddenError?.hasError || hasEmptyTerminalAssistantResponse(run.messages))
-			? formatEmptyTerminalAssistantResponseError(run.messages)
+			? formatEmptyTerminalAssistantResponseError(run.messages, step.outputPath)
 			: undefined;
 		const truncatedResponseError = terminalDiagnosticsEligible && run.exitCode === 0 && !run.error && !toolAvailabilityError && !structuredError && !midToolExitError
 			&& !emptyOutputError
@@ -1347,6 +1353,7 @@ export async function runSingleStepInner(
 				: undefined);
 		const error = underlyingError ?? missingRequiredOutputError;
 		finalOutputSnapshot = outputSnapshot;
+		finalAuthoredReport = authoredReport;
 		if (step.toolBudget) {
 			const toolMessages = run.messages.filter((message) => message.role === "toolResult");
 			const blockedMessage = toolMessages.find((message) => extractTextFromContent(message.content).includes("Tool budget hard limit reached"));
@@ -1397,10 +1404,10 @@ export async function runSingleStepInner(
 	const validatedStructuredOutput = finalResult?.structuredOutput !== undefined;
 	const outputForPersistence = validatedStructuredOutput
 		? serializeStructuredOutput(finalResult?.structuredOutput)
-		: stripAcceptanceReport(rawOutput);
+		: finalAuthoredReport ?? stripAcceptanceReport(rawOutput);
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
 		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, {
-			authoritative: validatedStructuredOutput,
+			authoritative: validatedStructuredOutput || finalAuthoredReport !== undefined,
 			expectedClaimPath: step.outputClaimPath,
 			immutable: step.outputMode === "file-only",
 		})
@@ -1413,7 +1420,7 @@ export async function runSingleStepInner(
 		finalResult.error = finalResult.error ? `${finalResult.error}\n${resolvedOutput.saveError}` : resolvedOutput.saveError;
 	}
 	const output = stripAcceptanceReport(resolvedOutput.fullOutput);
-	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
+	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, finalAuthoredReport ?? output) : undefined;
 	let outputForSummary = output;
 	if (finalResult?.stopped && !outputForSummary.trim()) {
 		outputForSummary = ctx.stopMessage ?? SUBAGENT_STOPPED_MESSAGE;

@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Message } from "@earendil-works/pi-ai";
-import { getFinalOutput } from "../../src/shared/utils.ts";
+import { formatEmptyTerminalAssistantResponseError, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../src/shared/utils.ts";
 
 function assistantContent(content: unknown[]): Message {
 	return { role: "assistant", content } as unknown as Message;
 }
+
+describe("empty terminal diagnostics", () => {
+	it("distinguishes no observed execution from completed model and tool turns", () => {
+		assert.equal(formatEmptyTerminalAssistantResponseError([]), "Subagent ended without an assistant response or tool results.");
+		const messages = [assistantContent([]), { role: "toolResult", toolName: "write" } as Message];
+		assert.match(formatEmptyTerminalAssistantResponseError(messages, "/report.md"), /1 assistant turns and 1 tool results.*No verified child-authored report at \/report.md/);
+		assert.doesNotMatch(formatEmptyTerminalAssistantResponseError(messages), /cold-start/);
+	});
+	for (const content of [[], [{ type: "text", text: "" }], [{ type: "text", text: " \n" }]]) {
+		it(`recognizes empty normal completion with nonzero usage: ${JSON.stringify(content)}`, () => {
+			const message = { ...assistantContent(content), stopReason: "stop", usage: { output: 4 } } as Message;
+			assert.equal(hasEmptyTerminalAssistantResponse([message]), true);
+		});
+	}
+});
 
 describe("getFinalOutput", () => {
 	it("uses the last non-empty text part in the latest assistant message", () => {

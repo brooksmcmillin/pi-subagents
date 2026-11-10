@@ -1704,6 +1704,37 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		}
 	});
 
+	for (const scenario of ["valid", "valid-file-only", "missing", "empty", "stale", "mismatched", "unattributed", "aborted"] as const) {
+		it(`verifies ${scenario} foreground artifact before accepting an empty final response`, async () => {
+			const outputPath = path.join(tempDir, "review.md");
+			const valid = scenario.startsWith("valid");
+			const content = scenario === "empty" ? " \n" : "No overlap. Reviewed pinned subject."
+				+ (scenario === "valid-file-only" ? '\n```acceptance-report\n{}\n```' : "");
+			if (scenario === "stale") fs.writeFileSync(outputPath, content);
+			mockPi.onCall({
+				writeFiles: scenario === "missing" || scenario === "stale" ? [] : [{ path: outputPath, content: scenario === "mismatched" ? "another run" : content }],
+				stdoutRaw: [
+					...(scenario === "unattributed" ? [] : events.completedWrite(outputPath, content)),
+					...(scenario === "aborted" ? [{ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }] : [events.assistantMessage("")]),
+				].map((event) => JSON.stringify(event)).join("\n"),
+			});
+			const result = await runSync(tempDir, [makeAgent("reviewer")], "reviewer", "Review the pinned subject", {
+				runId: `artifact-${scenario}`, outputPath,
+				...(scenario === "valid-file-only" ? { outputMode: "file-only" as const } : {}),
+			});
+			assert.equal(result.exitCode, valid ? 0 : 1, result.error ?? scenario);
+			if (valid) {
+				assert.equal(result.savedOutputPath, outputPath);
+				assert.match(result.finalOutput ?? "", scenario === "valid-file-only" ? /Output saved to:/ : /No overlap/);
+				assert.equal(result.outputReference?.bytes, Buffer.byteLength(content));
+				assert.equal(fs.readFileSync(outputPath, "utf8"), content);
+			} else if (scenario !== "aborted") {
+				assert.match(result.error ?? "", /No verified child-authored report/);
+				assert.doesNotMatch(result.error ?? "", /cold-start/);
+			}
+		});
+	}
+
 	it("preserves terminal empty-output diagnostics after useful foreground work", async () => {
 		const partialOutput = "I’ll inspect the retained candidate before changing it.";
 		mockPi.onCall({

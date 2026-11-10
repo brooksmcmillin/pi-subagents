@@ -975,6 +975,42 @@ setTimeout(() => process.exit(90), 15000).unref();
 		}
 	});
 
+	for (const scenario of ["valid", "valid-file-only", "missing", "empty", "stale", "mismatched", "unattributed", "aborted"] as const) {
+		it(`verifies ${scenario} background artifact before accepting an empty final response`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const outputPath = path.join(tempDir, "review.md");
+			const valid = scenario.startsWith("valid");
+			const content = scenario === "empty" ? " \n" : "No overlap. Reviewed pinned subject."
+				+ (scenario === "valid-file-only" ? '\n```acceptance-report\n{}\n```' : "");
+			if (scenario === "stale") fs.writeFileSync(outputPath, content);
+			mockPi.onCall({
+				writeFiles: scenario === "missing" || scenario === "stale" ? [] : [{ path: outputPath, content: scenario === "mismatched" ? "another run" : content }],
+				stdoutRaw: [
+					...(scenario === "unattributed" ? [] : events.completedWrite(outputPath, content)),
+					...(scenario === "aborted" ? [{ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }] : [events.assistantMessage("")]),
+				].map((event) => JSON.stringify(event)).join("\n"),
+			});
+			const id = `async-artifact-${scenario}-${Date.now().toString(36)}`;
+			executeAsyncSingle(id, {
+				agent: "reviewer", task: "Review the pinned subject", agentConfig: makeAgent("reviewer"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), output: outputPath, maxSubagentDepth: 2,
+				...(scenario === "valid-file-only" ? { outputMode: "file-only" as const } : {}),
+			});
+			const resultPath = await waitForAsyncResultFile(id);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload;
+			assert.equal(payload.success, valid, payload.results[0]?.error ?? scenario);
+			if (valid) {
+				assert.match(payload.results[0]?.output ?? "", scenario === "valid-file-only" ? /Output saved to:/ : /No overlap/);
+				assert.ok(payload.results[0]?.output?.includes(`(${Buffer.byteLength(content)} B,`));
+				assert.equal(fs.readFileSync(outputPath, "utf8"), content);
+			} else if (scenario !== "aborted") {
+				assert.match(payload.results[0]?.error ?? "", /No verified child-authored report/);
+				assert.doesNotMatch(payload.results[0]?.error ?? "", /cold-start/);
+			}
+		});
+	}
+
 	it("preserves terminal empty-output diagnostics after useful child work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const partialOutput = "I’ll inspect the retained candidate before changing it.";
 		const outputPath = path.join(tempDir, "missing-aborted-report.md");
