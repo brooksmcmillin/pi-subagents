@@ -312,7 +312,7 @@ syncBuiltinESMExports();
 				} else {
 					const expected = {
 						hidden: /bash failed/,
-						empty: /empty|no.*output/i,
+						empty: /Subagent ended without an assistant response or tool results\./,
 						structured: /structured_output/,
 						file: /Required file-only output was not produced/,
 					};
@@ -965,16 +965,19 @@ syncBuiltinESMExports();
 	});
 
 	it("keeps a parallel sibling's per-tool timeout armed when the run deadline is closer but a supervisor wait pauses it", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		const id = `async-supervisor-wait-tool-timeout-${Date.now().toString(36)}`;
+		const startTool = path.join(tempDir, `${id}-start-tool`);
+		const releaseSupervisor = path.join(tempDir, `${id}-release-supervisor`);
 		mockPi.onCall({ matchArgIncludes: "Ask the supervisor", steps: [
-			{ delay: 300, jsonl: [{ ...events.toolStart("contact_supervisor", { reason: "need_decision", message: "Question" }), toolCallId: "ask-1" }] },
-			{ delay: 3_000, jsonl: [{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" }, events.assistantMessage("asker done"), { type: "agent_end", willRetry: false }, { type: "agent_settled" }] },
+			{ jsonl: [{ ...events.toolStart("contact_supervisor", { reason: "need_decision", message: "Question" }), toolCallId: "ask-1" }] },
+			{ waitForPath: releaseSupervisor, jsonl: [{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" }, events.assistantMessage("asker done"), { type: "agent_end", willRetry: false }, { type: "agent_settled" }] },
 		] });
 		mockPi.onCall({ matchArgIncludes: "Run a wedged tool", steps: [
-			{ delay: 400, jsonl: [{ ...events.toolStart("bash"), toolCallId: "bash-1" }] },
-			{ delay: 6_000 },
+			{ waitForPath: startTool, jsonl: [{ ...events.toolStart("bash"), toolCallId: "bash-1" }] },
+			{ waitForPath: path.join(tempDir, `${id}-never-release`) },
 		] });
-		const id = `async-supervisor-wait-tool-timeout-${Date.now().toString(36)}`;
-		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1500";
+		// Leave startup headroom while keeping the run budget shorter than the tool timeout.
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "6000";
 		try {
 			executeAsyncChain(id, {
 				chain: [{ parallel: [{ agent: "one", task: "Ask the supervisor" }, { agent: "two", task: "Run a wedged tool" }] }],
@@ -983,11 +986,17 @@ syncBuiltinESMExports();
 				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
 				maxSubagentDepth: 2,
-				timeoutMs: 2_000,
+				timeoutMs: 5_000,
 			});
+			await waitForAsyncState(id, (status) => status.steps?.[0]?.currentTool === "contact_supervisor");
+			fs.writeFileSync(startTool, "");
+			await waitForAsyncState(id, (status) => status.steps?.[1]?.status === "failed");
+			fs.writeFileSync(releaseSupervisor, "");
 			const payload = await readAsyncPayload(id);
-			assert.equal(payload.results[1]?.error, "Tool 'bash' exceeded its timeout of 1500ms.", JSON.stringify(payload.results.map((result) => result.error)));
+			assert.equal(payload.results[0]?.success, true, JSON.stringify(payload.results[0]));
+			assert.equal(payload.results[1]?.error, "Tool 'bash' exceeded its timeout of 6000ms.", JSON.stringify(payload.results.map((result) => result.error)));
 		} finally {
+			fs.writeFileSync(releaseSupervisor, "");
 			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
 		}
 	});

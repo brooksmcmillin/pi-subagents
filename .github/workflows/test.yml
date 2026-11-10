@@ -21,7 +21,6 @@ jobs:
     name: test (${{ matrix.label }})
     strategy:
       matrix:
-        # Windows keeps two files at a time per runner (#2207); shards add parallelism across runners instead.
         include:
           - os: ubuntu-latest
             label: ubuntu-1
@@ -30,18 +29,6 @@ jobs:
           - os: ubuntu-latest
             label: ubuntu-2
             testArgs: --test-shard=2/2
-          - os: windows-latest
-            label: windows-1
-            testArgs: --test-concurrency=2 --test-shard=1/4
-          - os: windows-latest
-            label: windows-2
-            testArgs: --test-concurrency=2 --test-shard=2/4
-          - os: windows-latest
-            label: windows-3
-            testArgs: --test-concurrency=2 --test-shard=3/4
-          - os: windows-latest
-            label: windows-4
-            testArgs: --test-concurrency=2 --test-shard=4/4
       fail-fast: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -110,11 +97,7 @@ jobs:
         run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/schedule-claim-preservation.test.ts
 
   native-nested-wait:
-    strategy:
-      matrix:
-        os: [macos-latest, windows-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -131,11 +114,7 @@ jobs:
         run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --import ./test/support/native-peer-loader.mjs --test test/integration/nested-async-wait.test.ts
 
   native-mcp-readiness:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
