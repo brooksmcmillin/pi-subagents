@@ -103,6 +103,7 @@ export interface BuildInProcessChildLaunchInput {
 	nestedRoute?: { rootRunId: string; eventSink: string; controlInbox: string; capabilityToken: string };
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	structuredOutput?: StructuredOutputRuntime;
+	readOnlyReview?: boolean;
 	fileHandoffPath?: string;
 	fast?: boolean;
 	toolBudget?: ResolvedToolBudget;
@@ -262,6 +263,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	const structuredTerminalState = { captured: false };
 
 	const config: ChildRuntimeConfig = {
+		...(input.readOnlyReview && input.structuredOutput ? { retainReportCorrection: true } : {}),
 		cwd: input.cwd,
 		...(input.runId ? { runId: input.runId } : {}),
 		agent: input.childAgentName,

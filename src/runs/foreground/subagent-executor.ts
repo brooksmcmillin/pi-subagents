@@ -30,6 +30,7 @@ import { readReplyWorkflowScript } from "../../extension/reply-workflow-script.t
 import { disabledFeatureNotice, disabledFeatureSectionNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
 import { runSync } from "./execution.ts";
 import { commandAction } from "./command-action.ts";
+import { correctRetainedReport } from "../shared/report-correction.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { applyWatchdogLaunchRules } from "../../watchdog/rules.ts";
@@ -234,7 +235,7 @@ import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { editDistance, hasSingleAdjacentTransposition } from "../../shared/edit-distance.ts";
 import { waitToolName } from "../../shared/wait-tool-name.ts";
 
-const MUTATING_MANAGEMENT_ACTIONS = new Set(["command.yield", "command.cancel", "create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "watchdog.configure", "mission.create", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "inspector.open", "inspector.close", "project.open", "project.close", "worktree.discard", "worktree.cleanup", "lane.recordMerge", "lane.recordSupersession", "refine", "refine.rollback", "dismiss", "schedule.create", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"]);
+const MUTATING_MANAGEMENT_ACTIONS = new Set(["report.correct", "command.yield", "command.cancel", "create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "watchdog.configure", "mission.create", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "inspector.open", "inspector.close", "project.open", "project.close", "worktree.discard", "worktree.cleanup", "lane.recordMerge", "lane.recordSupersession", "refine", "refine.rollback", "dismiss", "schedule.create", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"]);
 const DESTRUCTIVE_MANAGEMENT_ACTIONS = new Set(["command.cancel", "delete", "eject", "disable", "reset", "mission.close", "worktree.discard", "refine.rollback", "inspector.close", "project.close", "stop", "interrupt", "schedule.delete"]);
 
 function resolveSteerDeliveryMode(mode: SubagentParamsLike["mode"]): SteerDeliveryMode | undefined {
@@ -7460,6 +7461,30 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					if (foreground) return withBudget(foregroundStatusResult(foreground));
 				}
 				return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: deps.state, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
+			}
+			if (action === "report.correct") {
+				try {
+					if (deps.childRuntime) throw new Error("report.correct is a parent-only retained-review operation.");
+					if (!paramsWithResolvedCwd.id || !paramsWithResolvedCwd.message?.trim()) throw new Error("report.correct requires an exact source run id and a message describing the suspected report error.");
+					if (["agent", "task", "model", "output", "outputSchema", "chain", "worktree"].some((key) => (paramsWithResolvedCwd as Record<string, unknown>)[key] !== undefined)) throw new Error("report.correct does not accept launch, schema, model, output or worktree overrides.");
+					deps.state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+					const resolveSource = () => {
+						const target = resolveRequestedResumeTarget(paramsWithResolvedCwd, deps, ctx.sessionManager.getSessionFile() ?? null);
+						if (target.kind !== "revive" || target.runId !== paramsWithResolvedCwd.id || !target.sessionFile || (target.state !== "complete" && target.state !== "failed")) throw new Error("report.correct requires an exact, terminal retained reviewer, not a live, paused or unknown run.");
+						return target;
+					};
+					const target = resolveSource();
+					const correction = await correctRetainedReport({
+						runId: target.runId, parentSessionId: ctx.sessionManager.getSessionId(), sourceSessionFile: target.sessionFile!,
+						reason: paramsWithResolvedCwd.message, timeoutMs: Math.min(paramsWithResolvedCwd.timeoutMs ?? 120_000, 300_000), signal,
+						parentProviderRegistry: ctx.modelRegistry,
+						requiredExtensions: resolveRequiredChildExtensions(ctx.sessionManager.getSessionId()),
+						assertTerminal: () => { if (resolveSource().sessionFile !== target.sessionFile) throw new Error("Retained review session changed."); },
+					});
+					return { content: [{ type: "text", text: `Corrected report saved separately: ${correction.artifactPath}\nOriginal run ${correction.sourceRunId} and its historical report are unchanged. Consume both reports; formatting alone does not establish a clean review.` }], details: { mode: "management", results: [], reportCorrection: correction } };
+				} catch (error) {
+					return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "management", results: [] } };
+				}
 			}
 			if (action === "resume") {
 				const workflowResumeSourceId = workflowResumeTargetId(DIRS.async, paramsWithResolvedCwd);

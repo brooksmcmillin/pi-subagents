@@ -437,6 +437,7 @@ async function runSingleAttempt(
 		parentSessionFile: options.parentSessionFile,
 		forkCacheKey: options.context === "fork" ? deriveForkPromptCacheKey(options.parentSessionId) : undefined,
 		structuredOutput: options.structuredOutput,
+		readOnlyReview: agent.acceptanceRole === "read-only",
 		...(options.outputMode === "file-only" && options.outputPath ? { fileHandoffPath: options.outputPath } : {}),
 		fast: options.fast ?? agent.fast,
 		toolBudget: options.toolBudget,

@@ -21,6 +21,7 @@ import type { ChildWatchdogConfig } from "../../watchdog/child-status.ts";
 import type { WatchdogPermissionRequest, WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL_NAME } from "../../watchdog/diff-tool.ts";
+import { registerReportCorrectionSource } from "./report-correction-source.ts";
 import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
@@ -714,6 +715,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	// the configured inline factory. It must be inert rather than crashing the
 	// child before startup; the inline factory remains the real registration path.
 	if (!config) return;
+	registerReportCorrectionSource(pi, config);
 	if (config.structuredOutput) {
 		// Native dispatch stops at the first block; latch before ordinary gates.
 		pi.on("tool_call", (event) => {
