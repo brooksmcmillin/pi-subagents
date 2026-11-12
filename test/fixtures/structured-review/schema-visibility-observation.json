@@ -1,0 +1,69 @@
+{
+  "observedAt": "2026-11-12T06:04:43.022Z",
+  "model": {
+    "provider": "openai-codex",
+    "id": "gpt-6.1-sol",
+    "api": "openai-codex-responses"
+  },
+  "schemaSha256": "ce5d98405b08b261044549b4ea6402d16192b399ddb09160439aed458fe10033",
+  "argumentSchemaBytes": 5935,
+  "descriptionBytes": 6225,
+  "simulateIncompleteTypes": true,
+  "requests": 1,
+  "presentedRequests": 1,
+  "calls": 1,
+  "errors": 0,
+  "errorMessages": [],
+  "value": {
+    "status": "clean",
+    "scopeChecked": "Synthetic report for fixture.ts:1.",
+    "baseRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stagedTree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "findings": [],
+    "next": "No further action for this synthetic fixture.",
+    "blockedReason": "",
+    "threatMatrix": {
+      "reportedCase": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic reported case checked."
+      },
+      "adjacentBoundaries": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic adjacent boundaries checked."
+      },
+      "malformedOrTruncated": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic malformed inputs checked."
+      },
+      "aliasesAndRebinding": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic aliases and rebinding checked."
+      },
+      "nestedAndRepeatedScopes": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic nested scopes checked."
+      },
+      "deadOrConditionalPaths": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic conditional paths checked."
+      },
+      "dynamicLookupOrLoading": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic dynamic lookup checked."
+      },
+      "alternateCallers": {
+        "status": "checked",
+        "evidence": "fixture.ts:1",
+        "reason": "Synthetic alternate callers checked."
+      }
+    }
+  },
+  "passed": true
+}
