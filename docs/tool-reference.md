@@ -190,6 +190,10 @@ Recovery pins the original transcript prefix and output schema. In a Git workspa
 
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
 
+### Retained report correction
+
+For an eligible terminal read-only review, `subagent({ action: "report.correct", id: "<exact-run-id>", message: "Reassess the suspected format-only blocker from retained evidence." })` obtains a separate report-only amendment. It does not reopen the historical run or restore its inspection/mutation tools. This is distinct from automatic missing-call recovery and ordinary in-turn invalid-submission repair. Read [eligibility, artifacts and proof limits](report-correction.md) before consuming an amendment.
+
 ### Retained children
 
 Completed workflow children from the current parent session stay addressable as retained children. `{ action: "children.list" }` lists up to the last 10 with their run ids and explicit `resumable` or `not resumable` state. This workflow-only roster is not an exhaustive list of direct native children. Resume only rows reported `resumable`. When the exact run id of an intended direct child is known, inspect it with `{ action: "status", id: "<run-id>" }`; if status identifies the candidate, attempt `{ action: "resume", id: "<run-id>", message: "..." }`. Resume performs the authoritative eligibility check and may reject the attempt. Start a same-role fallback challenge, labeled as fallback, only when no known candidate exists or resume rejects eligibility. A later workflow continues a resumable child by passing `resume` instead of `agent`:

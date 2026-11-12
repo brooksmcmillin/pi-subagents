@@ -32,7 +32,7 @@ export function shouldRecoverStructuredOutputCompletion(options: {
 		&& !last.content.some((part) => part.type === "toolCall");
 }
 
-function captureGitBaseline(cwd: string): { root: string; ref: string } | undefined {
+export function captureGitBaseline(cwd: string): { root: string; ref: string } | undefined {
 	// Keep this completion path independent of the watchdog tool's optional Typebox runtime.
 	const result = spawnSync("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
 	if (result.error || result.status !== 0) return undefined;
@@ -42,13 +42,13 @@ function captureGitBaseline(cwd: string): { root: string; ref: string } | undefi
 	return root && ref ? { root, ref } : undefined;
 }
 
-function captureIndexTree(cwd: string): string | undefined {
+export function captureIndexTree(cwd: string): string | undefined {
 	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "write-tree"], { cwd, encoding: "utf8", timeout: 2_000, windowsHide: true });
 	const tree = result.stdout?.trim();
 	return !result.error && result.status === 0 && tree && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
 }
 
-function hasHiddenTrackedFiles(cwd: string): boolean | undefined {
+export function hasHiddenTrackedFiles(cwd: string): boolean | undefined {
 	const result = spawnSync("git", ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { cwd, encoding: "utf8", timeout: 2_000, maxBuffer: 1024 * 1024, windowsHide: true });
 	if (result.error || result.status !== 0) return undefined;
 	return result.stdout.split("\0").some((entry) => /^[a-zS]/.test(entry));

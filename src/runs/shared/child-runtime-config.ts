@@ -72,6 +72,8 @@ export interface ChildSupervisorMetadata {
  * that hosts the child session builds it and passes it to the hooks directly.
  */
 export interface ChildRuntimeConfig {
+	/** Retain correction identity only for declared read-only structured reviewers. */
+	retainReportCorrection?: boolean;
 	cwd?: string;
 	runId?: string;
 	agent?: string;
