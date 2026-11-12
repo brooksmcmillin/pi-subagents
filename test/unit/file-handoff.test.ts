@@ -11,23 +11,22 @@ function harness(output: string, cwd: string) {
 	const handlers = new Map<string, (event: any, ctx: any) => any>();
 	registerFileHandoffGuard({ on: (name: string, fn: any) => handlers.set(name, fn) } as unknown as ExtensionAPI, output);
 	const ctx = { cwd, sessionManager: { getBranch: () => [] } } as unknown as ExtensionContext;
-	return { ctx, call: (event: any) => handlers.get("tool_call")!(event, ctx), result: (event: any) => handlers.get("tool_result")!(event, ctx) };
+	return { ctx, call: (event: any) => handlers.get("tool_call")!(event, ctx) };
 }
 
-test("file handoff freezes mutations before sibling preflight and survives restart", () => {
+test("writing an output file does not block research, revisions or structured submission", () => {
 	const cwd = mkdtempSync(join(tmpdir(), "handoff-"));
 	try {
 		const output = join(cwd, "report.json");
 		const guard = harness(output, cwd);
 		assert.equal(guard.call({ toolName: "write", toolCallId: "report", input: { path: output } }), undefined);
-		assert.equal(guard.call({ toolName: "bash", input: { command: "git commit --amend --no-edit" } }).block, true);
-		guard.result({ toolCallId: "report", isError: true });
-		assert.equal(guard.call({ toolName: "edit", input: { path: "source.ts" } }), undefined);
+		const tools = ["web_search", "fetch_content", "get_search_content", "source_check", "structured_output", "write", "edit", "bash", "mcp", "morph_fastapply", "contact_supervisor"];
+		for (const toolName of tools) assert.equal(guard.call({ toolName, input: {} }), undefined, toolName);
 		writeFileSync(output, "{}");
-		for (const toolName of ["write", "edit", "bash", "mcp", "morph_fastapply"]) {
-			assert.equal(harness(output, cwd).call({ toolName, input: { path: output } }).block, true);
+		for (const toolName of tools) {
+			assert.equal(guard.call({ toolName, input: { path: output } }), undefined, toolName);
+			assert.equal(harness(output, cwd).call({ toolName, input: { path: output } }), undefined, `restart: ${toolName}`);
 		}
-		assert.equal(guard.call({ toolName: "contact_supervisor", input: {} }), undefined);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
@@ -58,11 +57,11 @@ test("published worker branches reject rewriting but permit ordinary follow-up c
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test("report publication must be the only tool in its batch", () => {
+test("a draft write does not impose a terminal tool batch", () => {
 	const cwd = mkdtempSync(join(tmpdir(), "handoff-batch-"));
 	try {
 		const guard = harness(join(cwd, "report.json"), cwd);
 		guard.ctx.sessionManager.getBranch = () => [{ type: "message", message: { role: "assistant", content: [{ type: "toolCall" }, { type: "toolCall" }] } }] as any;
-		assert.match(guard.call({ toolName: "write", toolCallId: "report", input: { path: "report.json" } }).reason, /sole tool call/);
+		assert.equal(guard.call({ toolName: "write", toolCallId: "report", input: { path: "report.json" } }), undefined);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
