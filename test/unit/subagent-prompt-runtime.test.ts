@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { validateToolArguments, type AssistantMessage, type Message, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
-import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { convertResponsesMessages, convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { specialistSchema, threatFamilies } from "../fixtures/structured-review/specialist-schema.ts";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { createEventBus } from "../support/helpers.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
@@ -532,6 +533,39 @@ describe("subagent prompt runtime", () => {
 			assert.equal(result.terminate, true);
 			assert.deepEqual(captured, [{ ok: true }]);
 			assert.equal(terminalState.captured, true);
+		}
+	});
+
+	it("presents the authoritative specialist contract as text through Responses conversion", async () => {
+		type Tool = { name: string; description: string; parameters: never; execute: (id: string, params: { value: unknown }) => Promise<unknown> };
+		for (const schema of [specialistSchema, { ...specialistSchema, required: [...specialistSchema.required, "newIdentity"], properties: { ...specialistSchema.properties, newIdentity: { const: "changed" } } }]) {
+			let tool: Tool | undefined;
+			const captured: unknown[] = [];
+			registerSubagentPromptRuntime({
+				registerTool(registered: Tool) { if (registered.name === "structured_output") tool = registered; }, on() {},
+			} as never, childConfig({ structuredOutput: { schema, capture: (value) => captured.push(value) } }));
+			assert.ok(tool);
+			// Description is a separate model-facing channel from rendered parameter types.
+			const presented = JSON.parse(tool.description.split("\n").at(-1)!);
+			assert.deepEqual(presented, tool.parameters);
+			assert.deepEqual(presented.properties.value, schema);
+			const [wire] = convertResponsesTools([tool]);
+			assert.equal(wire?.type, "function");
+			if (wire?.type !== "function") throw new Error("Expected function tool");
+			assert.equal(wire.description, tool.description);
+			assert.deepEqual(wire.parameters, tool.parameters);
+			const value = {
+				status: "clean", scopeChecked: "fixture only", baseRef: "a".repeat(40), stagedTree: "b".repeat(40),
+				findings: [], next: "done", blockedReason: "",
+				threatMatrix: Object.fromEntries(threatFamilies.map((family) => [family, { status: "checked", evidence: "fixture.ts:1", reason: "synthetic check" }])),
+				...("newIdentity" in schema.properties ? { newIdentity: "changed" } : {}),
+			};
+			await assert.rejects(tool.execute("missing-identity", { value: { ...value, baseRef: undefined } }), /validation failed/);
+			await assert.rejects(tool.execute("bad-status", { value: { ...value, status: "unknown" } }), /validation failed/);
+			await assert.rejects(tool.execute("bad-conditional", { value: { ...value, status: "blocked" } }), /validation failed/);
+			await assert.rejects(tool.execute("bad-nested", { value: { ...value, threatMatrix: { ...value.threatMatrix, reportedCase: { status: "checked", evidence: "", reason: "checked needs a location" } } } }), /validation failed/);
+			await tool.execute("valid", { value });
+			assert.deepEqual(captured, [value]);
 		}
 	});
 
