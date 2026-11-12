@@ -535,6 +535,38 @@ describe("subagent prompt runtime", () => {
 		}
 	});
 
+	it("keeps research available with an existing file and captures only one validated final result", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "structured-handoff-"));
+		try {
+			const outputPath = path.join(cwd, "report.json");
+			fs.writeFileSync(outputPath, "draft");
+			const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+			const captured: unknown[] = [];
+			let execute: ((_id: string, params: { value: unknown }) => Promise<{ terminate?: boolean }>) | undefined;
+			registerSubagentPromptRuntime({
+				on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+					if (name === "tool_call") handlers.push(handler);
+				},
+				registerTool(tool: { name: string; execute: typeof execute }) {
+					if (tool.name === "structured_output") execute = tool.execute;
+				},
+			} as never, childConfig({
+				fileHandoffPath: outputPath,
+				structuredOutput: { schema: { type: "boolean" }, capture: (value) => captured.push(value) },
+			}));
+			for (const toolName of ["web_search", "fetch_content", "edit", "structured_output"]) {
+				for (const handler of handlers) assert.equal(await handler({ toolName, input: {} }, { cwd }), undefined, toolName);
+			}
+			await assert.rejects(execute!("invalid", { value: "draft" }), /validation failed/);
+			assert.deepEqual(captured, []);
+			assert.equal((await execute!("final", { value: true })).terminate, true);
+			await assert.rejects(execute!("replacement", { value: false }), /already submitted/);
+			assert.deepEqual(captured, [true]);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("requires and validates acceptanceReport when structured capture is required", async () => {
 		{
 			const captured: Array<{ value: unknown; acceptanceReport: unknown }> = [];
