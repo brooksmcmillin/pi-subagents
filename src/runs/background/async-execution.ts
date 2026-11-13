@@ -2313,6 +2313,7 @@ export function executeAsyncSingle(
 						launchResolvedExtensions,
 						effectiveAcceptance: resolvedAcceptance,
 						acceptanceInput: params.acceptance,
+						acceptanceRole: agentConfig.acceptanceRole,
 						...(structuredOutput ? { structuredOutput } : {}),
 						...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
