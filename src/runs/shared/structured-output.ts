@@ -243,7 +243,7 @@ interface JsonSchemaValidationError {
 	keyword?: string;
 	schemaPath?: string;
 	instancePath?: string;
-	params?: { failingKeyword?: string; requiredProperties?: string[]; allowedValues?: unknown[]; allowedValue?: unknown };
+	params?: { failingKeyword?: string; requiredProperties?: string[]; additionalProperties?: string[]; allowedValues?: unknown[]; allowedValue?: unknown };
 	message?: string;
 }
 
@@ -423,11 +423,45 @@ function expandConditionalError(compile: CompileJsonSchema, schema: JsonSchemaOb
 	}
 }
 
-function formatValidationError(error: JsonSchemaValidationError): string[] {
-	const pathText = error.instancePath ? error.instancePath.replace(/^\//, "").replace(/\//g, ".") : "root";
-	if (error.keyword === "required" && error.params?.requiredProperties?.length) {
-		return error.params.requiredProperties.map((property) => `${pathText === "root" ? property : `${pathText}.${property}`}: is required`);
+function diagnosticPath(pointer: string): string {
+	let result = "";
+	for (const encoded of pointer.replace(/^\//, "").split("/")) {
+		const key = encoded.replace(/~1/g, "/").replace(/~0/g, "~");
+		result += /^[A-Za-z_$][\w$]*$|^(0|[1-9]\d*)$/.test(key)
+			? `${result ? "." : ""}${key}` : `[${JSON.stringify(key)}]`;
 	}
+	return result;
+}
+
+function propertyPointer(pointer: string, property: string): string {
+	return `${pointer}/${property.replace(/~/g, "~0").replace(/\//g, "~1")}`;
+}
+
+function requiredContract(schema: JsonSchemaObject, node: unknown): string {
+	const resolved = resolveLocalRefs(schema, node);
+	if (!resolved || Object.keys(resolved).length === 0) return "";
+	// Only schema data is included, never the submitted value. Keep nested shape local and bounded.
+	const contract = JSON.stringify(resolved);
+	return `; expected ${utf8Prefix(contract, 384)}${Buffer.byteLength(contract, "utf8") > 384 ? " (fragment truncated; consult the declared structured_output value schema)" : ""}`;
+}
+
+function formatValidationError(schema: JsonSchemaObject, error: JsonSchemaValidationError): string[] {
+	const pointer = error.instancePath ?? "";
+	const pathText = pointer ? diagnosticPath(pointer) : "root";
+	const node = error.schemaPath ? resolveLocalRefs(schema, jsonPointerTarget(schema, error.schemaPath)) : undefined;
+	if (error.keyword === "required" && error.params?.requiredProperties?.length) {
+		return error.params.requiredProperties.map((property) => {
+			const properties = node?.properties as Record<string, unknown> | undefined;
+			return `${diagnosticPath(propertyPointer(pointer, property))}: is required${requiredContract(schema, properties?.[property])}`;
+		});
+	}
+	if (error.keyword === "additionalProperties" && error.params?.additionalProperties?.length) {
+		const allowed = node?.properties && typeof node.properties === "object" ? Object.keys(node.properties) : [];
+		const context = allowed.length ? `; declared properties: ${allowed.slice(0, MAX_LISTED_ALLOWED_VALUES).map((key) => JSON.stringify(key)).join(", ")}${allowed.length > MAX_LISTED_ALLOWED_VALUES ? ", ..." : ""}` : "";
+		return error.params.additionalProperties.map((property) => `${diagnosticPath(propertyPointer(pointer, property))}: unexpected property; remove it${context}`);
+	}
+	// TypeBox also emits a boolean-schema failure for each forbidden extra; the named error is clearer.
+	if (error.keyword === "boolean" && error.schemaPath?.endsWith("/additionalProperties") && jsonPointerTarget(schema, error.schemaPath) === false) return [];
 	if (error.keyword === "enum" && error.params?.allowedValues?.length) {
 		const values = error.params.allowedValues;
 		const extra = values.length - MAX_LISTED_ALLOWED_VALUES;
@@ -442,10 +476,10 @@ function formatValidationError(error: JsonSchemaValidationError): string[] {
 function expandedErrorMessages(compile: CompileJsonSchema, schema: JsonSchemaObject, value: unknown, error: JsonSchemaValidationError, limit: number, seen: Set<string>): string[] {
 	if (limit <= 0) return [];
 	const state = `${errorKey(error)}\0${JSON.stringify(schema)}`;
-	if (seen.has(state)) return formatValidationError(error).slice(0, limit);
+	if (seen.has(state)) return formatValidationError(schema, error).slice(0, limit);
 	seen.add(state);
 	const expanded = expandConditionalError(compile, schema, value, error);
-	if (!expanded) return formatValidationError(error).slice(0, limit);
+	if (!expanded) return formatValidationError(schema, error).slice(0, limit);
 	const messages: string[] = [];
 	for (const candidate of expanded.errors) {
 		messages.push(...expandedErrorMessages(compile, expanded.schema, value, candidate, limit - messages.length, seen));
@@ -522,7 +556,8 @@ function validateWithCompile(compile: CompileJsonSchema, schema: JsonSchemaObjec
 		}
 		if (errors.length >= 8) break;
 	}
-	return { status: "invalid", message: errors.join("; ") || "schema validation failed" };
+	const message = errors.join("; ") || "schema validation failed";
+	return { status: "invalid", message: utf8Prefix(message.replace(/[\u0000-\u001f\u007f]/g, ""), MAX_STRUCTURED_OUTPUT_REJECTION_ERROR_BYTES) };
 }
 
 export async function readStructuredOutput(runtime: StructuredOutputRuntime): Promise<{ value?: unknown; error?: string }> {
