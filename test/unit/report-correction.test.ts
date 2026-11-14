@@ -5,9 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { it, type TestContext } from "node:test";
 import { ExtensionRunner, SessionManager, type FileEntry } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
-import { setChildSessionFactory, type ChildSessionFactory, type ChildSessionLaunch } from "../../src/runs/shared/child-session.ts";
+import { createDefaultChildSessionFactory, setChildSessionFactory, type ChildSessionFactory, type ChildSessionLaunch } from "../../src/runs/shared/child-session.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
 import { correctRetainedReport } from "../../src/runs/shared/report-correction.ts";
 import { registerReportCorrectionSource, reviewSubject, REPORT_CORRECTION_SOURCE } from "../../src/runs/shared/report-correction-source.ts";
@@ -77,7 +77,7 @@ function factory(report: unknown, options: { forbidden?: string; lateForbidden?:
 	const value: ChildSessionFactory = {
 		async create(launch: ChildSessionLaunch) {
 			launches++;
-			assert.deepEqual(launch.tools, []); assert.equal(launch.ambientExtensions, false); assert.equal(launch.noSkills, true); assert.equal(launch.noContextFiles, true);
+			assert.deepEqual(launch.tools, ["structured_output"]); assert.equal(launch.ambientExtensions, false); assert.equal(launch.noSkills, true); assert.equal(launch.noContextFiles, true);
 			const handlers = new Map<string, Array<(event: unknown) => unknown>>();
 			let submit!: (id: string, params: { value: unknown }) => Promise<unknown>;
 			const pi = { on(name: string, handler: (event: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
@@ -104,6 +104,36 @@ function request(f: ReturnType<typeof fixture>, stub: ReturnType<typeof factory>
 		reason: "Reassess the suspected report-format explanation from retained evidence, not fresh inspection.", timeoutMs: 5_000,
 		assertTerminal() {}, factory: stub.value, ...extra });
 }
+
+it("real SDK correction startup allows only structured_output without a provider request", async (t) => {
+	const f = fixture(t); const before = fs.readFileSync(f.source);
+	const faux = fauxProvider({ provider: "fixture", models: [{ id: "reviewer" }], tokensPerSecond: 100_000 });
+	const native = createDefaultChildSessionFactory({ loadPiCodingAgent: () => import("@earendil-works/pi-coding-agent") });
+	t.after(() => native.dispose());
+	const startup: ChildSessionFactory = {
+		...native,
+		async create(launch) {
+			let registered: string[] = [], active: string[] = [];
+			const child = await native.create({ ...launch, hooks: [...launch.hooks, { name: "startup-proof", factory(pi) {
+				pi.registerProvider(faux.provider as never);
+				pi.on("session_start", () => {
+					registered = pi.getAllTools().map((tool) => tool.name);
+					active = pi.getActiveTools();
+				});
+			} }] });
+			try {
+				assert.deepEqual(launch.tools, ["structured_output"]);
+				assert.deepEqual(registered, ["structured_output"]);
+				assert.deepEqual(active, ["structured_output"]);
+				assert.equal(faux.state.callCount, 0);
+			} finally { await child.dispose(); }
+			throw new Error("Startup verified; no correction prompt dispatched");
+		},
+	};
+	await assert.rejects(correctRetainedReport({ runId: "source-run", parentSessionId: "parent-session", sourceSessionFile: f.source,
+		reason: "Verify startup only", timeoutMs: 5_000, assertTerminal() {}, factory: startup }), /Startup verified; no correction prompt dispatched/);
+	assert.deepEqual(fs.readFileSync(f.source), before);
+});
 
 for (const rejected of [true, false]) {
 	it(`PR57-style ${rejected ? "rejected submission" : "captured erroneous blocker"} obtains a substantive decision without rewriting prior evidence`, async (t) => {
