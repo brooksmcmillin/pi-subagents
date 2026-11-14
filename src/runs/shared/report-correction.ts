@@ -120,7 +120,7 @@ export async function correctRetainedReport(input: {
 		child = await factory.create({
 			cwd: source.cwd, storage: { kind: "file", sessionFile }, model: source.model,
 			parentProviderRegistry: input.parentProviderRegistry,
-			tools: [], extensionPaths: requiredExtensions.map((extension) => extension.path), requiredExtensions,
+			tools: ["structured_output"], extensionPaths: requiredExtensions.map((extension) => extension.path), requiredExtensions,
 			ambientExtensions: false, noSkills: true, noContextFiles: true,
 			signal: controller.signal, runtime,
 			hooks: [{ name: "report-only-correction", factory: (pi) => registerSubagentPromptRuntime(pi, runtime) }],
