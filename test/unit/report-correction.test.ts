@@ -12,6 +12,8 @@ import { createSubagentExecutor } from "../../src/runs/foreground/subagent-execu
 import { correctRetainedReport } from "../../src/runs/shared/report-correction.ts";
 import { registerReportCorrectionSource, reviewSubject, REPORT_CORRECTION_SOURCE } from "../../src/runs/shared/report-correction-source.ts";
 import { createStructuredOutputRuntime, prepareStructuredOutputArguments } from "../../src/runs/shared/structured-output.ts";
+import { DIRS } from "../../src/shared/types.ts";
+import { resultFilePath } from "../../src/runs/background/result-files.ts";
 
 const schema = { type: "object", additionalProperties: false, required: ["status", "scopeChecked", "findings", "blockedReason"], properties: {
 	status: { type: "string", enum: ["clean", "findings", "blocked"] }, scopeChecked: { type: "string", minLength: 1 },
@@ -150,9 +152,9 @@ it("cold real SDK correction prepares and captures only structured_output withou
 });
 
 for (const rejected of [true, false]) {
-	it(`PR57-style ${rejected ? "rejected submission" : "captured erroneous blocker"} obtains a substantive decision without rewriting prior evidence`, async (t) => {
+	it(`PR57-style ${rejected ? "rejected submission" : "captured erroneous blocker"} obtains a cross-session decision without rewriting prior evidence`, async (t) => {
 		const f = fixture(t, { rejected }); const before = fs.readFileSync(f.source); const original = fs.readFileSync(f.artifact);
-		const stub = factory(clean); const result = await request(f, stub);
+		const stub = factory(clean); const result = await request(f, stub, { parentSessionId: "new-conversation" });
 		assert.equal(result.sourceState, rejected ? "rejected" : "captured-blocked"); assert.equal(result.status, "unassessed"); assert.deepEqual(result.proposedReport, clean);
 		assert.deepEqual(result.original, f.original); assert.equal(stub.launches(), 1);
 		assert.deepEqual(fs.readFileSync(f.source), before); assert.deepEqual(fs.readFileSync(f.artifact), original);
@@ -219,11 +221,18 @@ for (const scenario of ["no-inspection", "writer", "clean", "aborted"]) {
 	});
 }
 
-for (const mismatch of [{ runId: "unrelated-run" }, { parentSessionId: "other-owner" }]) {
-	it(`refuses unrelated identity ${JSON.stringify(mismatch)}`, async (t) => {
-		const f = fixture(t); const stub = factory(clean); await assert.rejects(request(f, stub, mismatch), /run or owner does not match/); assert.equal(stub.launches(), 0);
-	});
-}
+it("refuses an unrelated source run before model execution", async (t) => {
+	const f = fixture(t); const stub = factory(clean);
+	await assert.rejects(request(f, stub, { runId: "unrelated-run" }), /source run does not match/); assert.equal(stub.launches(), 0);
+});
+
+it("another parent can correct retained evidence without replacing its original parent identity", async (t) => {
+	const f = fixture(t); const before = fs.readFileSync(f.source);
+	const result = await request(f, factory(clean), { parentSessionId: "new-conversation-after-restart" });
+	assert.deepEqual(result.proposedReport, clean);
+	assert.deepEqual(fs.readFileSync(f.source), before);
+	assert.equal((f.entries.find((entry) => entry.customType === REPORT_CORRECTION_SOURCE)!.data as { parentSessionId: string }).parentSessionId, "parent-session");
+});
 
 for (const mutation of ["HEAD", "base", "index", "working", "untracked", "assume-unchanged", "skip-worktree"]) {
 	for (const during of [false, true]) {
@@ -260,7 +269,7 @@ it("session lease prevents duplicate live report correctors", async (t) => {
 	const hold = new Promise<void>((resolve) => { release = resolve; });
 	const first = request(f, factory(clean, { before: async () => { started(); await hold; } }));
 	await entered;
-	const second = factory(clean); await assert.rejects(request(f, second), /lease|owned|already/i); assert.equal(second.launches(), 0);
+	const second = factory(clean); await assert.rejects(request(f, second, { parentSessionId: "another-parent" }), /lease|owned|already/i); assert.equal(second.launches(), 0);
 	release(); await first;
 });
 
@@ -280,22 +289,55 @@ it("source evidence is branch-bound, not an abandoned custom entry", async (t) =
 	await assert.rejects(request(f, factory(clean)), /no eligible retained/);
 });
 
-it("public report.correct consumes the retained producer record without rewriting source run status", async (t) => {
+for (const storage of ["foreground", "persisted-after-restart"] as const) {
+it(`public report.correct from another parent uses ${storage} evidence without taking source ownership`, async (t) => {
 	const f = fixture(t); const stub = factory(clean); setChildSessionFactory(stub.value); t.after(() => setChildSessionFactory(undefined));
 	const retained = { runId: "source-run", sessionId: "parent-session", cwd: f.cwd, mode: "single", children: [{ agent: "quick-review", status: "completed", sessionFile: f.source }] };
 	const original = JSON.stringify(retained);
-	const state = { baseCwd: f.cwd, currentSessionId: "parent-session", asyncJobs: new Map(), foregroundRuns: new Map([["source-run", retained]]), foregroundControls: new Map(),
+	const runDir = path.join(DIRS.async, "source-run");
+	const statusFile = path.join(runDir, "status.json");
+	if (storage === "persisted-after-restart") {
+		fs.mkdirSync(runDir, { recursive: true });
+		fs.writeFileSync(statusFile, JSON.stringify({ runId: "source-run", sessionId: "parent-session", mode: "single", state: "complete",
+			startedAt: 100, endedAt: 200, lastUpdate: 200, cwd: f.cwd, sessionFile: f.source, steps: [{ agent: "quick-review", status: "complete" }] }));
+		t.after(() => fs.rmSync(runDir, { recursive: true, force: true }));
+	}
+	const originalStatus = storage === "persisted-after-restart" ? fs.readFileSync(statusFile) : undefined;
+	const state = { baseCwd: f.cwd, currentSessionId: "new-conversation", asyncJobs: new Map(), foregroundRuns: new Map(storage === "foreground" ? [["source-run", retained]] : []), foregroundControls: new Map(),
 		lastForegroundControlId: null, cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };
 	const executor = createSubagentExecutor({ pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName: () => "parent" }, state,
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} }, asyncByDefault: false, tempArtifactsDir: f.root, getSubagentSessionRoot: () => f.root,
 		expandTilde: (value: string) => value, discoverAgents: () => ({ agents: [] }) } as never);
-	const ctx = { cwd: f.cwd, hasUI: false, sessionManager: { getSessionId: () => "parent-session", getSessionFile: () => null }, modelRegistry: { getAvailable: () => [] } } as never;
+	const ctx = { cwd: f.cwd, hasUI: false, sessionManager: { getSessionId: () => "new-conversation", getSessionFile: () => null }, modelRegistry: { getAvailable: () => [] } } as never;
 	const result = await executor.execute("correction", { action: "report.correct", id: "source-run", message: "Reassess the format blocker." }, new AbortController().signal, undefined, ctx);
 	assert.notEqual(result.isError, true, JSON.stringify(result.content));
 	assert.deepEqual(result.details.reportCorrection?.proposedReport, clean); assert.equal(stub.launches(), 1); assert.equal(JSON.stringify(retained), original);
 	const refused = await executor.execute("override", { action: "report.correct", id: "source-run", message: "Reassess", outputSchema: { type: "string" } }, new AbortController().signal, undefined, ctx);
 	assert.equal(refused.isError, true); assert.equal(stub.launches(), 1);
+	const resume = await executor.execute("resume", { action: "resume", id: "source-run", message: "Continue inspection" }, new AbortController().signal, undefined, ctx);
+	assert.equal(resume.isError, true, "ordinary cross-session resumption remains unavailable"); assert.equal(stub.launches(), 1);
+	if (originalStatus) {
+		assert.deepEqual(fs.readFileSync(statusFile), originalStatus);
+		const prefix = await executor.execute("prefix", { action: "report.correct", id: "source-ru", message: "Reassess" }, new AbortController().signal, undefined, ctx);
+		assert.equal(prefix.isError, true, "correction still requires the exact source ID");
+		for (const terminalState of ["running", "stale-running", "paused", "stopped"]) {
+			const sourceState = terminalState === "stale-running" ? "running" : terminalState;
+			fs.writeFileSync(statusFile, JSON.stringify({ ...JSON.parse(originalStatus.toString()), state: sourceState,
+				pid: terminalState === "stale-running" ? 2147483646 : process.pid, lastUpdate: terminalState === "stale-running" ? 100 : Date.now(),
+				steps: [{ agent: "quick-review", status: sourceState, sessionFile: f.source }] }));
+			const beforeStatus = fs.readFileSync(statusFile);
+			const resultPath = resultFilePath(DIRS.results, "source-run");
+			assert.equal(fs.existsSync(resultPath), false);
+			const refusedState = await executor.execute(terminalState, { action: "report.correct", id: "source-run", message: "Reassess" }, new AbortController().signal, undefined, ctx);
+			assert.equal(refusedState.isError, true, `${terminalState} sources remain ineligible`);
+			assert.deepEqual(fs.readFileSync(statusFile), beforeStatus, "correction lookup must not reconcile the source status");
+			assert.equal(fs.existsSync(resultPath), false, "correction lookup must not publish a repaired source result");
+		}
+		assert.equal(stub.launches(), 1);
+	}
+	assert.equal(JSON.stringify(retained), original);
 });
+}
 
 it("a later source message invalidates the earlier retained terminal record", async (t) => {
 	const f = fixture(t); const latest = f.entries.at(-1)!;
