@@ -5,13 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { it, type TestContext } from "node:test";
 import { ExtensionRunner, SessionManager, type FileEntry } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, validateToolArguments } from "@earendil-works/pi-ai";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { createDefaultChildSessionFactory, setChildSessionFactory, type ChildSessionFactory, type ChildSessionLaunch } from "../../src/runs/shared/child-session.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
 import { correctRetainedReport } from "../../src/runs/shared/report-correction.ts";
 import { registerReportCorrectionSource, reviewSubject, REPORT_CORRECTION_SOURCE } from "../../src/runs/shared/report-correction-source.ts";
-import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import { createStructuredOutputRuntime, prepareStructuredOutputArguments } from "../../src/runs/shared/structured-output.ts";
 
 const schema = { type: "object", additionalProperties: false, required: ["status", "scopeChecked", "findings", "blockedReason"], properties: {
 	status: { type: "string", enum: ["clean", "findings", "blocked"] }, scopeChecked: { type: "string", minLength: 1 },
@@ -105,8 +105,11 @@ function request(f: ReturnType<typeof fixture>, stub: ReturnType<typeof factory>
 		assertTerminal() {}, factory: stub.value, ...extra });
 }
 
-it("real SDK correction startup allows only structured_output without a provider request", async (t) => {
-	const f = fixture(t); const before = fs.readFileSync(f.source);
+it("cold real SDK correction prepares and captures only structured_output without a provider request", async (t) => {
+	assert.throws(() => prepareStructuredOutputArguments(schema, { value: clean }), /validator is still loading/);
+	const f = fixture(t); const before = fs.readFileSync(f.source); const original = fs.readFileSync(f.artifact);
+	type Tool = { name: string; parameters: never; prepareArguments?: (args: unknown) => Record<string, unknown>; execute: (id: string, params: unknown) => Promise<unknown> };
+	let tool: Tool | undefined;
 	const faux = fauxProvider({ provider: "fixture", models: [{ id: "reviewer" }], tokensPerSecond: 100_000 });
 	const native = createDefaultChildSessionFactory({ loadPiCodingAgent: () => import("@earendil-works/pi-coding-agent") });
 	t.after(() => native.dispose());
@@ -114,25 +117,36 @@ it("real SDK correction startup allows only structured_output without a provider
 		...native,
 		async create(launch) {
 			let registered: string[] = [], active: string[] = [];
-			const child = await native.create({ ...launch, hooks: [...launch.hooks, { name: "startup-proof", factory(pi) {
+			const child = await native.create({ ...launch, hooks: [...launch.hooks.map((hook) => ({ ...hook, factory(pi) {
+				return hook.factory({ ...pi, registerTool(registered) {
+					if (registered.name === "structured_output") tool = registered as unknown as Tool;
+					pi.registerTool(registered);
+				} });
+			} })), { name: "startup-proof", factory(pi) {
 				pi.registerProvider(faux.provider as never);
 				pi.on("session_start", () => {
 					registered = pi.getAllTools().map((tool) => tool.name);
 					active = pi.getActiveTools();
 				});
 			} }] });
-			try {
+			return Object.assign(child, { async prompt() {
 				assert.deepEqual(launch.tools, ["structured_output"]);
 				assert.deepEqual(registered, ["structured_output"]);
 				assert.deepEqual(active, ["structured_output"]);
+				assert.ok(tool?.prepareArguments);
+				assert.throws(() => tool!.prepareArguments!({ value: { ...clean, status: "invalid" } }), /Structured output validation failed/);
+				const args = validateToolArguments(tool!, { type: "toolCall", id: "corrected", name: "structured_output", arguments: tool!.prepareArguments!({ value: clean }) });
+				await tool!.execute("corrected", args);
 				assert.equal(faux.state.callCount, 0);
-			} finally { await child.dispose(); }
-			throw new Error("Startup verified; no correction prompt dispatched");
+			} });
 		},
 	};
-	await assert.rejects(correctRetainedReport({ runId: "source-run", parentSessionId: "parent-session", sourceSessionFile: f.source,
-		reason: "Verify startup only", timeoutMs: 5_000, assertTerminal() {}, factory: startup }), /Startup verified; no correction prompt dispatched/);
-	assert.deepEqual(fs.readFileSync(f.source), before);
+	const result = await correctRetainedReport({ runId: "source-run", parentSessionId: "parent-session", sourceSessionFile: f.source,
+		reason: "Verify cold preparation and capture without a model request", timeoutMs: 5_000, assertTerminal() {}, factory: startup });
+	assert.equal(result.status, "unassessed"); assert.deepEqual(result.proposedReport, clean); assert.deepEqual(result.original, f.original);
+	assert.deepEqual(JSON.parse(fs.readFileSync(result.artifactPath, "utf8")), result);
+	assert.equal(faux.state.callCount, 0);
+	assert.deepEqual(fs.readFileSync(f.source), before); assert.deepEqual(fs.readFileSync(f.artifact), original);
 });
 
 for (const rejected of [true, false]) {
