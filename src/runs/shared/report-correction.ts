@@ -7,7 +7,7 @@ import { childSessionFactory, childSessionHasQueuedMessages } from "./child-sess
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { acquireSessionLease } from "./session-lease.ts";
 import { REPORT_CORRECTION_SOURCE, reviewSubject, type ReportCorrectionSource } from "./report-correction-source.ts";
-import { validateStructuredOutputValue } from "./structured-output.ts";
+import { structuredOutputValidatorReady, validateStructuredOutputValue } from "./structured-output.ts";
 import registerSubagentPromptRuntime from "./subagent-prompt-runtime.ts";
 import { snapshotRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
 
@@ -123,7 +123,10 @@ export async function correctRetainedReport(input: {
 			tools: ["structured_output"], extensionPaths: requiredExtensions.map((extension) => extension.path), requiredExtensions,
 			ambientExtensions: false, noSkills: true, noContextFiles: true,
 			signal: controller.signal, runtime,
-			hooks: [{ name: "report-only-correction", factory: (pi) => registerSubagentPromptRuntime(pi, runtime) }],
+			hooks: [{ name: "report-only-correction", factory: (pi) => {
+				registerSubagentPromptRuntime(pi, runtime);
+				return structuredOutputValidatorReady();
+			} }],
 		});
 		if (cancelled || timedOut) throw new Error("Report correction cancelled or timed out during startup.");
 		await child.prompt([
