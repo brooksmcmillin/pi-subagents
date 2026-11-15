@@ -11,6 +11,7 @@ import { intersectSubagentCapabilityCeilings, normalizeCapabilityCeilingAllowedA
 import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
+import { readStatus } from "../../shared/utils.ts";
 import { resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { canScanAsyncRunPrefix, MIN_SAFE_ASYNC_RUN_PREFIX_LENGTH } from "./run-id-query.ts";
 import { parallelHandoffPath, resolveRetainedWorktreeCwd } from "../shared/parallel-handoff.ts";
@@ -38,6 +39,8 @@ export interface AsyncResumeDeps {
 }
 
 export interface AsyncResumeOptions {
+	/** Report-only correction must inspect recorded state without repairing the source run. */
+	reconcile?: boolean;
 	requireSessionFile?: boolean;
 	sessionId?: string;
 }
@@ -523,10 +526,11 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		try { recordedRunId = (JSON.parse(fs.readFileSync(path.join(location.asyncDir, "status.json"), "utf-8")) as { runId?: unknown }).runId; } catch { /* missing or unreadable: validateStatusForResume reports it */ }
 		if (typeof recordedRunId === "string" && recordedRunId !== path.basename(location.asyncDir)) throw new Error(`Async run '${path.basename(location.asyncDir)}' has a status file for a different run '${recordedRunId}'.`);
 	}
-	const reconciliation = location.asyncDir
-		? reconcileAsyncRun(location.asyncDir, { resultsDir, kill: deps.kill, now: deps.now })
-		: undefined;
-	const status = reconciliation?.status ?? null;
+	const status = location.asyncDir
+		? options.reconcile === false
+			? readStatus(location.asyncDir)
+			: reconcileAsyncRun(location.asyncDir, { resultsDir, kill: deps.kill, now: deps.now }).status
+		: null;
 	validateStatusForResume(status, location.asyncDir ? path.join(location.asyncDir, "status.json") : "status.json");
 	// Records are trusted only for a run folder directly under the runs root: `dir` may name a
 	// runs-shaped tree a run built inside its own folder.

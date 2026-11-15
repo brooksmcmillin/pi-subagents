@@ -1039,7 +1039,7 @@ function resolveForegroundResumeTarget(params: SubagentParamsLike, state: Subage
 	const requested = (params.id ?? params.runId)?.trim();
 	if (!requested || !state.foregroundRuns?.size || !state.currentSessionId) return undefined;
 	const direct = state.foregroundRuns.get(requested);
-	const matches = direct?.sessionId === state.currentSessionId
+	const matches = direct && (direct.sessionId === state.currentSessionId || params.action === "report.correct")
 		? [direct]
 		: options.exactOnly ? [] : [...state.foregroundRuns.values()].filter((run) => run.sessionId === state.currentSessionId && run.runId.startsWith(requested));
 	if (matches.length === 0) return undefined;
@@ -1135,7 +1135,9 @@ function resolveResumeTarget(params: SubagentParamsLike, state: SubagentState, o
 			source: "async",
 			...resolveAsyncResumeTarget(asyncParams, {}, compactOptional<NonNullable<Parameters<typeof resolveAsyncResumeTarget>[2]>>({
 				requireSessionFile: options.asyncRequireSessionFile,
-				sessionId: state.currentSessionId ?? undefined,
+				reconcile: params.action !== "report.correct",
+				// Correction copies terminal evidence; it does not take ownership of the source run.
+				sessionId: params.action === "report.correct" ? undefined : state.currentSessionId ?? undefined,
 			})),
 		};
 	} catch (error) {

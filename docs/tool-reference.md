@@ -194,7 +194,7 @@ Workflows get `await state.get(key)` and `await state.set(key, value)` through t
 
 ### Retained report correction
 
-For an eligible terminal read-only review, `subagent({ action: "report.correct", id: "<exact-run-id>", message: "Reassess the suspected format-only blocker from retained evidence." })` obtains a separate report-only amendment. It does not reopen the historical run or restore its inspection/mutation tools. This is distinct from automatic missing-call recovery and ordinary in-turn invalid-submission repair. Read [eligibility, artifacts and proof limits](report-correction.md) before consuming an amendment.
+For an eligible terminal read-only review, `subagent({ action: "report.correct", id: "<exact-run-id>", message: "Reassess the suspected format-only blocker from retained evidence." })` obtains a separate report-only amendment. It does not reopen the historical run or restore its inspection/mutation tools. A different parent conversation can request correction by exact run ID, including after restart; ordinary resume ownership messages do not determine correction eligibility. This is distinct from automatic missing-call recovery and ordinary in-turn invalid-submission repair. Read [eligibility, artifacts and proof limits](report-correction.md) before consuming an amendment.
 
 ### Retained children
 

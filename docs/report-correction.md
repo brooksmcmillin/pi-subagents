@@ -14,9 +14,15 @@ subagent({
 });
 ```
 
-`index` selects a child of a multi-child run. The exact run must belong to the
-current parent and be complete or failed, not live, paused, stopped, or unknown.
+`index` selects a child of a multi-child run. The exact run must be complete or
+failed, not live, paused, stopped, or unknown. Any parent conversation can request
+correction of an eligible retained run by its exact ID, including after a Pi
+restart; reopening the launching conversation is not required. The source run's
+ownership and original parent identity are not transferred or rewritten.
 The source session's normal revival lease excludes concurrent correction/resume.
+Ordinary `resume` and live-run controls retain their session-ownership rules:
+a status message saying resume is unavailable does not establish that
+`report.correct` is unavailable. Attempt correction itself to check eligibility.
 No launch, model, output, schema, worktree or agent override is accepted. The
 operation waits for one report turn, bounded by the requested timeout (maximum
 five minutes) and cancellation. It never retries automatically.
@@ -108,7 +114,7 @@ management dispatcher, source-session leases and native tool gates. Sanitized
 PR57-style fixtures exercise rejected submissions separately from accepted format
 blockers, retaining originals while obtaining a substantive verdict. A retained
 coverage-gap fixture stays blocked. Negative cases cover identity, branch history,
-missing inspection, writer sources, source/subject changes, concurrent correction,
+missing inspection, writer sources, source/subject changes, concurrent correction across parents,
 substantive findings, forbidden tools and queued input.
 
 The model/provider/session transport is simulated in these unit fixtures. They
