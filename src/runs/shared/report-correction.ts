@@ -91,7 +91,7 @@ export async function correctRetainedReport(input: {
 		input.assertTerminal();
 		const raw = fs.readFileSync(sourceFile, "utf8");
 		const { source, sourceToolCallIds } = activeSource(raw);
-		if (source.runId !== input.runId || source.parentSessionId !== input.parentSessionId) throw new Error("Report correction source run or owner does not match.");
+		if (source.runId !== input.runId) throw new Error("Report correction source run does not match.");
 		const validateSubject = () => fs.readFileSync(sourceFile, "utf8") !== raw ? "Report correction failed: retained source evidence changed."
 			: reviewSubject(source.cwd) !== source.subject ? "Report correction failed: HEAD, base refs, index or working-tree subject changed or became unavailable." : undefined;
 		const initialError = validateSubject();
