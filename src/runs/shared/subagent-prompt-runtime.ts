@@ -21,6 +21,7 @@ import type { ChildWatchdogConfig } from "../../watchdog/child-status.ts";
 import type { WatchdogPermissionRequest, WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL_NAME } from "../../watchdog/diff-tool.ts";
+import { registerReportCorrectionSource } from "./report-correction-source.ts";
 import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
@@ -658,7 +659,11 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 		name: "structured_output",
 		...MODEL_ONLY_TOOL,
 		label: "Structured Output",
-		description: "Submit the required final structured output for this subagent step. This terminates the step.",
+		description: [
+			"Submit the required final structured output for this subagent step. This terminates the step.",
+			"The authoritative JSON Schema for this tool's arguments follows. Use it even if the rendered parameter types are incomplete; include the value wrapper and obey nested and conditional constraints.",
+			JSON.stringify(parameters),
+		].join("\n"),
 		parameters,
 		prepareArguments: (args: unknown) => prepareStructuredOutputArguments(structured.schema, args),
 		async execute(_id: string, params: { value: unknown; acceptanceReport?: unknown }) {
@@ -710,6 +715,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	// the configured inline factory. It must be inert rather than crashing the
 	// child before startup; the inline factory remains the real registration path.
 	if (!config) return;
+	registerReportCorrectionSource(pi, config);
 	if (config.structuredOutput) {
 		// Native dispatch stops at the first block; latch before ordinary gates.
 		pi.on("tool_call", (event) => {

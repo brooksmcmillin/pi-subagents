@@ -170,7 +170,7 @@ describe("disabled feature discovery", () => {
 	it("removes disabled-feature text from the built-in descriptions and keeps the safety guidance", () => {
 		const enabled = buildSubagentToolDescription({ toolDescriptionMode: "full" });
 		for (const text of featureText) assert.ok(enabled.includes(text), `enabled description lacks ${text}`);
-		assert.match(enabled, /Management discovery: list\/get\/models\/guide; create\/update\/delete\/eject\/disable\/enable\/reset\/refine; mission\.\*, schedule\.\*, watchdog\.\*, inspector\.\*, project\.\*, lane\.status\/recordMerge\/recordSupersession; worktree\.discard and reviewed worktree\.cleanup; doctor and grant-spawn-budget\. /);
+		assert.match(enabled, /Management discovery: list\/get\/models\/guide, report\.correct \(retained-evidence report-only amendment\); create\/update\/delete\/eject\/disable\/enable\/reset\/refine; mission\.\*, schedule\.\*, watchdog\.\*, inspector\.\*, project\.\*, lane\.status\/recordMerge\/recordSupersession; worktree\.discard and reviewed worktree\.cleanup; doctor and grant-spawn-budget\. /);
 
 		const disabledFeatures = resolveDisabledFeatureSurface(ALL_DISABLED);
 		for (const toolDescriptionMode of [undefined, "full"] as const) {
@@ -181,7 +181,7 @@ describe("disabled feature discovery", () => {
 			assert.doesNotMatch(description, /action:'validate'|launchState:'not_started'/);
 			if (toolDescriptionMode === "full") assert.match(description, /Thinking uses model suffix\./);
 		}
-		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "full" }, { disabledFeatures }), /Management discovery: list\/get\/models\/guide; doctor\. Use guide topics agents, observability, tool-reference, configuration, models or extension-api for/);
+		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "full" }, { disabledFeatures }), /Management discovery: list\/get\/models\/guide, report\.correct \(retained-evidence report-only amendment\); doctor\. Use guide topics agents, observability, tool-reference, configuration, models or extension-api for/);
 	});
 
 	it("lists only enabled actions for an unknown action", async () => {

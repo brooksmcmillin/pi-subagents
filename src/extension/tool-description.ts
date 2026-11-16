@@ -36,7 +36,7 @@ Details: guide ${on("workflow-scripts", "workflows or ")}tool-reference.
 ${safetyGuidance(on)}`;
 
 const managementDiscovery = (on: FeatureText) => [
-	["list/get/models/guide"],
+	["list/get/models/guide, report.correct (retained-evidence report-only amendment)"],
 	[on("agent-management", "create/update/delete/eject/disable/enable/reset/refine")],
 	[on("missions", "mission.*"), on("schedules", "schedule.*"), on("watchdog", "watchdog.*"), on("panes", "inspector.*, project.*"), on("lane-management", "lane.status/recordMerge/recordSupersession")],
 	[on("lane-management", "worktree.discard and reviewed worktree.cleanup")],
