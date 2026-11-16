@@ -150,10 +150,17 @@ export function outputPathMappingFromTask(task: string, savedPath: string | unde
 }
 
 /** A child on another machine cannot write the parent-side path; its final reply is saved there instead. */
-export function injectSingleOutputInstruction(task: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities, machine?: PlacementMachineReference): string {
+export function injectSingleOutputInstruction(task: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities, machine?: PlacementMachineReference, structuredOutput = false): string {
 	if (!outputPath) return task;
 	const remote = machine !== undefined && !isRexLocalMachine(machine);
-	const delivery = !remote && (!capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools))
+	const delivery = structuredOutput
+		? [
+			"Finish research, revisions, verification, and any supervisor requests before submitting your result.",
+			"Call structured_output as your sole final action; do not write a draft or receipt to the output path first.",
+			`The runtime will persist it to exactly this path: ${outputPath}`,
+			"Use a separate scratch file for drafts. Corrections after submission require a new run and output path.",
+		].join("\n")
+		: !remote && (!capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools))
 		? [
 			`Write your findings to exactly this path: ${outputPath}`,
 			!capabilities?.tools || capabilities.tools.includes("write")

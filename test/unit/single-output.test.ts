@@ -121,6 +121,19 @@ describe("resolveSingleOutputPath", () => {
 });
 
 describe("injectSingleOutputInstruction", () => {
+	it("routes schema-bound results through structured_output regardless of write capability or placement", () => {
+		for (const tools of [undefined, ["read"], ["read", "write"], ["bash"]]) {
+			for (const machine of [undefined, { provider: "rex", id: "remote", target: "host", cwd: "/remote" }] as const) {
+				const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.json", { tools }, machine, true);
+				assert.match(output, /Call structured_output as your sole final action/);
+				assert.match(output, /do not write a draft or receipt to the output path first/);
+				assert.match(output, /separate scratch file/);
+				assert.equal(requestedOutputPathFromTask(output), "/tmp/report.json");
+				assert.doesNotMatch(output, /Write your findings|Return the complete artifact in your final response/);
+			}
+		}
+	});
+
 	it("appends direct-write instructions for mutation-capable agents", () => {
 		const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools: ["read", "write"] });
 		assert.match(output, /Write your findings to exactly this path: \/tmp\/report.md/);
