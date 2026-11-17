@@ -1030,7 +1030,7 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	const shownAgents = executableAgents.slice(0, MAX_LISTED_AGENTS);
 	const shownUnavailableAgents = unavailableAgents.slice(0, MAX_LISTED_AGENTS - shownAgents.length);
 	const shownRestrictedAgents = restrictedAgents.slice(0, MAX_LISTED_AGENTS - shownAgents.length - shownUnavailableAgents.length);
-	const omittedCount = visibleAgents.length - shownAgents.length - shownUnavailableAgents.length - shownRestrictedAgents.length;
+	const omittedCount = Math.max(0, visibleAgents.length - MAX_LISTED_AGENTS);
 	const lines = [
 		capabilityMode ? "Executable agents (capabilities):" : "Executable agents:",
 		...formatAgentListSections(shownAgents, providerNameSet, formatLine),
