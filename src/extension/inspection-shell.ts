@@ -25,16 +25,12 @@ const SAFE_GH_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
 };
 const GH_BLOCKED_FLAGS = new Set([
 	"-F",
-	"-R",
 	"-f",
 	"-X",
 	"--field",
-	"--hostname",
 	"--input",
 	"--method",
 	"--raw-field",
-	"--repo",
-	"--web",
 ]);
 const NO_TEXTCONV_GIT_SUBCOMMANDS = new Set(["diff", "log", "show"]);
 const GIT_DANGEROUS_OPTIONS = new Set([
@@ -91,8 +87,8 @@ function gitSubcommandIndex(args: string[]): number {
 
 function hasBlockedGhArgument(args: string[]): boolean {
 	return args.some((arg) => GH_BLOCKED_FLAGS.has(arg)
-		|| /^(?:-X|-f|-F|-R)/.test(arg)
-		|| /^(?:--method|--raw-field|--field|--input|--hostname|--repo)=/.test(arg));
+		|| /^(?:-X|-f|-F)/.test(arg)
+		|| /^(?:--method|--raw-field|--field|--input)=/.test(arg));
 }
 
 /** Reject command forms that can select a mutating command or inject shell behavior. */
@@ -123,7 +119,25 @@ export function validateInspectionCommand({ program, args }: InspectionParams): 
 		return { ok: true };
 	}
 
-	const [group, command, ...rest] = args;
+	const [group, command] = args;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--hostname" || arg.startsWith("--hostname=")) {
+			return invalid("GitHub host overrides are not available in the inspection shell.");
+		}
+		if (arg === "--web" || arg.startsWith("--web=")) {
+			return invalid("Browser launch flags are not available in the inspection shell.");
+		}
+		if (arg === "--repo" || arg.startsWith("--repo=") || arg.startsWith("-R")) {
+			if (group === "api") return invalid("Repository selection flags are not supported for GitHub API inspection; use a relative /repos/OWNER/REPO path.");
+			const repo = arg === "--repo" || arg === "-R"
+				? args[++index]
+				: arg.startsWith("--repo=") ? arg.slice(7) : arg.slice(2);
+			if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+				return invalid("GitHub repository selection requires OWNER/REPO without a host override.");
+			}
+		}
+	}
 	if (group === "api") {
 		if (command === undefined || command === "graphql" || !command.startsWith("/") || command.startsWith("//")) {
 			return invalid("Only relative GitHub REST paths are available through 'gh api'; GraphQL, absolute URLs, and requests without an endpoint are blocked.");

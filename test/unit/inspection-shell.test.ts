@@ -13,6 +13,44 @@ describe("inspection shell", () => {
 		assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["api", "/repos/acme/project/pulls/123"] }), { ok: true });
 	});
 
+	it("allows repository selection on read-only GitHub commands", () => {
+		for (const repo of [
+			["-R", "brooksmcmillin/pi-config"], ["-Rbrooksmcmillin/pi-config"],
+			["--repo", "brooksmcmillin/pi-config"], ["--repo=brooksmcmillin/pi-config"],
+		]) {
+			const args = ["pr", "view", "14", ...repo, "--json", "url,baseRefOid,headRefOid"];
+			assert.deepEqual(validateInspectionCommand({ program: "gh", args }), { ok: true });
+			assert.deepEqual(buildInspectionArgs("gh", args), args);
+			assert.equal(validateInspectionCommand({ program: "gh", args: ["pr", "merge", "14", ...repo] }).ok, false);
+			for (const flag of ["-XPOST", "-fbody=value", "-Fbody=@file", "--method=POST", "--input=file"]) {
+				assert.equal(validateInspectionCommand({ program: "gh", args: [...args, flag] }).ok, false);
+			}
+		}
+		assert.deepEqual(validateInspectionCommand({ program: "gh", args: [
+			"pr", "view", "https://github.com/brooksmcmillin/pi-config/pull/14", "--json", "url,baseRefOid,headRefOid",
+		] }), { ok: true });
+	});
+
+	it("explains repository, host and browser restrictions separately from mutations", () => {
+		for (const flags of [["-R"], ["--repo"], ["--repo="], ["-R", "--web"],
+			["-R", "other.host/owner/repo"], ["--repo=https://other.host/owner/repo"]]) {
+			assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["pr", "view", "14", ...flags] }), {
+				ok: false, reason: "GitHub repository selection requires OWNER/REPO without a host override.",
+			});
+		}
+		for (const flags of [["--hostname", "other.host"], ["--hostname=other.host"]]) {
+			assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["api", "/repos/owner/repo", ...flags] }), {
+				ok: false, reason: "GitHub host overrides are not available in the inspection shell.",
+			});
+		}
+		assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["pr", "view", "14", "--web"] }), {
+			ok: false, reason: "Browser launch flags are not available in the inspection shell.",
+		});
+		assert.deepEqual(validateInspectionCommand({ program: "gh", args: ["api", "/repos/owner/repo", "-Rowner/repo"] }), {
+			ok: false, reason: "Repository selection flags are not supported for GitHub API inspection; use a relative /repos/OWNER/REPO path.",
+		});
+	});
+
 	it("parses directory options before validating and hardening the subcommand", () => {
 		for (const prefix of [
 			["-C", "/tmp/pi-audit-3-20261109/checkout"],

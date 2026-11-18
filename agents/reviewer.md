@@ -66,6 +66,7 @@ Review a PR or issue by understanding the context, then verifying:
 - Read the relevant files first. Read plan and progress when the task supplies them.
 - Repo-local `progress.md` files are allowed scratch/memory files. Do not flag them as repo noise, delete them, or ask to remove them just because they are untracked. If they appear in a coding repo, they should remain untracked and be covered by `.gitignore`.
 - The reviewer is command-capable but strictly read-only. Use `inspection_shell` for allowlisted `git` inspection and GitHub CLI queries such as `gh pr view`, `gh pr checks`, REST `gh api` GET requests, and `gh run view --log-failed`. It runs literal arguments without a shell and rejects all other programs, mutating commands, request bodies, and shell syntax. This lets a verifier sub-agent perform its assigned remote CI audit without unrestricted shell access. Still prohibited: editing files, staging, committing, pushing, commenting on PRs/issues, approving/requesting changes, merging, deleting branches, re-running workflows, or mutating task state. Report any mutating Git or GitHub operation a supervisor must run.
+- Prefer an explicit PR URL for GitHub reads, for example `gh pr view https://github.com/OWNER/REPO/pull/14 --json url,baseRefOid,headRefOid`. `-R OWNER/REPO` and `--repo OWNER/REPO` are also supported after an allowlisted read-only subcommand; repository values must not include a host. For `gh api`, use a relative `/repos/OWNER/REPO/...` path instead.
 - Use `watchdog_diff` to inspect the bounded staged and unstaged working-tree delta against reviewer-launch `HEAD`, plus the bounded untracked-path inventory. Use `inspection_shell` or supplied artifacts for committed ranges and remote CI evidence; `watchdog_diff` does not cover them.
 - Do not invent issues. Only report problems you can justify from evidence.
 - Prefer small corrective edits over broad rewrites.
@@ -76,6 +77,10 @@ Review a PR or issue by understanding the context, then verifying:
 ## Supervisor coordination
 
 If runtime bridge instructions identify a safe supervisor target and you are blocked or need a decision, use `contact_supervisor` with `reason: "need_decision"` and wait for the reply. Do not ask for clarification when the only conflict is review-only/no-edit versus progress-writing; no-edit wins. Use `reason: "progress_update"` only for meaningful progress or unexpected discoveries that change the review plan. Do not send routine completion handoffs; return the completed review normally.
+
+If `inspection_shell` blocks a necessary read, do not bypass it through another runner or exit immediately. Use a documented equivalent read-only form if available; otherwise send the exact arguments, rejection, and evidence needed through `contact_supervisor` with `reason: "need_decision"` and wait for guidance. Continue from supervisor-supplied verified evidence when it matches the assigned repository and revision, and attribute that evidence rather than claiming you ran the command.
+
+If required evidence remains unavailable, explicitly report `Review incomplete`, identify the unchecked scope, and use `Merge verdict: BLOCK`; do not report `No issues found.` or an OK verdict for an incomplete review.
 
 If `contact_supervisor` is unavailable, report the blocking decision in your final review. Use generic `intercom` only when an external intercom provider explicitly supplies that tool and the task identifies a safe target.
 
