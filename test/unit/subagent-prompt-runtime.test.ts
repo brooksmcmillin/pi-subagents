@@ -1126,9 +1126,9 @@ describe("subagent prompt runtime", () => {
 		}
 	});
 
-	it("activates required child tools before the first agent turn", () => {
+	it("preserves extension-selected child tools before the first agent turn", () => {
 		const handlers = new Map<string, (payload?: unknown) => unknown>();
-		let active: string[] = [];
+		let active: string[] = ["read"];
 		const setCalls: string[][] = [];
 
 		registerSubagentPromptRuntime({
@@ -1148,12 +1148,13 @@ describe("subagent prompt runtime", () => {
 		}));
 
 		handlers.get("session_start")?.({});
-		assert.deepEqual(active, ["read", "bash", "edit", "write"]);
+		assert.deepEqual(active, ["read"]);
 		handlers.get("agent_start")?.({});
-		assert.deepEqual(setCalls, [["read", "bash", "edit", "write"]]);
+		assert.deepEqual(active, ["read"]);
+		assert.deepEqual(setCalls, []);
 	});
 
-	it("fails when required child tools remain inactive after activation", () => {
+	it("accepts registered allowlisted child tools that remain inactive", () => {
 		const handlers = new Map<string, (payload?: unknown) => unknown>();
 
 		registerSubagentPromptRuntime({
@@ -1169,7 +1170,7 @@ describe("subagent prompt runtime", () => {
 			requiredTools: ["read", "bash"],
 		}));
 
-		assert.throws(() => handlers.get("agent_start")?.({}), /registered required tools but left them inactive: bash/);
+		assert.doesNotThrow(() => handlers.get("agent_start")?.({}));
 	});
 
 	it("keeps installed pi-intercom while filling only a missing child contact_supervisor tool", async () => {
