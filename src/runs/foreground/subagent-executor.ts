@@ -3894,6 +3894,17 @@ function writeWorkflowAggregateOutput(outputPath: string | undefined, text: stri
 	}
 }
 
+function assertFreshWorkflowOutput(outputPath: string | undefined): void {
+	if (!outputPath) return;
+	try {
+		fs.lstatSync(outputPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	throw new Error(`Workflow cannot reuse an existing output: ${outputPath}. Set output to a new path.`);
+}
+
 function appendWorkflowOutputWarning(text: string, warning: string | undefined): string {
 	return warning ? `${text}\n\n${warning}` : text;
 }
@@ -6439,6 +6450,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						persist({ tolerateStatusWriteFailure: true });
 					};
 					try {
+						// Relaunches may reuse a report already delivered by a child of the interrupted run.
+						if (!workflowReuseSource) assertFreshWorkflowOutput(workflowAggregateOutputPath);
 						const workflow = await runWorkflowScript({
 							script: workflowScript,
 							...(workflowArgs ? { args: workflowArgs } : {}),
@@ -6605,8 +6618,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 										inheritedNestedRoute(deps)?.rootRunId,
 									);
 									preparedChildParams = childRequest;
-									const launchRefusal = await approveWorkflowChildLaunch(ctx, () => workflowChildLaunchArgs(workflowRunId, key, childRequest, childParams.agent, parentCwd, discoverWorkflowAgents), workflowSignal);
-									if (launchRefusal) return buildRequestedModeError(childRequest, launchRefusal);
+									const approval = await approveWorkflowChildLaunch(ctx, () => workflowChildLaunchArgs(workflowRunId, key, childRequest, childParams.agent, parentCwd, discoverWorkflowAgents), workflowSignal);
+									if ("refusal" in approval) return buildRequestedModeError(childRequest, approval.refusal);
+									// Assigned in place: the WeakMaps below are keyed on this object. A resume's task is its message, which stays as sent.
+									if (approval.task !== undefined && childRequest.action !== "resume") childRequest.task = approval.task;
 									if (workflowUsageBudget.budget) workflowOwnedUsageBudgets.set(childRequest, workflowUsageBudget.budget);
 									if (workflowRequiredExtensions) workflowRetainedRequiredExtensions.set(childRequest, workflowRequiredExtensions);
 									workflowLaunchObservers.set(childRequest, (launch) => {
@@ -6752,7 +6767,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						const terminalSummary = `${status.state === "complete"
 							? "Workflow completed after detached child finished."
 							: errorPreview ?? (pauseForDetached ? "Workflow paused." : "Workflow failed.")}${stopCause ? ` ${WORKFLOW_RUNTIME_REPLACED_STOP_NOTICE}` : ""}${workflowOutputPathMappingSummary(partial.children)}${finalPreflightWarnings.length ? ` ${finalPreflightWarnings.join(" ")}` : ""}`;
-						const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, terminalSummary, producedChildOutputPaths);
+						// Only completion writes the declared file, so its existence never reads as a delivered report.
+						const outputWarning = status.state === "complete"
+							? writeWorkflowAggregateOutput(workflowAggregateOutputPath, terminalSummary, producedChildOutputPaths)
+							: undefined;
 						const resultSummary = appendWorkflowOutputWarning(terminalSummary, outputWarning);
 						const receiptState: WorkflowReceiptState = status.state === "complete" ? "complete" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "failed";
 						const terminalOutcome = workflowFailureTerminalOutcome(error, partial.children, usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)));
@@ -6819,7 +6837,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const workflowHostSteps = new Map<string, HostStepNode>();
 			let liveWorkflow: NonNullable<Details["workflow"]> = { trace: [], emits: [], console: [], ...(workflowResource ? { resource: workflowResource.provenance } : {}) };
 			const childProgress = new Map<string, ReturnType<typeof workflowChildProgress>>();
-			const childLaunches = new Map<string, { agent: string; runId?: string }>();
+			const childLaunches = new Map<string, { agent: string; runId?: string; sessionFile?: string }>();
 			const blockingWorkflowChildren = new Set<string>();
 			let activityTimer: ReturnType<typeof setTimeout> | undefined;
 			let lastProgressAt = 0;
@@ -6835,6 +6853,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				onUpdate?.(workflowProgressUpdate(foregroundWorkflowRunId, chatProgress, liveWorkflow, liveWorkflowChildren, workflowPreflight));
 			};
 			try {
+				assertFreshWorkflowOutput(workflowAggregateOutputPath);
 				const workflow = await runWorkflowScript({
 					script: requestParams.workflowScript,
 					...(workflowArgs ? { args: workflowArgs } : {}),
@@ -6898,8 +6917,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								inheritedNestedRoute(deps)?.rootRunId,
 							);
 							preparedChildParams = childRequest;
-							const launchRefusal = await approveWorkflowChildLaunch(ctx, () => workflowChildLaunchArgs(foregroundWorkflowRunId, key, childRequest, childParams.agent, ctx.cwd, discoverWorkflowAgents), workflowSignal);
-							if (launchRefusal) return buildRequestedModeError(childRequest, launchRefusal);
+							const approval = await approveWorkflowChildLaunch(ctx, () => workflowChildLaunchArgs(foregroundWorkflowRunId, key, childRequest, childParams.agent, ctx.cwd, discoverWorkflowAgents), workflowSignal);
+							if ("refusal" in approval) return buildRequestedModeError(childRequest, approval.refusal);
+							if (approval.task !== undefined && childRequest.action !== "resume") childRequest.task = approval.task;
 							if (workflowUsageBudget.budget) workflowOwnedUsageBudgets.set(childRequest, workflowUsageBudget.budget);
 							if (workflowRequiredExtensions) workflowRetainedRequiredExtensions.set(childRequest, workflowRequiredExtensions);
 							if (delegatedWorkflowPermit) {
@@ -6916,7 +6936,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									(deps.state.blockingWorkflowChildren ??= new Set()).add(launch.runId);
 									blockingWorkflowChildren.add(launch.runId);
 								}
-								childLaunches.set(key, { agent: launch.agent, ...(launch.runId ? { runId: launch.runId } : {}) });
+								childLaunches.set(key, {
+									agent: launch.agent,
+									...(launch.runId ? { runId: launch.runId } : {}),
+									...(launch.sessionFile ? { sessionFile: launch.sessionFile } : {}),
+								});
 								// Telemetry must not decide the child's outcome, as with onTrace in scripted-workflow.
 								try {
 									sendWorkflowProgress();
@@ -7021,7 +7045,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						...(outputMappings ? [outputMappings] : []),
 					],
 					maxOutput: requestParams.maxOutput,
-					aggregateOutputPath: workflowAggregateOutputPath,
+					// A failed workflow's text never goes to the declared output file; truncated text goes to the full-result file.
+					aggregateOutputPath: undefined,
 					fullResultPath: workflowFullResultPath,
 					producedChildOutputPaths,
 				});

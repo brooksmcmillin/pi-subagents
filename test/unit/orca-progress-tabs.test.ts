@@ -73,7 +73,7 @@ function captureCommand(command: string, cwd: string): Promise<string> {
 }
 
 function writeCaptureOrca(dir: string): string {
-	return writeNodeCommand(dir, "orca", "require('fs').writeFileSync(process.env.ORCA_TEST_CAPTURE, JSON.stringify(process.argv.slice(2)))");
+	return writeNodeCommand(dir, "orca", "const fs = require('fs'); const target = process.env.ORCA_TEST_CAPTURE; fs.writeFileSync(target + '.tmp', JSON.stringify(process.argv.slice(2))); fs.renameSync(target + '.tmp', target);");
 }
 
 function shellQuote(value: string): string {
