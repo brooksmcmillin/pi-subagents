@@ -160,6 +160,9 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			const id = recordId(job);
 			if (!id) continue;
 			const state = programState(job, blockedRuns.has(job.asyncId));
+			// Child results belong to the working parent first, not the user. Omission also
+			// clears previously shown results when the parent resumes handling them.
+			if (!parentIdle && (state === "done" || state === "error")) continue;
 			const report = programStatusReport({ state, id, ...(state === "blocked" ? { kind: "question" as const } : {}), title: jobLabel(job), msg: message(job, state) });
 			candidates.push({ id, report, active: state === "working" || state === "blocked", updatedAt: job.updatedAt ?? job.startedAt ?? 0 });
 		}

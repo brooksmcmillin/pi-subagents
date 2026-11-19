@@ -72,6 +72,56 @@ describe("OSC 7501 program status", () => {
 		}
 	});
 
+	it("defers workflow and child results until the parent settles, clearing them on its next start", () => {
+		const workflow = "abcdef12-3456-7890-abcd-ef1234567890";
+		const { instance, jobs, records, writes } = reporter({ jobs: [
+			job(workflow, "running", { mode: "workflow" }),
+			job("child", "running", { parentWorkflowRunId: workflow, workflowKey: "code" }),
+			job("other", "running"),
+		] });
+		instance.agentStarted();
+		jobs.get(workflow)!.status = "complete";
+		jobs.get("child")!.status = "complete";
+		instance.sync();
+		assert.deepEqual(records().slice(3), [
+			{ state: "clear", id: "subagents/abcdef123456" },
+			{ state: "clear", id: "subagents/abcdef123456.code" },
+		]);
+		assert.ok(!records().some(({ state }) => state === "done"));
+		instance.sync();
+		assert.equal(writes.length, 5, "unchanged results stay suppressed");
+		if (process.platform !== "win32") {
+			process.emit("SIGCONT");
+			assert.deepEqual(records().slice(5).map(({ state, id }) => [state, id]), [["working", "subagents/other"]]);
+		}
+		instance.agentSettled();
+		assert.deepEqual(records().slice(-2).map(({ state }) => state), ["done", "done"]);
+		instance.agentStarted();
+		assert.deepEqual(records().slice(-2).map(({ state, id }) => [state, id]), [
+			["clear", "subagents/abcdef123456"],
+			["clear", "subagents/abcdef123456.code"],
+		]);
+		assert.equal(jobs.size, 3, "terminal projection does not remove inspectable results");
+	});
+
+	it("defers failures to the working parent without hiding failures that arrive while idle", () => {
+		for (const status of ["failed", "partial", "rejected"] as const) {
+			const { instance, jobs, records } = reporter();
+			instance.agentStarted();
+			jobs.set("result", job("result", status));
+			instance.sync();
+			assert.deepEqual(records(), [], status);
+			instance.agentSettled();
+			assert.equal(records().at(-1)?.state, "error", status);
+			instance.agentStarted();
+			assert.deepEqual(records().at(-1), { state: "clear", id: "subagents/result" });
+		}
+		const idle = reporter();
+		idle.jobs.set("late", job("late", "failed"));
+		idle.instance.sync();
+		assert.equal(idle.records().at(-1)?.state, "error");
+	});
+
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {
 		const { instance, records, pending } = reporter({ jobs: [job("run-a", "running")] });
 		pending.push({ id: "req-1", runId: "run-a" });
