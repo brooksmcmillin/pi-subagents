@@ -392,9 +392,11 @@ Reports are sent only from an interactive TUI session whose standard output is a
 |---|---|
 | queued or running | `working` |
 | running, with a `contact_supervisor` question the parent left unanswered when it finished its turn | `blocked` (`kind=question`) |
-| complete | `done` |
-| failed, partial, or rejected | `error` |
+| complete | `done` while the parent is idle; cleared while it works |
+| failed, partial, or rejected | `error` while the parent is idle; cleared while it works |
 | stopped or paused | `idle` |
+
+Completion and failure indicators are deferred until the parent fully settles (`agent_settled`), not merely until a child or a low-level agent turn ends. Starting parent work clears previously reported completion and failure records, including workflow children, so internal results do not request user attention while the parent handles them. Running records remain visible, and results remain inspectable in Fleet and run artifacts.
 
 Each record's `title` is the agent names or workflow key, and its `msg` is the current tool while working, or the outcome. Neither includes the task text. Finished runs keep their `done`, `error`, or `idle` record after they leave the async widget, for as long as they are in Fleet's recent history (the last 20 finished runs). Records of runs this session no longer tracks, for example after switching sessions, are cleared. At most 64 records are shown: running and waiting runs first, then finished ones, most recently updated first; older finished records are cleared to make room. When the extension is reloaded or the session is replaced, it clears every record it sent and the new session reports the runs it still tracks. Pi reports its own state on the root record and clears every record, these included, when it quits, suspends with Ctrl+Z, or opens an external editor. After a suspend, this extension sends its records again; after an external editor, each record comes back the next time it changes. Foreground runs are not reported, and tmux drops these sequences unless you configure passthrough.
 
