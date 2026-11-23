@@ -27,20 +27,19 @@ Example shape:
 
 ```typescript
 subagent({
-  workflowScript: `
+  options: { script: `
     const results = await runs.all([
       { key: "deslop", agent: "reviewer", task: "Apply the available 'deslop' skill to review the current diff for concrete cleanup findings only. Do not modify files.", skill: "deslop" },
       { key: "accessibility", agent: "reviewer", task: "Apply the available 'accessibility' skill to review the UI changes for concrete issues only. Do not modify files.", skill: "accessibility" }
     ]);
     return results.map(result => result.output);
-  `,
-  context: "fresh"
+  `, context: "fresh" }
 })
 ```
 
 ## Review-loop technique
 
-Use this when the user wants implementation or current diff review to continue until reviewers stop finding fixes worth doing now. Keep the loop in the parent session: one async `worker` implements or fixes, fresh-context `reviewer` agents inspect the actual repo and diff, the parent synthesizes accepted fixes, and one async forked `worker` applies them. The parent can express the sequence up front as an async/background `workflowScript` when the workflow is known, or continue with explicit follow-up workflowScript runs after each async completion. For an initial workflow, pass `async: true` so the main chat is unblocked. Treat an async implementation worker handoff as an intermediate state, not final completion, unless the user explicitly asked for worker-only work, review-only output, or to stop after implementation. Stop when reviewers find no blockers or fixes worth doing now, remaining feedback is optional or deferred, an unapproved product/scope/architecture decision appears, or the max review-round cap is reached. Default to 3 review rounds unless the user sets a different cap. Do not loop for optional polish, and do not let children launch subagents or decide the loop outcome.
+Use this when the user wants implementation or current diff review to continue until reviewers stop finding fixes worth doing now. Keep the loop in the parent session: one async `worker` implements or fixes, fresh-context `reviewer` agents inspect the actual repo and diff, the parent synthesizes accepted fixes, and one async forked `worker` applies them. The parent can express the sequence up front as an async workflow when the sequence is known, or continue with explicit follow-up workflow runs after each async completion. For an initial workflow, pass `async: true` so the main chat is unblocked. Treat an async implementation worker handoff as an intermediate state, not final completion, unless the user explicitly asked for worker-only work, review-only output, or to stop after implementation. Stop when reviewers find no blockers or fixes worth doing now, remaining feedback is optional or deferred, an unapproved product/scope/architecture decision appears, or the max review-round cap is reached. Default to 3 review rounds unless the user sets a different cap. Do not loop for optional polish, and do not let children launch subagents or decide the loop outcome.
 
 As a conservative orchestration policy, do not pass `turnBudget` or a hard `toolBudget` to an implementation worker, fix worker, reviewer with edit authority, or other mutation-capable child. The default tool budget blocks read/search tools rather than mutation tools, but count limits still do not measure delivery safety. Use a narrow task plus an outer elapsed deadline with enough margin, then request a checkpoint after the current tool returns. The checkpoint should report changed files, build/test state, remaining work, and commit or PR state. An elapsed timeout is not a mutation-safe boundary and must not be used as the checkpoint trigger.
 
@@ -68,34 +67,15 @@ Prefer `async: true`, `context: "fresh"` for reviewers/validators, `outputMode: 
 
 When one child returns a structured target list, use ordinary JavaScript to validate/filter it and map bounded entries into `runs.all`; do not use the removed chain fanout DSL.
 
-Example shape:
-
-```typescript
-subagent({
-  async: true,
-  context: "fresh",
-  chain: [
-    { parallel: [
-      { agent: "reviewer", phase: "Planning", label: "Deploy docs", as: "deployPlan", task: "Plan fixes for deploy docs/workflow. Inspect the current diff. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "plans/deploy.md", outputMode: "file-only" },
-      { agent: "reviewer", phase: "Planning", label: "Scheduler contract", as: "schedulerPlan", task: "Plan fixes for scheduler contract. Inspect the current diff. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "plans/scheduler.md", outputMode: "file-only" },
-      { agent: "reviewer", phase: "Planning", label: "Sandbox/security", as: "sandboxPlan", task: "Plan fixes for sandbox/security. Inspect the current diff. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "plans/sandbox.md", outputMode: "file-only" }
-    ], concurrency: 3 },
-    { agent: "worker", phase: "Implementation", label: "Apply accepted fixes", as: "workerResult", task: "Apply only the accepted fixes from these planning summaries. You are the sole writer for the active worktree. Run focused validation and report changed files, commands, failures, and remaining issues.\n\nDeploy plan:\n{outputs.deployPlan}\n\nScheduler plan:\n{outputs.schedulerPlan}\n\nSandbox plan:\n{outputs.sandboxPlan}", output: "worker/fixes.md", outputMode: "file-only", progress: true },
-    { parallel: [
-      { agent: "reviewer", phase: "Validation", label: "Deploy/scheduler validation", task: "Validate the post-worker diff for deploy and scheduler fixes. Start from the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "validation/deploy-scheduler.md", outputMode: "file-only" },
-      { agent: "reviewer", phase: "Validation", label: "Sandbox validation", task: "Validate the post-worker diff for sandbox/security fixes. Start from the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "validation/sandbox.md", outputMode: "file-only" }
-    ], concurrency: 2 }
-  ]
-})
-```
+Use the [staged fix orchestration example](prompting-and-roles.md#staged-fix-orchestration-technique) for the inline plan → writer → validation call shape.
 
 ## Recon → Plan → Implement
 
 ```js
-subagent({ workflowScript: `
+subagent({ options: { script: `
   const context = await runs.run("recon", { agent: "scout", task: "Inspect the codebase and identify the implementation seam" });
   return (await runs.run("implement", { agent: "worker", task: "Implement from: " + context.output })).output;
-` })
+` } })
 ```
 
 ## Fable mode for complex work
@@ -160,14 +140,14 @@ Example implementation handoff after clarification and optional planning:
 
 ```typescript
 subagent({
-  workflowScript: `return runs.run("implementation", {
+  options: { script: `return runs.run("implementation", {
     agent: "worker",
     task: "Implement the approved feature.\n\nClarified requirements:\n- ...\n\nPlan: see ~/Documents/docs/...-plan.md\n\nValidation contract:\n- ...\n\nReturn a handoff with changed files, what was implemented, what was left undone, commands run with exit codes, validation evidence, surprises/new risks, and decisions needing parent approval.",
     acceptance: {
       level: "checked",
       evidence: ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"]
     }
-  })`,
+  })` },
   async: true
 })
 ```
@@ -176,15 +156,14 @@ Example review pass after implementation:
 
 ```typescript
 subagent({
-  workflowScript: `
+  options: { script: `
     const results = await runs.all([
       { key: "correctness", agent: "reviewer", task: "Review the current diff for correctness and regressions. Inspect changed files directly; do not rely on the worker's reasoning.", output: false },
       { key: "tests", agent: "reviewer", task: "Review the current diff for tests and validation quality against the validation contract. Inspect changed files directly.", output: false },
       { key: "simplicity", agent: "reviewer", task: "Review the current diff for simplicity and maintainability. Inspect changed files directly.", output: false }
     ]);
     return results.map(result => result.output);
-  `,
-  context: "fresh",
+  `, context: "fresh" },
   async: true
 })
 ```
@@ -193,10 +172,10 @@ Example fix worker after parallel reviews:
 
 ```typescript
 subagent({
-  workflowScript: `return runs.run("fix", {
+  options: { script: `return runs.run("fix", {
     agent: "worker",
     task: "Apply the synthesized reviewer feedback below. Only apply fixes worth doing now; preserve user-approved scope; ask before unapproved product or architecture changes. Run focused validation and summarize what changed.\n\nReviewer synthesis:\n..."
-  })`,
+  })` },
   async: true
 })
 ```
@@ -205,19 +184,19 @@ subagent({
 
 Do not treat review as the final step for implementation work. Run reviewers and validators, synthesize their findings against user scope and the validation contract, then launch one `worker` for accepted fixes when implementation is authorized.
 
-When an async implementation worker completes, treat the worker handoff as an intermediate state. The next parent action is review fanout, then synthesis, then a fix worker if reviewers found fixes worth doing now. This can be planned as an initial async `workflowScript` when the whole workflow is known, or continued as follow-up workflowScript runs when the parent only launched the first worker initially. Initial workflows should pass `async: true` so the main chat is unblocked.
+When an async implementation worker completes, treat the worker handoff as an intermediate state. The next parent action is review fanout, then synthesis, then a fix worker if reviewers found fixes worth doing now. This can be planned as an initial async workflow when the whole sequence is known, or continued as follow-up workflow runs when the parent only launched the first worker initially. Initial workflows should pass `async: true` so the main chat is unblocked.
 
 For explicit review-loop requests, repeat worker → fresh-reviewer → synthesized-fix-worker cycles until reviewers find no blockers or fixes worth doing now, remaining feedback is optional or intentionally deferred, an unapproved product/scope/architecture decision needs the user, or the max review-round cap is reached. Default to 3 review rounds unless the user sets a different cap. For complex work, many changed lines, or any fix pass that materially changes the diff, run another focused review round before the parent's final look; otherwise stop instead of chasing optional polish.
 
 ## Parallel non-conflicting analysis
 
 ```js
-subagent({ workflowScript: `
+subagent({ options: { script: `
   return await runs.all([
     { key: "frontend", agent: "scout", task: "Inspect the frontend" },
     { key: "backend", agent: "scout", task: "Inspect the backend" }
   ]);
-` })
+` } })
 ```
 
 Use distinct keys, prompts, and output paths. Do not launch parallel writers into the same checkout.

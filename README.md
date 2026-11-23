@@ -26,6 +26,10 @@ and cold/activated tool-description budgets. It checks staged content with
 unstaged changes temporarily stashed; existing hooks are preserved by
 pre-commit's default migration mode. Node and npm must be on your Git hook's PATH.
 Run `npm run check:budgets` directly for the same checks without committing.
+For changes to subagent call guidance or tool schemas, also run
+`npm run typecheck && npm run check:workflow-guidance` with Node.js 24. That
+local check covers documented call shapes, chain/tasks schemas, and a chain
+launch without `options` when workflow scripts are disabled.
 
 ## Try this first
 

@@ -323,7 +323,7 @@ export function createSubagentParamsSchema(disabled?: DisabledFeatureSurface): t
 	const enabledProperties = Object.fromEntries(Object.entries(ModelTopLevelProperties).flatMap(([name, schema]) => {
 		if (disabled.params.has(name)) return [];
 		if (structured && name === "action") return [[name, StructuredWorkflowProperties.action]];
-		if (structured && name === "options") return [[name, { ...schema, description: "Other options: guide tool-reference/parameter-reference." }]];
+		if (structured && name === "options") return [[name, Type.Optional({ ...schema, description: "Other options: guide tool-reference/parameter-reference." })]];
 		if (structured && name === "task") return [[name, StructuredWorkflowProperties.task], ["tasks", StructuredWorkflowProperties.tasks], ["chain", StructuredWorkflowProperties.chain]];
 		return [[name, schema]];
 	}));
