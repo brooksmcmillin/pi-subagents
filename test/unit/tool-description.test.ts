@@ -76,13 +76,13 @@ describe("registered subagent tool description", () => {
 		for (const description of [DEFAULT_SUBAGENT_TOOL_DESCRIPTION, FULL_SUBAGENT_TOOL_DESCRIPTION, COMPACT_SUBAGENT_TOOL_DESCRIPTION]) {
 			for (const contract of [
 				/One child: \{agent,task\}/,
-				/exactly one top-level subagent workflow call with async:true; prefer options:\{script:"\.\.\."\} for inline code; omit workflow/,
-				/Lost block: replace workflow with options\.script; keep other fields\/options\. Never pass both/,
+				/async:true,options:\{script:"return runs\.run\(/,
+				/omit workflow when using options\.script/,
 				/\{action,id\?,options:\{\.\.\.\}\}; fields not in this schema go in options/,
 				/Launch agents by name and pass models as exact provider\/id; an unknown agent or model returns the valid choices/,
 				/Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it/,
 				/One writer per cwd\/worktree/,
-				/Validate authored scripts first: action:'validate', same inputs; launch after passing/,
+				/Validate authored scripts first: action:'validate', same inputs except launch-only controls; launch after passing/,
 				/Only launchState:'not_started' permits two correction\/revalidation attempts without approval/,
 				/Otherwise stop\/report failures; inspect status before retry. Never blindly relaunch or switch to interactive_shell, pi -ne or another CLI/,
 				/Details: guide workflows or tool-reference/,

@@ -56,8 +56,8 @@ export type PublicSubagentExecutionNormalization<T> =
 	| { ok: true; params: T }
 	| { ok: false; error: string; mode: PublicSubagentExecutionMode };
 
-const RAW_SCRIPT_FORMS = "workflow: true or a workflow script path";
-const REMOVED_WORKFLOW_SCRIPT = "workflowScript was removed; write the script in one ```js workflow block in this reply and call subagent({ workflow: true }), or pass a script file as workflow: \"./path/to/script.js\".";
+const RAW_SCRIPT_FORMS = "options.script without workflow, workflow: true, or a workflow script path";
+const REMOVED_WORKFLOW_SCRIPT = "workflowScript was removed; pass inline source in options.script and omit workflow, or pass a script file as workflow: \"./path/to/script.js\".";
 const REMOVED_WORKFLOW_SCRIPT_PATH = "workflowScriptPath was removed; pass the script file as workflow: \"./path/to/script.js\" (a workflow value containing '/' is a path).";
 
 /** A workflow value containing "/" or "\" is a script path; named workflow resource names contain neither. */

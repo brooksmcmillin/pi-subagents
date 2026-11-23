@@ -16,7 +16,7 @@ import { createEventBus, makeMinimalCtx } from "../support/helpers.ts";
 const SETTING = `disabledFeatures "workflow-scripts"`;
 const DISABLED: ExtensionConfig = { disabledFeatures: ["workflow-scripts"] };
 const surface = resolveDisabledFeatureSurface(DISABLED);
-const LEGACY_ERROR = "Legacy top-level chain and parallel inputs were removed; use a workflow script (workflow: true or a workflow script path).";
+const LEGACY_ERROR = "Legacy top-level chain and parallel inputs were removed; use a workflow script (options.script without workflow, workflow: true, or a workflow script path).";
 const SCRIPTS_DISABLED = `subagent workflow scripts are disabled by config ${SETTING}.`;
 
 function createExecutor(config: ExtensionConfig) {

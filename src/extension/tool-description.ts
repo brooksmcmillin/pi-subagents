@@ -21,11 +21,11 @@ const safetyGuidance = (on: FeatureText) => `SAFETY-CRITICAL SUBAGENT GUIDANCE:
 - Delegate only when the operator asked, directly or through applicable user/project instructions; size, complexity or risk alone is not authorization.
 - Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it.
 - One writer per cwd/worktree; isolate concurrent writers.
-${on("workflow-scripts", "- Validate authored scripts first: action:'validate', same inputs; launch after passing. Only launchState:'not_started' permits two correction/revalidation attempts without approval, overriding blanket stop rules.\n")}- Otherwise stop/report failures; inspect status before retry. Never blindly relaunch or switch to interactive_shell, pi -ne or another CLI.`;
+${on("workflow-scripts", "- Validate authored scripts first: action:'validate', same inputs except launch-only controls; launch after passing. Only launchState:'not_started' permits two correction/revalidation attempts without approval, overriding blanket stop rules.\n")}- Otherwise stop/report failures; inspect status before retry. Never blindly relaunch or switch to interactive_shell, pi -ne or another CLI.`;
 
 export const SUBAGENT_SAFETY_GUIDANCE = safetyGuidance(allEnabled);
 
-const scriptCalls = "One child: {agent,task}. Parallel: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Multi-step: exactly one top-level subagent workflow call with async:true; prefer options:{script:\"...\"} for inline code; omit workflow. workflow:true needs a same-reply ```js workflow block. Lost block: replace workflow with options.script; keep other fields/options. Never pass both.";
+const scriptCalls = "One child: {agent,task}. Parallel: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Inline workflow: {async:true,options:{script:\"return runs.run('check',{agent:'scout',task:'Inspect the current diff.'});\"}}. Send one top-level call and omit workflow when using options.script.";
 const structuredCalls = "One child: {agent,task}. Parallel: tasks:[{agent,task,cwd?,model?},...]. In order: chain:[{agent,task?,as?,cwd?,model?} or {parallel:[{agent,task,cwd?,model?},...]}]; step tasks can use {task}, {previous} and {outputs.name}. Use exactly one top-level subagent chain or tasks call with async:true.";
 
 const essentials = (on: FeatureText) => `${on("workflow-scripts", scriptCalls, structuredCalls)}
@@ -44,7 +44,7 @@ const managementDiscovery = (on: FeatureText) => [
 ].map((group) => group.filter(Boolean).join(", ")).filter(Boolean).join("; ");
 
 const scriptDetails = `• Scripts: JavaScript statement bodies with explicit return, top-level await, plain helpers/Promise chains; nested async function/arrow/method helpers are rejected. Await runs.run('key',{agent,task}) before .output; await runs.all([{key,agent,task},...]) for an ordered array, not a key map. Observe every stored run promise with direct await, Promise.race or Promise.all. Await/return runs.steer(key,message,options?) for a prior key, never raw run ids; queued/delivered/missed/failed receipts are not compliance proof.
-• workflow:'./path.js' (any value with '/') loads a file from request cwd; other strings name a resource, such as {workflow:'review',args:{task:'...'}}. agent/task exclude workflow; task excludes action; validate accepts workflow:true or a path without launching. Raw-script sandboxes add deeply frozen args that persist as evidence, so never include secrets; raw scripts cannot use runs.host. Granted commands/relative outputs use workflow cwd, never per-step cwd.
+• workflow:'./path.js' loads a file from request cwd; use a resource name for a named workflow, such as {workflow:'review',args:{task:'...'}}. agent/task exclude workflow; task excludes action; Validate authored scripts without launching; named resources launch without action. Raw-script sandboxes add deeply frozen args that persist as evidence, so never include secrets; raw scripts cannot use runs.host. Granted commands/relative outputs use workflow cwd, never per-step cwd.
 • runs.lanes([{key,stages:[{key,agent,task},{key,resume:'previous',task}]}]) runs first stages together, later stages sequentially per lane. Failures stay lane-local; only explicit structuredOutput.verdict === 'blocked' blocks a successful stage, never reviewer prose.
 `;
 

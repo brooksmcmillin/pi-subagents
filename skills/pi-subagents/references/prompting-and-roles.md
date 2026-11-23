@@ -25,7 +25,7 @@ they do not authorize a launch.
 
 ## Tool vs Slash Commands
 
-Agents use the `subagent(...)` tool for execution, management, status, and control. Direct `{ agent, task }` execution is enough for one bounded child task; use a workflow script (one ```` ```js workflow ```` block in the reply plus `subagent({ workflow: true })`) when the parent needs JavaScript control flow or data-dependent branching, keyed, parallel, sequential, retry, retained-resume, aggregate, or explicit staged-lane behavior (`runs.lanes`). Humans often use the slash-command layer instead:
+Agents use the `subagent(...)` tool for execution, management, status, and control. Direct `{ agent, task }` execution is enough for one bounded child task; use a workflow script (pass inline source in `options.script` and omit `workflow`) when the parent needs JavaScript control flow or data-dependent branching, keyed, parallel, sequential, retry, retained-resume, aggregate, or explicit staged-lane behavior (`runs.lanes`). Humans often use the slash-command layer instead:
 
 - `/run` — launch a single agent
 - `subagent({ workflow: ... })` — the workflow-script surface for sequence, parallelism, branching, retries, and aggregation; with `disabledFeatures: ["workflow-scripts"]`, top-level `chain` and `tasks` replace it (see [configuration](../../../docs/configuration.md#chain-and-tasks-without-workflow-scripts))
@@ -84,7 +84,7 @@ Default guardrails:
 
 Example shape:
 
-```js workflow
+```js
 const results = await runs.all([
   { key: "deslop", agent: "reviewer", task: "Apply the available 'deslop' skill to review the current diff for concrete cleanup findings only. Do not modify files.", skill: "deslop" },
   { key: "accessibility", agent: "reviewer", task: "Apply the available 'accessibility' skill to review the UI changes for concrete issues only. Do not modify files.", skill: "accessibility" }
@@ -93,7 +93,7 @@ return results.map(result => result.output);
 ```
 
 ```typescript
-subagent({ workflow: true, options: { context: "fresh" } })
+subagent({ async: true, options: { script, context: "fresh" } }) // script is the source above
 ```
 
 ### Review-loop technique
@@ -135,7 +135,7 @@ When one child returns a structured target list, use ordinary JavaScript to vali
 
 Single-seam example shape (the lane board records that these are review angles on one tightly coupled deployment-lifecycle diff, not independent implementation contracts):
 
-```js workflow
+```js
 // Stage 1: parallel read-only review angles on one recorded single seam
 const plans = await runs.all([
   { key: "correctness-plan", agent: "reviewer", phase: "Planning", label: "Review lifecycle correctness", task: "Plan correctness fixes for the same deployment-lifecycle diff. Do not modify project/source files; returning findings via the configured output artifact is allowed.", output: "plans/correctness.md", outputMode: "file-only" },
@@ -165,7 +165,7 @@ return { worker: worker.output, validations: validations.map(v => v.output) };
 ```
 
 ```typescript
-subagent({ workflow: true, async: true, options: { context: "fresh" } })
+subagent({ async: true, options: { script, context: "fresh" } }) // script is the source above
 ```
 
 ## Builtin Agents

@@ -100,7 +100,7 @@ Alternatively, the `workflow` field selects the script source:
 - A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file.
 - Any other string, such as `workflow: "review"`, is a [named workflow resource](#named-workflow-resources-for-permission-extensions). The string `"true"` is read as `workflow: true`, because some MCP clients send the boolean as a string.
 
-`workflow: true` works only from a model tool call. Slash commands, RPC, and schedules pass scripts through their own inputs. Examples below that show only a ```` ```js workflow ```` block run with `subagent({ workflow: true })` in the same reply.
+`workflow: true` works only from a model tool call. Slash commands, RPC, and schedules pass scripts through their own inputs. For standalone script snippets below, pass just the JavaScript source as `options.script` and omit `workflow`, even where the example uses a `js workflow` label.
 
 For multi-step or parallel work, make exactly one top-level `subagent` workflow call with `async:true` and launch children only inside it. Read this guide for recipes rather than constructing a second top-level orchestration. Available sandbox helpers include `runs.run`, `runs.all`, `runs.lanes`, `runs.steer`, `runs.status`, `runs.ref`/`runs.refs`, `emit`, `console`, standard JavaScript, and mission `state` when enabled. No filesystem, shell, arbitrary Pi tools, or host globals are available; named resources alone may grant `runs.host` authority.
 
@@ -156,19 +156,15 @@ reviewer runtime availability or review acceptance.
 
 ### Script validation and arguments
 
-Every script launch automatically runs static validation before allocating an async run or launching children. Before launching authored code, also call `action: "validate"` with the exact source, args, cwd and options you intend to launch, then wait for it to pass. Revalidate after changing those inputs. This side-effect-free preflight applies to `options.script`, reply-block and file-backed scripts; it never executes the script or launches children. It is not a reservation or proof of runtime success: dynamic values still receive runtime checks.
+Every script launch automatically runs static validation before allocating an async run or launching children. Before launching authored code, also call `action: "validate"` with the exact source, args, cwd and options shared with launch, then wait for it to pass. Omit launch-only controls such as `globalConcurrencyLimit`. Revalidate after changing those inputs. This side-effect-free preflight applies to `options.script`, reply-block and file-backed scripts; it never executes the script or launches children. It is not a reservation or proof of runtime success: dynamic values still receive runtime checks.
 
 Syntax failures include 1-based line/column coordinates and a bounded source excerpt with a caret. Validation results include `launchState: "not_started"`; failed prelaunch validation also includes bounded correction instructions. Follow [prelaunch recovery](#failed-lane-recovery-and-execution-mode-boundaries), not the runtime-failure stop rule.
 
-For example, validate this reply-block script:
-
-```js workflow
-const results = await runs.all([{ key: "scan", agent: "scout", task: "Scan" }]);
-return results[0].output;
-```
+For example, validate inline source without a `workflow` field:
 
 ```js
-subagent({ action: "validate", workflow: true });
+const script = 'const results = await runs.all([{ key: "scan", agent: "scout", task: "Scan" }]); return results[0].output;';
+subagent({ action: "validate", options: { script } });
 ```
 
 For a script stored in a file, pass its path:
@@ -517,20 +513,14 @@ return runs.run("fix", { agent: "worker", task: "Implement these findings:\n" + 
 
 Legacy top-level `chain`, `tasks`, `parallel`, `chainDir`, `/chain`, `/parallel`, `/run-chain`, and durable `.chain.md` execution are no longer the public workflow API. Rewrite them as JavaScript. The exception is `disabledFeatures: ["workflow-scripts"]`, which replaces workflow scripts with top-level `chain` and `tasks` (see [configuration](configuration.md#chain-and-tasks-without-workflow-scripts)).
 
-```js workflow
-// Old shape, no longer supported:
-// { chain: [{ agent: "scout", task: "Scan" }, { agent: "worker", task: "Fix from {previous}" }] }
-
-// Current shape: this ```js workflow block plus subagent({ workflow: true })
+```js
+// Replaces legacy { chain: [...] }. Pass this source in options.script.
 const scan = await runs.run("scan", { agent: "scout", task: "Scan" });
 return runs.run("fix", { agent: "worker", task: "Fix from: " + scan.output });
 ```
 
-```js workflow
-// Old shape, no longer supported:
-// { tasks: [{ agent: "reviewer", task: "Review API" }, { agent: "reviewer", task: "Review UI" }] }
-
-// Current shape: this ```js workflow block plus subagent({ workflow: true })
+```js
+// Replaces legacy { tasks: [...] }. Pass this source in options.script.
 return runs.all([
   { key: "api", agent: "reviewer", task: "Review API" },
   { key: "ui", agent: "reviewer", task: "Review UI" }
