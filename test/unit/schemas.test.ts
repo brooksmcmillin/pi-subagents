@@ -210,9 +210,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const workflow = SubagentParams?.properties?.workflow;
 		assert.equal(hasAnyOfType(workflow, "boolean"), true);
 		assert.equal(anyOfBranches(workflow).find((branch) => branch.type === "string")?.minLength, 1);
-		assert.match(String(workflow?.description ?? ""), /true: run the one ```js workflow block written in this same reply/);
-		assert.match(String(workflow?.description ?? ""), /String with '\/': script file read from request cwd/);
-		assert.match(String(workflow?.description ?? ""), /Other string: named workflow resource/);
+		assert.match(String(workflow?.description ?? ""), /reply fence/);
+		assert.match(String(workflow?.description ?? ""), /\.\/flow\.js.*named resource/);
+		assert.match(String(workflow?.description ?? ""), /omit.*options\.script/i);
 		assert.match(String(workflow?.description ?? ""), /no runs.host/);
 		const args = SubagentParams?.properties?.args;
 		assert.equal(args?.type, "object");
@@ -274,8 +274,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(actionSchema.minLength, 1);
 		assert.equal(actionSchema.enum, undefined);
 		const description = String(actionSchema.description ?? "");
-		assert.match(description, /Management\/control only; omit for execution/);
-		assert.match(description, /validate accepts workflow: true or a script path/);
+		assert.match(description, /Management\/control/);
+		assert.match(description, /Validate.*launch script input/);
 		assert.match(description, /\{action:"guide",options:\{topic:"tool-reference"\}\}/);
 		assert.doesNotMatch(description, /orchestration\./);
 	});
@@ -472,9 +472,10 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(properties.options?.type, "object");
 		assert.equal(properties.options?.additionalProperties, true);
 		assert.equal(properties.options?.properties, undefined);
-		assert.match(String(properties.options?.description ?? ""), /acceptance, timeoutMs.*guide tool-reference\/parameter-reference/);
+		assert.match(String(properties.options?.description ?? ""), /options\.script; omit workflow.*guide tool-reference\/parameter-reference/);
 		const { resolveDisabledFeatureSurface } = await import("../../src/shared/disabled-features.ts");
 		const structured = createProviderSchema!(resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] }));
+		assert.doesNotMatch(JSON.stringify(structured), /options\.script/);
 		assert.ok(JSON.stringify(structured).length <= 2_450, `expected structured schema at or under 2,450 chars, got ${JSON.stringify(structured).length}`);
 		assert.deepEqual(Object.keys(structured.properties as JsonSchemaNode), ["agent", "task", "tasks", "chain", "async", "model", "cwd", "worktree", "output", "action", "id", "message", "options"]);
 

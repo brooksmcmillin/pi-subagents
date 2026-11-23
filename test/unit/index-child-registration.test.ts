@@ -117,7 +117,7 @@ describe("subagent extension child mode", () => {
 				modelRegistry: { getAvailable() { return []; } },
 			};
 			for (const tool of [tools.parent, tools.fanout]) {
-				await assert.rejects(tool.execute("model-script", { workflowScript: "return 1" }, new AbortController().signal, undefined, ctx), /workflowScript was removed.*subagent\(\{ workflow: true \}\)/);
+				await assert.rejects(tool.execute("model-script", { workflowScript: "return 1" }, new AbortController().signal, undefined, ctx), /workflowScript was removed.*options\.script.*omit workflow/);
 				await assert.rejects(tool.execute("model-path", { workflowScriptPath: "ci/sweep.js" }, new AbortController().signal, undefined, ctx), /workflowScriptPath was removed.*workflow: "\.\/path\/to\/script\.js"/);
 			}
 			assert.deepEqual(expanded, [], "rejected calls must not reach parent execution");

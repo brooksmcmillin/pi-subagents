@@ -34,7 +34,7 @@ For durable evidence, copy only the final summary to session memory, a PR body/c
 
 ## Best Practices
 
-- Run subagents asynchronously by default; direct one-child execution is enough for one bounded task, while a workflow script (a ```` ```js workflow ```` block plus `subagent({ workflow: true })`) is the composition surface for JavaScript control flow and data-dependent branching. Use `async: false` only when the parent must block. See `references/execution-controls.md` → Async/background for wait semantics.
+- Run subagents asynchronously by default; direct one-child execution is enough for one bounded task, while a workflow script (pass inline source in `options.script` and omit `workflow`) is the composition surface for JavaScript control flow and data-dependent branching. Use `async: false` only when the parent must block. See `references/execution-controls.md` → Async/background for wait semantics.
 - For a predeclared broad plan split into visible narrow stages, use `runs.lanes([...])` inside a workflow script; use raw `runs.run(...)`/`runs.all(...)` for conditional or rolling flows. See [`execution-controls.md`](execution-controls.md#parallel-sequential-lanes).
 - Keep one writer per cwd/worktree. Parallelize reading, review, and validation; concurrent writers need isolated worktrees. Give every child a cold-start packet with its goal, target/ref, authority, context, success criteria, validation, output, and stop rules.
 - Keep tasks narrow and standalone; do not rely on issue numbers, broad globs, or supervisor round-trips to supply missing context.

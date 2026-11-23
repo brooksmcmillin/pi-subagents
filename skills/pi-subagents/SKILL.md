@@ -43,23 +43,20 @@ and their resolved `tools` allow `subagent`.
 | Council of advisors | `../council-mode/SKILL.md` |
 | Management, status, steering, authoring, or inspection | `action` |
 
-For inline workflow scripts, prefer `subagent({ options: { script: "..." },
-async: true, ... })` and omit `workflow` entirely. Tool arguments preserve the
-source even on hosts that drop reply code fences. Use
-`workflow: "./path/to/script.js"` for a script file and `workflow: "<name>"`
-for a named resource.
+Pass inline JavaScript source as `options.script` and omit `workflow` from
+both calls:
 
-`workflow: true` is an alternative only when one ```` ```js workflow ````
-fenced block reaches the session in the same reply as the tool call. If that
-block is lost, remove the `workflow` field and put its source in `options.script`,
-preserving other fields and options. Never pass both `workflow` and
-`options.script`; retry with the argument form for the rest of the turn.
+```js
+subagent({ action: "validate", options: { script } })
+// After validation passes, launch with the same source:
+subagent({ async: true, options: { script } })
+```
 
-Before launching authored workflow code, call `subagent({ action: "validate",
-options: { script: "..." }, args: { ... } })` with the exact source and args you
-will launch. For files, use the same `workflow: "./path.js"`; for `workflow:true`,
-repeat the same fenced source with each call. Validation starts no workflow or
-children. Launch only after it passes; revalidate after changing the source or args.
+`script` is the JavaScript source string. Keep the same `args`, `cwd`, and
+shared workflow options on both calls; omit launch-only controls from validation. For a script file, use the same
+`workflow: "./path/to/script.js"` instead of `options.script`. Validation launches no children; revalidate
+if the source or args change. For a named resource, launch with
+`workflow: "<name>"` and no `action`; the raw script validation step does not apply.
 A failure reporting `launchState: "not_started"` permits at most two corrections
 and revalidations within the original scope without approval. Report the failure
 if those attempts fail. Runtime failures or uncertain launch state require status

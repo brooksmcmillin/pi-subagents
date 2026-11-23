@@ -53,9 +53,9 @@ must resume it by key.
 
 ### Forked context
 
-Write this block in the reply, then call `subagent({ workflow: true })` (see [Scripted workflows](#scripted-workflows)):
+Pass this source as `options.script` (see [Scripted workflows](#scripted-workflows)):
 
-```js workflow
+```js
 return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction and challenge assumptions.", context: "fork" });
 ```
 
@@ -82,25 +82,20 @@ workflow whenever the parent is starting a coordinated wave, such as multiple
 reviews, review plus gate monitor, worker then monitor setup, cross-repo prep
 lanes, or a fanout that the parent will consume together.
 
-Write the script as one ```` ```js workflow ```` fenced block in the reply, then
-call `subagent({ workflow: true, ... })` in the same reply. The block is plain
-text, so it needs no JSON string escaping; a line containing only ```` ``` ````
-(three or more backticks) ends it. A reply carries one block and one
-`workflow: true` call. Use `workflow: "./path/to/script.js"` for a script file.
-Later examples that show only a ```` ```js workflow ```` block run with
-`subagent({ workflow: true })`.
+Put the JavaScript source in `options.script` and omit `workflow`. Validate
+first with `subagent({ action: "validate", options: { script } })`; after it
+passes, launch with `subagent({ async: true, options: { script } })` using the
+same source and workflow inputs. Use `workflow: "./path/to/script.js"` instead
+for a script file. Workflow code snippets below show source to pass in
+`options.script`, not fences to send in a reply.
 
-```js workflow
+```js
 const scan = await runs.run("scan", { label: "Map target behavior", agent: "scout", task: "Map the target" });
 const reviews = await runs.all([
   { key: "correctness", label: "Review target correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
   { key: "tests", label: "Review target test coverage", agent: "reviewer", task: "Review tests: " + scan.output }
 ]);
 return reviews.map(result => result.output);
-```
-
-```js
-subagent({ workflow: true, async: true })
 ```
 
 Scripts run in a timed worker with only `runs.run`, `runs.all`, `runs.status`, `runs.ref/refs`, `emit`, captured `console`, and standard JavaScript. Pass explicit task text to `runs.run`. Mission-attached workflows also get `await state.get(key)` and `await state.set(key, value)` for durable JSON state shared across workflows on the same mission; `mission: false` workflows have no `state` global. Stable keys are required. Child launches follow ordinary single-agent execution controls. Give each child a distinct decision and output path when reports must outlive the workflow, then consume the aggregate workflow result before opening individual reports. Do not ask children to write `reports/...` or other repo-root scratch paths in task text.
@@ -194,12 +189,8 @@ fleet. If `PI_SUBAGENT_WAIT_TOOL_ENABLED` disables blocking, direct waits return
 immediately, but headless `agent_end` auto-drain still surfaces provider,
 reconciliation, or timeout failures.
 
-```js workflow
-return runs.run("main", { agent: "worker", task: "Run the full test suite" });
-```
-
-```typescript
-subagent({ workflow: true, async: true })
+```js
+subagent({ async: true, options: { script: 'return runs.run("main", { agent: "worker", task: "Run the full test suite" });' } })
 ```
 
 File-only output mode works for workflow script child launches. Use relative child output paths for scratch reports so the runtime stores them under the run artifact directory and age-based cleanup can remove them. Use absolute paths only for user-approved durable destinations, such as session memory, a docs folder outside the repo, or a known handoff path. For cross-codebase waves, include the repo slug or lane key in each output path so reports from different repositories cannot collide.
@@ -208,12 +199,9 @@ The `output` field is the API binding; a filename mentioned in task text is only
 
 For review fanout where the parent continues a local audit:
 
-```js workflow
-return runs.run("correctness", { agent: "reviewer", task: "Review the current diff for correctness issues. Do not edit files." });
-```
-
-```typescript
-const run = subagent({ workflow: true, async: true, options: { context: "fresh" } })
+```js
+const script = 'return runs.run("correctness", { agent: "reviewer", task: "Review the current diff for correctness issues. Do not edit files." });';
+const run = subagent({ async: true, options: { script, context: "fresh" } })
 // Continue local inspection, then later call status with the returned id.
 ```
 
@@ -288,8 +276,8 @@ A cooperating terminal runtime can register read-only external records through `
 Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for. To keep schedules outside the project repository, set `{ "scheduledRuns": { "storeRoot": "~/.pi/subagent-schedules" } }` in the same config: `storeRoot` accepts an absolute path or a `~/`-prefixed path, and records land under `<storeRoot>/<sha256(path.resolve(cwd)) first 20 hex>/<scheduleId>/`.
 
 ```typescript
-// One-shot reviewer, after a ```js workflow block with the script
-subagent({ action: "schedule.create", id: "evening-review", workflow: true, options: { name: "Evening review", at: "+30m" } })
+// One-shot reviewer; script is the JavaScript source string.
+subagent({ action: "schedule.create", id: "evening-review", options: { script, name: "Evening review", at: "+30m" } })
 
 // Fixed recurring workflow from a script file
 subagent({ action: "schedule.create", id: "backlog", workflow: "./.pi/workflows/backlog.js", options: { every: "6h", catchUp: "latest" } })
@@ -304,7 +292,7 @@ subagent({ action: "schedule.run-due" })
 subagent({ action: "schedule.delete", id: "backlog" })
 ```
 
-`schedule.create` accepts exactly one target, a workflow script (`workflow: true` or a script path; the script text is stored at creation), and exactly one trigger (`at`, or a fixed `every` interval using `m`, `h`, `d`, or `w`). Runs always launch async with fresh context and no automatic mission; mission attachment is deferred from this first slice. `overlap` is currently `skip`; `catchUp` supports `latest` and `none`. `schedule.run-due` is the headless external-launcher seam. Calendar recurrence, cron, and the schedule inspector are deferred from this first safe slice. Definitions, bounded history, append-only events, and per-run receipts remain project-scoped across Pi sessions.
+`schedule.create` accepts exactly one target, a workflow script (`options.script` or a script path in `workflow`; the script text is stored at creation), and exactly one trigger: `at`, a fixed `every` interval, or a calendar `every` rule. Runs launch async with fresh context and no automatic mission; `missionId` can attach an existing mission. `overlap` is `skip`; `catchUp` supports `latest` and `none`. `schedule.run-due` is the headless external-launcher seam. See the [schedule guide](../../../docs/missions.md#schedules) for trigger options. Definitions, bounded history, append-only events, and per-run receipts remain project-scoped across Pi sessions.
 
 Humans can use `/subagents-doctor` for the same read-only report. It checks runtime paths, discovery counts, async support, current session context, and intercom bridge state.
 
@@ -331,7 +319,7 @@ A soft interrupt cancels the current child turn and leaves the run paused. It do
 
 Per-run control thresholds can be overridden when a task legitimately runs without observable output for longer than usual:
 
-```js workflow
+```js
 return runs.run("slow-tests", {
   agent: "worker",
   task: "Run the slow migration test suite",
@@ -442,8 +430,8 @@ Project panes run a separate Pi session from the target directory. Subagents lau
 
 ```typescript
 subagent({ action: "mission.create", options: { mission: { title: "Ship auth refresh", objective: "Implement and validate refresh handling" } } })
-subagent({ workflow: true, options: { missionId: "<mission-id>" } }) // after a ```js workflow block
-subagent({ workflow: true, options: { mission: false } }) // after a ```js workflow block
+subagent({ options: { script, missionId: "<mission-id>" } })
+subagent({ options: { script, mission: false } })
 subagent({ action: "mission.list", options: { missionScope: "global" } })
 subagent({ action: "mission.resolve-decision", id: "<decision-id>", options: { missionId: "<mission-id>", summary: "Settled: ship the v2 API; no schema freeze needed." } })
 subagent({ action: "project.open", cwd: "/path/to/other-repo", message: "Own this mission for the project and report back with receipts." })
@@ -457,7 +445,7 @@ subagent({ action: "mission.close", options: { missionId: "<mission-id>", missio
 When multiple agents might write concurrently, use worktrees instead of letting
 them share one filesystem view.
 
-```js workflow
+```js
 const results = await runs.all([
   { key: "feature-a", agent: "worker", task: "Implement feature A", worktree: true },
   { key: "feature-b", agent: "worker", task: "Implement feature B", worktree: true }
@@ -506,13 +494,13 @@ The intended oracle loop is:
 4. the main agent decides what direction to approve
 5. only then should `worker` implement
 
-```js workflow
+```js
 // Advisory review in a branched thread. Oracle defaults to forked context.
 return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction, challenge assumptions, and propose the best next move." });
 ```
 
-```js workflow
-// Implementation only after explicit approval, in a later reply. Worker defaults to fresh context.
+```js
+// Pass this source in a separate tool call, only after explicit approval. Worker defaults to fresh context.
 return runs.run("implementation", { agent: "worker", task: "Implement the approved approach: ..." });
 ```
 

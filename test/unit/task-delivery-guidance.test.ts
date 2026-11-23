@@ -9,7 +9,7 @@ const recipePath = "skills/pi-subagents/references/task-delivery.md";
 const read = (path: string) => readFileSync(resolve(path), "utf8").replace(/\r\n/g, "\n");
 const recipe = read(recipePath);
 const skill = read("skills/pi-subagents/SKILL.md");
-const extractScript = (text: string) => text.match(/```js workflow\n([\s\S]*?)\n```/)?.[1];
+const extractScript = (text: string) => text.match(/^```js\n([\s\S]*?)\n```$/m)?.[1];
 const script = extractScript(recipe);
 assert.ok(script, "recipe must include the executable two-stage example");
 

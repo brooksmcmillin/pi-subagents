@@ -156,7 +156,7 @@ const SubagentParamProperties = {
 	extensionBindings: Type.Optional(Type.Unsafe({ type: "object", maxProperties: 16, additionalProperties: true, description: "Child-only plain JSON; package.name/1; depth 16, 256 props, 16 KiB." })),
 	// Management action (when present, tool operates in management mode)
 	action: Type.Optional(Type.String({ minLength: 1,
-		description: "Management/control only; omit for execution. validate accepts workflow: true or a script path. Discover actions with {action:\"guide\",options:{topic:\"tool-reference\"}}."
+		description: "Management/control. Validate with the launch script input. Discover: {action:\"guide\",options:{topic:\"tool-reference\"}}."
 	})),
 	capabilities: Type.Optional(Type.Boolean({ description: "list: compact capability rows/details without system prompts." })),
 	search: Type.Optional(Type.String({ minLength: 1, description: "list: case-insensitive match on agent name, alias, or description." })),
@@ -220,7 +220,7 @@ const SubagentParamProperties = {
 	})),
 	workflow: Type.Optional(Type.Unsafe<string | true>({
 		anyOf: [{ type: "boolean" }, { type: "string", minLength: 1 }],
-		description: "true: run the one ```js workflow block written in this same reply (false invalid). String with '/': script file read from request cwd. Other string: named workflow resource. Raw scripts (true or path) have no runs.host.",
+		description: "Script path (e.g. './flow.js') or named resource. Legacy true reads a reply fence. Omit with options.script. Raw scripts have no runs.host.",
 	})),
 	args: Type.Optional(Type.Unsafe({ type: "object", maxProperties: MAX_ARGS_FIELDS, additionalProperties: true, description: `Plain-JSON args for workflow; ${MAX_ARGS_FIELDS} fields/object, ${MAX_ARGS_ITEMS} items/array, depth ${MAX_ARGS_DEPTH}, ${MAX_ARGS_BYTES / 1024} KiB total; raw-script args are exposed deeply frozen and persisted, so do not include secrets.` })),
 	reuseFrom: Type.Optional(Type.String({ minLength: 1, description: "Exact id of a workflow run ended by a reload, handoff or Pi exit; this async workflow reuses its finished children and re-attaches to its running ones." })),
@@ -296,7 +296,7 @@ export const SubagentOptionParams = Type.Object(SubagentOptionProperties, { addi
 
 const ModelTopLevelProperties = {
 	agent, task, workflow, args, async, model, cwd, worktree, output, action, id, message,
-	options: Type.Optional(Type.Unsafe<Record<string, unknown>>({ type: "object", additionalProperties: true, description: "Every field not listed here, such as acceptance, timeoutMs, context, view and index; guide tool-reference/parameter-reference." })),
+	options: Type.Optional(Type.Unsafe<Record<string, unknown>>({ type: "object", additionalProperties: true, description: "Inline source: options.script; omit workflow. Other options: guide tool-reference/parameter-reference." })),
 };
 
 export const SubagentParams = keepTopLevelParameterDescriptions(Type.Object(ModelTopLevelProperties));
@@ -323,6 +323,7 @@ export function createSubagentParamsSchema(disabled?: DisabledFeatureSurface): t
 	const enabledProperties = Object.fromEntries(Object.entries(ModelTopLevelProperties).flatMap(([name, schema]) => {
 		if (disabled.params.has(name)) return [];
 		if (structured && name === "action") return [[name, StructuredWorkflowProperties.action]];
+		if (structured && name === "options") return [[name, { ...schema, description: "Other options: guide tool-reference/parameter-reference." }]];
 		if (structured && name === "task") return [[name, StructuredWorkflowProperties.task], ["tasks", StructuredWorkflowProperties.tasks], ["chain", StructuredWorkflowProperties.chain]];
 		return [[name, schema]];
 	}));

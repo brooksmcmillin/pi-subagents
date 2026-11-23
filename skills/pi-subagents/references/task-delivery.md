@@ -49,7 +49,7 @@ staged-tree plus diff identity), validation commands/results, and open blockers.
 The reviewer must verify that identity before inspecting files, report a mismatch
 as blocked, and independently inspect evidence rather than trust writer prose.
 
-```js workflow
+```js
 const writer = await runs.run("delivery-write", {
   label: "Implement approved change", agent: "worker", cwd: args.cwd,
   context: "fresh", task: args.writerPacket,
@@ -64,9 +64,9 @@ const review = await runs.run("delivery-review", {
 return { stage: "parent-disposition", writer, review };
 ```
 
-Write the block and call `subagent({ workflow: true, async: true, cwd: CWD,
-args: { cwd: CWD, writerPacket: WRITER_PACKET, reviewPacket: REVIEW_PACKET } })`
-in the same reply. Omit child `async` so `await runs.run` observes completion,
+Pass the source string in `subagent({ async: true, cwd: CWD, options: { script },
+args: { cwd: CWD, writerPacket: WRITER_PACKET, reviewPacket: REVIEW_PACKET } })`.
+Omit child `async` so `await runs.run` observes completion,
 not a dispatch receipt. A failed child rejects the awaited call and stops the
 sequence before review. Relative `output` paths bind reports under run artifacts,
 not the repository; filenames in task prose do not bind outputs. Inspect returned

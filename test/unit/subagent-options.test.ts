@@ -170,7 +170,14 @@ describe("registered subagent tools with options", () => {
 			await assert.rejects(call({ action: "status", id: "missing-run", options: { view: "transcript", lines: 5 } }), /Transcript target: run missing-run/);
 			await assert.rejects(call({ action: "steer", id: "missing-run", message: "focus", options: { mode: "plan" } }), /action='steer' mode must be/);
 			assert.match(text(await call({ action: "schedule.create", workflow: "./flow.js", options: { every: "1h", name: "nightly" } })), /Trigger: every 1h/);
-			assert.match(text(await call({ action: "validate", options: { script: "return 1;" } })), /"ok":true/);
+			const source = "return 1;";
+			assert.match(text(await call({ action: "validate", options: { script: source } })), /"ok":true/);
+			await call({ action: "schedule.create", id: "inline", options: { script: source, at: "+30m" } });
+			const scheduled = await call({ action: "schedule.show", id: "inline" });
+			assert.equal(scheduled.details.schedules.records[0].target.workflowScript, source);
+			assert.equal(scheduled.details.schedules.records[0].trigger.kind, "once");
+			const history = await call({ action: "schedule.history", id: "inline" });
+			assert.deepEqual(history.details.schedules.runs, []);
 			await assert.rejects(call({ workflow: true, options: { script: "return 1;" } }), /options\.script replaces workflow/);
 			await assert.rejects(call({ agent: "worker", task: "scan", options: { acceptance: "checked", timeoutMs: 3000000000 } }), /timeoutMs must be a positive integer no larger/);
 			const theme = { fg(_name, value) { return value; }, bold(value) { return value; } };
