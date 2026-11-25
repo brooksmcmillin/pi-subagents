@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { buildCompletionKey } from "../../src/runs/background/completion-dedupe.ts";
 import { createResultWatcher as createRawResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { collectWaitCompletions } from "../../src/runs/background/wait-completions.ts";
@@ -268,19 +269,29 @@ describe("result watcher", () => {
 		const state = createState();
 		state.currentSessionId = "session-current";
 		const order: string[] = [];
+		const terminalHolds: boolean[] = [];
+		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
+			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
 			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) order.push("subscriber wake");
 		} } }, state, resultsDir, 60_000, {
 			notifier: { async deliver() { order.push("non-waking notice"); return true; } },
 			onResultDelivered: () => order.push("release"),
+			onOwnedQueueChanged: reporter.sync,
 		});
 		try {
+			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
 			const resultPath = path.join(resultsDir, "wake-order.json");
 			writeIndexedResult(resultPath, { id: "wake-order", sessionId: "session-current", success: true, summary: "done" });
 			watcher.primeExistingResults();
-			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			assert.equal(state.asyncJobs.size, 0);
+			assert.deepEqual(terminalHolds, [true], "owned indexed work is held before coalescing");
+			assert.deepEqual(order, []);
+			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
+			assert.deepEqual(terminalHolds, [true, false]);
 		} finally {
+			reporter.dispose();
 			watcher.stopResultWatcher();
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}

@@ -423,6 +423,20 @@ export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: st
 	return firstExistingResultFile([...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)]);
 }
 
+/** Do not infer absence from an inaccessible pending or public location. */
+export function resultPayloadVisibility(resultsDir: string, sessionId: string, runId: string): "present" | "absent" | "unknown" {
+	let unknown = false;
+	for (const candidate of [...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)]) {
+		try {
+			if (fs.statSync(candidate).isFile()) return "present";
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENAMETOOLONG") unknown = true;
+		}
+	}
+	return unknown ? "unknown" : "absent";
+}
+
 function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEntry): ResultPayloadLocation | undefined {
 	if (entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
 	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file);

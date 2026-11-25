@@ -116,11 +116,13 @@ describe("retained foreground nested route tracker", () => {
 			path: [...foreground.path, { runId: foreground.id }], asyncDir: path.join(asyncRoot, "independent") };
 		writeNestedEvent(nestedRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: owner.parentRunId, child: { ...owner, state: "failed" } });
 		writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 201, parentRunId: foreground.parentRunId, child: foreground });
-		writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 202, parentRunId: independent.parentRunId, child: independent });
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
 		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
 		try {
 			tracker.track(nestedRoute.rootRunId);
+			await new Promise((resolve) => setTimeout(resolve, 35));
+			assert.equal(state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId), true, "foreground work stays live without close proof");
+			writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 202, parentRunId: independent.parentRunId, child: independent });
 			fs.mkdirSync(owner.asyncDir, { recursive: true });
 			fs.writeFileSync(path.join(owner.asyncDir, "process-terminal.json"), JSON.stringify({
 				version: 1, state: "observed", runId: ownerId, runnerProcessInstanceId: "runner", observedAt: 300,

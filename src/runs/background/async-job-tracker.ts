@@ -31,6 +31,7 @@ import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summar
 import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
+import { resultPayloadVisibility } from "./result-files.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
@@ -631,10 +632,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
-						const published = reconciliation.resultPath && fs.existsSync(reconciliation.resultPath);
-						publicationClosed = !published && readProcessTerminal(job.asyncDir, {
+						let published = Boolean(reconciliation.resultPath && fs.existsSync(reconciliation.resultPath));
+						if (!published && job.sessionId && readProcessTerminal(job.asyncDir, {
 							runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
-						})?.state === "observed";
+						})?.state === "observed") {
+							const visibility = resultPayloadVisibility(resultsDir, job.sessionId, job.asyncId);
+							published = visibility === "present";
+							publicationClosed = visibility === "absent";
+						}
 						if (published || publicationClosed) {
 							publication = { pending: false };
 							terminalPublications.set(job.asyncId, publication);

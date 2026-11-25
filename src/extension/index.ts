@@ -472,7 +472,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const hasOutstandingResults = () => owedResultRunIds.size > 0 || hasLiveSubagentWork(state);
 	const programStatus = registerProgramStatusReporter({
 		enabled: config.programStatus !== false,
-		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend(),
+		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend() || resultWatcher.hasQueuedOwnedResults(),
 		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
 			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
 		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? parentWake.getQueuedWait() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
@@ -486,7 +486,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		widgetCollapsed: asyncWidgetCollapsed,
 		widgetLayout: asyncWidgetLayout,
 		onJobTerminal: (job, publicationClosed) => {
-			if (publicationClosed && job.sessionId && !resultPayloadFileForSessionRun(DIRS.results, job.sessionId, job.asyncId)) {
+			if (publicationClosed) {
 				owedResultRunIds.delete(job.asyncId);
 			} else {
 				holdOwedResult(job);
@@ -507,6 +507,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		{
 			notifier: completionNotifier,
 			ownership: resultDeliveryOwnership,
+			onOwnedQueueChanged: programStatus.sync,
 			onResultDelivered: (runId) => {
 				owedResultRunIds.delete(runId);
 				if (state.asyncJobs.has(runId)) deliveredRunIds.add(runId);

@@ -71,6 +71,7 @@ type ResultWatcherDeps = {
 	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds" | "deliveryOwnerId">;
 	/** Called once the parent has this run's result: the notifier accepted it, or an earlier delivery already did. */
 	onResultDelivered?: (runId: string) => void;
+	onOwnedQueueChanged?: () => void;
 };
 
 type ResultFileChild = {
@@ -231,6 +232,7 @@ export function createResultWatcher(
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
 	deliverPendingResults: () => Promise<void>;
 	hasPendingResults: () => boolean;
+	hasQueuedOwnedResults: () => boolean;
 	refreshResultDelivery: () => void;
 	stopResultWatcher: () => void;
 } {
@@ -246,6 +248,7 @@ export function createResultWatcher(
 	});
 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
 	const pendingTriggerTurn = new Map<string, boolean>();
+	const queuedOwnedResults = new Set<string>();
 	const incompleteResultRetries = new Map<string, number>();
 	const processing = new Set<string>();
 	const handling = new Set<Promise<void>>();
@@ -279,6 +282,12 @@ export function createResultWatcher(
 	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0) => {
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
+		const identity = identityCache.get(file)?.identity;
+		if (delayMs === 0 && identity?.sessionId && !queuedOwnedResults.has(file)
+			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
+			queuedOwnedResults.add(file);
+			deps.onOwnedQueueChanged?.();
+		}
 		state.resultFileCoalescer.schedule(file, delayMs);
 	};
 
@@ -365,6 +374,12 @@ export function createResultWatcher(
 		if (identity.runId && fsApi.existsSync(missionObserverIndexPath(resultsDir, identity.runId))) return true;
 		if (identity.runId && (observed ?? observedRunIds()).has(identity.runId)) return true;
 		return Boolean(deps.observeCompletion && !deps.observedCompletionRunIds);
+	};
+
+	const markDeliverySettled = (file: string, runId: string) => {
+		const dequeued = queuedOwnedResults.delete(file);
+		deps.onResultDelivered?.(runId);
+		if (dequeued) deps.onOwnedQueueChanged?.();
 	};
 
 	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot): void => {
@@ -511,6 +526,7 @@ export function createResultWatcher(
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
+				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
@@ -573,6 +589,7 @@ export function createResultWatcher(
 			}), nestedChildren);
 
 			if (alreadyDelivered) {
+				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
 				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
@@ -678,7 +695,7 @@ export function createResultWatcher(
 			}
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 			// A completion subscriber may queue a wake even if the notifier did not.
-			deps.onResultDelivered?.(runId);
+			markDeliverySettled(file, runId);
 			if (!observerSucceeded) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
@@ -705,7 +722,11 @@ export function createResultWatcher(
 		pendingTriggerTurn.delete(file);
 		const run = handleResult(file, triggerTurn);
 		handling.add(run);
-		void run.finally(() => handling.delete(run));
+		const epoch = deliveryEpoch;
+		void run.finally(() => {
+			handling.delete(run);
+			if (epoch === deliveryEpoch && !processing.has(file) && !pendingTriggerTurn.has(file) && queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
+		});
 	}, deps.coalesceDelayMs ?? 50);
 	state.resultFileCoalescer = resultFileCoalescer;
 
@@ -901,6 +922,7 @@ export function createResultWatcher(
 		deliveryActive = true;
 		activeSessionId = state.currentSessionId;
 		deliveryEpoch += 1;
+		queuedOwnedResults.clear();
 		identityCache.clear();
 	};
 
@@ -914,10 +936,11 @@ export function createResultWatcher(
 		clearResultScan();
 		state.resultFileCoalescer.clear();
 		pendingTriggerTurn.clear();
+		queuedOwnedResults.clear();
 		processing.clear();
 		identityCache.clear();
 		incompleteResultRetries.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, hasPendingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults: () => queuedOwnedResults.size > 0, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }

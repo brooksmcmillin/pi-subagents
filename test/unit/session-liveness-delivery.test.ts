@@ -15,7 +15,8 @@ import { SUBAGENT_ASYNC_COMPLETE_EVENT } from "../../src/shared/types.ts";
 // send is rejected, and whose accepted wake is started by the parent later.
 const terminalBeforePublicationScript = String.raw`
 	import assert from "node:assert/strict";
-	import * as fs from "node:fs";
+	import fsDefault, * as fs from "node:fs";
+	import { syncBuiltinESMExports } from "node:module";
 	import * as path from "node:path";
 	import { createEventBus } from "@earendil-works/pi-coding-agent";
 	import registerSubagentExtension from "./src/extension/index.ts";
@@ -157,7 +158,26 @@ const terminalBeforePublicationScript = String.raw`
 			if (!closedFirst) {
 				assert.deepEqual(holds, [true]);
 				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
-				writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+				const stat = fsDefault.statSync;
+				let denied = false;
+				fsDefault.statSync = (file, ...args) => {
+					if (String(file).includes("result-pending")) {
+						denied = true;
+						throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+					}
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				try {
+					writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+					events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+					for (let i = 0; i < 130 && !denied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+					assert.equal(denied, true);
+					assert.deepEqual(holds, [true]);
+				} finally {
+					fsDefault.statSync = stat;
+					syncBuiltinESMExports();
+				}
 				events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
 			}
 			for (let i = 0; i < 130 && holds.at(-1) === true; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
@@ -192,7 +212,7 @@ describe("session liveness through result delivery", () => {
 		["status", "stays live from a child's terminal status through a rejected send until its wake starts"],
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
 		["pending", "holds detached terminal status while an owned result exists only in pending storage"],
-		["closed", "releases terminal holds when the result writer definitively closes without publishing"],
+		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
