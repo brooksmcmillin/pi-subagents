@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AsyncJobState } from "../shared/types.ts";
+import { WAKE_PENDING_MS } from "../shared/parent-wake.ts";
 import { sanitizeDisplayText } from "../shared/display-text.ts";
 
 /**
@@ -25,6 +26,8 @@ export interface ProgramStatusReporterOptions {
 	hasBackgroundWork: () => boolean;
 	/** Uses the parent wake reservation, which can expire without a lifecycle event. */
 	hasPendingWake?: () => boolean;
+	getQueuedWake?: () => string | undefined;
+	now?: () => number;
 	/** Pending native supervisor requests that expect a reply. */
 	getPendingRequests: () => Iterable<{ id: string; runId: string }>;
 	write?: (data: string) => void;
@@ -141,6 +144,9 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	let setBackgroundWork: ((key: string, active: boolean) => void) | undefined;
 	let reportedBackgroundWork = false;
 	let wakeRefresh: ReturnType<typeof setTimeout> | undefined;
+	const now = options.now ?? Date.now;
+	let lastQueuedWake: string | undefined;
+	let queuedWakeDeadline = 0;
 	// A request counts as waiting on the user only after the parent settled without answering it.
 	let unansweredAtSettle = new Set<string>();
 	// Pi clears every OSC 7501 record when it suspends on Ctrl+Z and re-reports only its own root
@@ -155,7 +161,13 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	// finished ones, each most recently updated first, up to the cap. Only the difference is written.
 	const sync = (): void => {
 		if (!active) return;
-		const pendingWake = options.hasPendingWake?.() ?? false;
+		const queuedWake = options.getQueuedWake?.();
+		const pendingParentWake = options.hasPendingWake?.();
+		if (queuedWake !== lastQueuedWake || !parentIdle || pendingParentWake) {
+			lastQueuedWake = queuedWake;
+			queuedWakeDeadline = now() + WAKE_PENDING_MS;
+		}
+		const pendingWake = pendingParentWake || (queuedWake !== undefined && now() < queuedWakeDeadline);
 		if (parentIdle && pendingWake) {
 			if (!wakeRefresh) {
 				wakeRefresh = setTimeout(() => {
@@ -225,6 +237,10 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			sync();
 		},
 		agentSettled() {
+			// A busy turn can queue a wake long before delivering it at the next boundary.
+			if (!parentIdle && options.getQueuedWake?.() !== undefined) {
+				queuedWakeDeadline = now() + WAKE_PENDING_MS;
+			}
 			parentIdle = true;
 			unansweredAtSettle = new Set([...options.getPendingRequests()].map((request) => request.id));
 			sync();

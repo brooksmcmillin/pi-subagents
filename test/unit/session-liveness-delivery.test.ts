@@ -198,6 +198,12 @@ describe("session liveness through result delivery", () => {
 			id, runId: id, sessionId, completionOwnerId: currentCompletionOwnerId(), success: false, summary: `${id} needs the parent`,
 		});
 		const activeAt: Record<string, boolean | undefined> = {};
+		const terminalHolds: boolean[] = [];
+		const holdsAtSettle: Array<boolean | undefined> = [];
+		const term = process.env.TERM;
+		process.env.TERM = "xterm-256color";
+		const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 		const faux = fauxProvider({ provider: "session-liveness", models: [{ id: "local" }], tokensPerSecond: 100_000 });
 		faux.setResponses([
 			() => fauxAssistantMessage("First reply."),
@@ -210,7 +216,6 @@ describe("session liveness through result delivery", () => {
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			extensionFactories: [
 				(api) => { api.registerProvider(faux.provider); },
-				registerSubagentExtension,
 				(api) => {
 					api.on("agent_start", () => {
 						if ("duringTurn" in activeAt) return;
@@ -226,6 +231,7 @@ describe("session liveness through result delivery", () => {
 						activeAt.atSettle = provider?.isActive();
 					});
 				},
+				registerSubagentExtension,
 			],
 		});
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -233,13 +239,25 @@ describe("session liveness through result delivery", () => {
 			await resourceLoader.reload();
 			const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json"), allowModelNetwork: false });
 			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
-			await session.bindExtensions({});
+			await session.bindExtensions({ mode: "tui", uiContext: {
+				setWidget() {}, setStatus() {},
+				setBackgroundWork: (_key: string, active: boolean) => terminalHolds.push(active),
+			} as unknown as NonNullable<Parameters<typeof session.bindExtensions>[0]["uiContext"]> });
+			session.subscribe((event) => {
+				if (event.type === "agent_settled") holdsAtSettle.push(terminalHolds.at(-1));
+			});
 			await session.prompt("Start the original turn.");
+			assert.equal(holdsAtSettle[0], true, "the first settle retains the queued completion hold");
+			assert.deepEqual(terminalHolds, [true, false], "terminal hold clears only after the final follow-up");
 			assert.deepEqual(activeAt, { duringTurn: true, atSettle: true, finalSettle: false });
 			assert.equal(session.messages.filter((message) => message.role === "custom" && message.customType === "subagent-notify").length, 2, "Pi started both queued wakes");
 			await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 		} finally {
 			session?.dispose();
+			if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (term === undefined) delete process.env.TERM;
+			else process.env.TERM = term;
 			delete (globalThis as Record<PropertyKey, unknown>)[registryKey];
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

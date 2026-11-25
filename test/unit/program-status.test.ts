@@ -26,7 +26,7 @@ function decode(report: string): Record<string, string> {
 
 const reporters: ProgramStatusReporter[] = [];
 
-function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
+function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWake?: () => string | undefined; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
 	const writes: string[] = [];
 	const jobs = new Map<string, AsyncJobState>((input.jobs ?? []).map((entry) => [entry.asyncId, entry as AsyncJobState]));
 	const pending = input.pending ?? [];
@@ -36,6 +36,8 @@ function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasP
 		getJobs: () => jobs.values(),
 		hasBackgroundWork: input.hasBackgroundWork ?? (() => false),
 		hasPendingWake: input.hasPendingWake,
+		getQueuedWake: input.getQueuedWake,
+		now: input.now,
 		getPendingRequests: () => pending,
 		write: (data) => writes.push(data),
 		isTTY: input.isTTY ?? true,
@@ -153,6 +155,54 @@ describe("OSC 7501 program status", () => {
 		instance.agentSettled();
 		assert.deepEqual(holds, [true, false]);
 		assert.deepEqual(records().filter(({ state }) => state === "done" || state === "error").map(({ state }) => state), ["done", "error"]);
+	});
+
+	it("keeps a queued result across a long busy turn and into its follow-up", () => {
+		let now = 0;
+		let queuedWake: string | undefined;
+		let running = true;
+		const { instance, jobs, holds, records } = reporter({ jobs: [job("review", "running")],
+			hasBackgroundWork: () => running, getQueuedWake: () => queuedWake, now: () => now });
+		instance.agentStarted();
+		queuedWake = "busy-turn-result";
+		running = false;
+		jobs.get("review")!.status = "complete";
+		instance.sync();
+		now += 60_000;
+		instance.agentSettled();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done"));
+		instance.agentStarted();
+		queuedWake = undefined;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
+	it("holds a deferred compaction wake across its transition to a parent wake", () => {
+		let now = 0;
+		let compacting = true;
+		let deferred = true;
+		let pending = false;
+		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")], now: () => now,
+			hasPendingWake: () => (deferred && compacting) || pending,
+			getQueuedWake: () => deferred ? "compaction" : undefined });
+		now += 60_000;
+		instance.sync();
+		compacting = false;
+		instance.sync();
+		deferred = false;
+		pending = true;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.deepEqual(records(), []);
+		instance.agentStarted();
+		pending = false;
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
 	});
 
 	it("releases a failed wake after its reservation expires, but not while Pi is preparing it", (t) => {

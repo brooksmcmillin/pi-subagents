@@ -473,7 +473,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const programStatus = registerProgramStatusReporter({
 		enabled: config.programStatus !== false,
 		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend(),
-		hasPendingWake: parentWake.isPending,
+		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
+			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
+		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
 		getPendingRequests: () => supervisorChannel.pending.values(),
@@ -1245,6 +1247,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				},
 				{ triggerTurn: true },
 			);
+			programStatus.sync();
 		};
 		compactionResumeTimer = setTimeout(wakeWhenIdle, COMPACTION_RESUME_POLL_MS);
 	};

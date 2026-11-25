@@ -9,7 +9,7 @@ export const STATUS_ACTION = "Check the run status and details above, then resum
 // A wake whose run never starts emits no agent_start; past this deadline an idle parent's wake counts as abandoned.
 // Pi persists the waking notice only when its run reaches message_end, so a run that never starts loses it;
 // notify.ts records undelivered subagent-notify notices at shutdown and replays them at the next start.
-const WAKE_PENDING_MS = 10_000;
+export const WAKE_PENDING_MS = 10_000;
 
 // Reload replaces extension instances, not Pi's session manager or a wake still starting.
 // The key and shape are shared with pi-intercom's idle wake: a wake prompt it sends is in
@@ -38,6 +38,7 @@ export interface ParentWake {
 	isHeld(): boolean;
 	/** True once if a wake was only appended because a manual compaction was in progress. */
 	takeDeferredWake(): boolean;
+	hasDeferredWake(): boolean;
 	sessionShutdown(reason: string | undefined): void;
 }
 
@@ -94,6 +95,7 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage">, now: () 
 		},
 		userAborted: () => { held = true; },
 		isHeld: () => held,
+		hasDeferredWake: () => deferred,
 		takeDeferredWake() {
 			const wasDeferred = deferred;
 			deferred = false;
