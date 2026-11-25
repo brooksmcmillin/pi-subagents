@@ -38,7 +38,7 @@ export interface ProgramStatusReporterOptions {
 
 export interface ProgramStatusReporter {
 	/** Only the interactive TUI session on a real terminal reports. */
-	sessionStarted(input: { hasUI: boolean; mode?: string; setBackgroundWork?: (key: string, active: boolean) => void }): void;
+	sessionStarted(input: { hasUI: boolean; mode?: string; setBackgroundWork?: (key: string, active: boolean) => void }): boolean;
 	sync(): void;
 	agentStarted(): void;
 	agentSettled(): void;
@@ -232,6 +232,7 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 				listeningForResume = true;
 			}
 			sync();
+			return active;
 		},
 		sync,
 		agentStarted() {

@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { retainLiveForegroundNestedRoute } from "../../src/integrations/pi-web-session-liveness.ts";
+import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { createRetainedNestedRouteTracker } from "../../src/runs/background/retained-nested-route-tracker.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
@@ -50,19 +51,29 @@ afterEach(() => {
 });
 
 describe("retained foreground nested route tracker", () => {
-	it("releases retained liveness after the nested descendant completes", async () => {
+	it("holds TUI terminal status until the retained descendant completes without Pi Web", async () => {
 		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("retained-root");
 		writeState(nestedRoute, "running", 100);
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
 
-		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
+		const holds: boolean[] = [];
+		const reporter = registerProgramStatusReporter({
+			enabled: true, getJobs: () => [], getPendingRequests: () => [],
+			hasBackgroundWork: () => Boolean(state.retainedForegroundNestedRoutes?.size),
+			isTTY: true, env: { TERM: "xterm-256color" },
+		});
+		assert.equal(reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) }), true);
+		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10, onRoutesChanged: reporter.sync });
 		try {
 			tracker.track(nestedRoute.rootRunId);
+			assert.deepEqual(holds, [true]);
 			writeState(nestedRoute, "complete", 200);
-			await waitFor(() => !state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId));
+			await waitFor(() => holds.length === 2);
+			assert.deepEqual(holds, [true, false]);
 		} finally {
 			tracker.clear();
+			reporter.dispose();
 		}
 	});
 

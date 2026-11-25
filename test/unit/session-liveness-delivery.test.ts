@@ -77,6 +77,7 @@ const terminalBeforePublicationScript = String.raw`
 	const reports = [];
 	if (closedCase) {
 		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
 		Object.defineProperty(process.stdout, "isTTY", { value: true });
 		const write = process.stdout.write.bind(process.stdout);
 		process.stdout.write = (chunk, ...args) => typeof chunk === "string" && chunk.startsWith("\x1b]7501;") ? (reports.push(chunk), true) : write(chunk, ...args);
@@ -229,7 +230,9 @@ describe("session liveness through result delivery", () => {
 		const timeline: string[] = [];
 		const holdsAtSettle: Array<boolean | undefined> = [];
 		const term = process.env.TERM;
+		const programStatus = process.env.PI_PROGRAM_STATUS;
 		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
 		const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 		const faux = fauxProvider({ provider: "session-liveness", models: [{ id: "local" }], tokensPerSecond: 100_000 });
@@ -294,6 +297,8 @@ describe("session liveness through result delivery", () => {
 			else Reflect.deleteProperty(process.stdout, "isTTY");
 			if (term === undefined) delete process.env.TERM;
 			else process.env.TERM = term;
+			if (programStatus === undefined) delete process.env.PI_PROGRAM_STATUS;
+			else process.env.PI_PROGRAM_STATUS = programStatus;
 			delete (globalThis as Record<PropertyKey, unknown>)[registryKey];
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

@@ -263,6 +263,29 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("hands a non-waking completion to subscribers before releasing its delivery hold", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const order: string[] = [];
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
+			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) order.push("subscriber wake");
+		} } }, state, resultsDir, 60_000, {
+			notifier: { async deliver() { order.push("non-waking notice"); return true; } },
+			onResultDelivered: () => order.push("release"),
+		});
+		try {
+			const resultPath = path.join(resultsDir, "wake-order.json");
+			writeIndexedResult(resultPath, { id: "wake-order", sessionId: "session-current", success: true, summary: "done" });
+			watcher.primeExistingResults();
+			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("records an id-alias result when runId is empty", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-id-alias-"));
 		try {

@@ -639,7 +639,6 @@ export function createResultWatcher(
 			}
 			// A newer payload replaced this one; keep the hold until that one is delivered.
 			if (markReplacedPayload()) return;
-			deps.onResultDelivered?.(runId);
 			try {
 				const marked = markDeliveredNotification(publicResultPath(file), data, read, Date.now());
 				identityCache.delete(file);
@@ -677,6 +676,9 @@ export function createResultWatcher(
 			} catch (error) {
 				reportResultWatcherWarning(state, `Completion observer failed for '${resultPath}'`, error);
 			}
+			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+			// A completion subscriber may queue a wake even if the notifier did not.
+			deps.onResultDelivered?.(runId);
 			if (!observerSucceeded) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;

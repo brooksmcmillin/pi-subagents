@@ -1279,10 +1279,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			})
 			: { registered: false, release: () => {} };
 		releaseHostSessionLiveness = liveness.release;
-		if (liveness.registered) {
-			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state);
-			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
-		}
 		herdrStatusBridge.sessionStarted({
 			hasUI: ctx.hasUI === true,
 			runs: activeHerdrRuns(),
@@ -1290,7 +1286,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const ui = ctx.mode === "tui" && ctx.hasUI
 			? ctx.ui as ExtensionContext["ui"] & Pick<Parameters<typeof programStatus.sessionStarted>[0], "setBackgroundWork">
 			: undefined;
-		programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork });
+		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork });
+		if (liveness.registered || terminalStatusActive) {
+			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state, { onRoutesChanged: programStatus.sync });
+			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
+		}
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
 		supervisorChannel.activateTransport();
