@@ -22,6 +22,9 @@ export interface ProgramStatusReporterOptions {
 	/** `programStatus` from the user config; only `false` turns it off. */
 	enabled: boolean;
 	getJobs: () => Iterable<AsyncJobState>;
+	hasBackgroundWork: () => boolean;
+	/** Uses the parent wake reservation, which can expire without a lifecycle event. */
+	hasPendingWake?: () => boolean;
 	/** Pending native supervisor requests that expect a reply. */
 	getPendingRequests: () => Iterable<{ id: string; runId: string }>;
 	write?: (data: string) => void;
@@ -31,7 +34,7 @@ export interface ProgramStatusReporterOptions {
 
 export interface ProgramStatusReporter {
 	/** Only the interactive TUI session on a real terminal reports. */
-	sessionStarted(input: { hasUI: boolean; mode?: string }): void;
+	sessionStarted(input: { hasUI: boolean; mode?: string; setBackgroundWork?: (key: string, active: boolean) => void }): void;
 	sync(): void;
 	agentStarted(): void;
 	agentSettled(): void;
@@ -135,6 +138,9 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	const sent = new Map<string, string>();
 	let active = false;
 	let parentIdle = true;
+	let setBackgroundWork: ((key: string, active: boolean) => void) | undefined;
+	let reportedBackgroundWork = false;
+	let wakeRefresh: ReturnType<typeof setTimeout> | undefined;
 	// A request counts as waiting on the user only after the parent settled without answering it.
 	let unansweredAtSettle = new Set<string>();
 	// Pi clears every OSC 7501 record when it suspends on Ctrl+Z and re-reports only its own root
@@ -149,6 +155,25 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	// finished ones, each most recently updated first, up to the cap. Only the difference is written.
 	const sync = (): void => {
 		if (!active) return;
+		const pendingWake = options.hasPendingWake?.() ?? false;
+		if (parentIdle && pendingWake) {
+			if (!wakeRefresh) {
+				wakeRefresh = setTimeout(() => {
+					wakeRefresh = undefined;
+					sync();
+				}, 1_000);
+				wakeRefresh.unref();
+			}
+		} else {
+			clearTimeout(wakeRefresh);
+			wakeRefresh = undefined;
+		}
+		const backgroundWork = pendingWake || options.hasBackgroundWork();
+		// Let the parent enter its follow-up turn before releasing its completion hold.
+		if (backgroundWork !== reportedBackgroundWork && (backgroundWork || parentIdle)) {
+			reportedBackgroundWork = backgroundWork;
+			setBackgroundWork?.("pi-subagents", backgroundWork);
+		}
 		const blockedRuns = new Set<string>();
 		if (parentIdle) {
 			for (const request of options.getPendingRequests()) {
@@ -161,8 +186,8 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			if (!id) continue;
 			const state = programState(job, blockedRuns.has(job.asyncId));
 			// Child results belong to the working parent first, not the user. Omission also
-			// clears previously shown results when the parent resumes handling them.
-			if (!parentIdle && (state === "done" || state === "error")) continue;
+			// clears previously shown results when work resumes.
+			if ((!parentIdle || backgroundWork) && (state === "done" || state === "error")) continue;
 			const report = programStatusReport({ state, id, ...(state === "blocked" ? { kind: "question" as const } : {}), title: jobLabel(job), msg: message(job, state) });
 			candidates.push({ id, report, active: state === "working" || state === "blocked", updatedAt: job.updatedAt ?? job.startedAt ?? 0 });
 		}
@@ -185,7 +210,8 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	};
 
 	return {
-		sessionStarted({ hasUI, mode }) {
+		sessionStarted({ hasUI, mode, setBackgroundWork: reportBackgroundWork }) {
+			setBackgroundWork = reportBackgroundWork;
 			active = options.enabled && hasUI && mode === "tui" && isTTY && env.TERM !== "dumb" && env.PI_PROGRAM_STATUS !== "0";
 			if (active && !listeningForResume && process.platform !== "win32") {
 				process.on("SIGCONT", resend);
@@ -208,6 +234,10 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 				for (const id of sent.keys()) write(programStatusReport({ state: "clear", id }));
 			}
 			sent.clear();
+			clearTimeout(wakeRefresh);
+			wakeRefresh = undefined;
+			setBackgroundWork = undefined;
+			reportedBackgroundWork = false;
 			active = false;
 			if (listeningForResume) {
 				process.off("SIGCONT", resend);

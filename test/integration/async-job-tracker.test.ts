@@ -414,29 +414,41 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("reports a tracked run to the terminal as working, then done, and keeps the done record after widget cleanup", async () => {
+	it("reports a tracked run to the terminal as done only after pending delivery clears", async () => {
 		const asyncRoot = createTempDir("pi-async-job-program-status-");
 		try {
 			const state = createState();
 			const ui = createUiContext();
 			const writes: string[] = [];
+			const parentStatus: Array<[string, boolean]> = [];
+			let pendingDelivery = false;
 			const programStatus = registerProgramStatusReporter({
 				enabled: true,
 				getJobs: () => new Map([...state.fleetJobs, ...state.asyncJobs]).values(),
+				hasBackgroundWork: () => pendingDelivery || [...state.asyncJobs.values()].some((job) => job.status === "running" || job.status === "queued"),
 				getPendingRequests: () => [],
 				write: (data) => writes.push(data),
 				isTTY: true,
 				env: { TERM: "xterm-256color" },
 			});
-			programStatus.sessionStarted({ hasUI: true, mode: "tui" });
-			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { completionRetentionMs: 5, onJobsChanged: programStatus.sync });
+			programStatus.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (key, active) => parentStatus.push([key, active]) });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, {
+				completionRetentionMs: 5,
+				onJobsChanged: programStatus.sync,
+			});
 			tracker.resetJobs(ui.ctx as never);
 			tracker.handleStarted({ id: "run-osc", asyncDir: path.join(asyncRoot, "run-osc"), agent: "worker" });
+			pendingDelivery = true;
 			tracker.handleComplete({ id: "run-osc", success: true });
 			await waitForCondition(() => state.asyncJobs.size === 0, "widget cleanup", 1000);
 
-			const states = writes.map((report) => /state=(\w+):id=([^:]+)/.exec(report)?.slice(1).join(" "));
-			assert.deepEqual(states, ["working subagents/runosc", "done subagents/runosc"]);
+			assert.deepEqual(parentStatus, [["pi-subagents", true]]);
+			assert.ok(!writes.some((report) => report.includes("state=done")));
+			pendingDelivery = false;
+			programStatus.sync();
+			assert.deepEqual(parentStatus, [["pi-subagents", true], ["pi-subagents", false]]);
+			assert.equal(writes.at(-1)?.includes("state=done:id=subagents/runosc"), true);
+			programStatus.dispose();
 		} finally {
 			removeTempDir(asyncRoot);
 		}

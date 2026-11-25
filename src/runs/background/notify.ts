@@ -162,6 +162,8 @@ export interface RegisterSubagentNotifyOptions {
 
 export interface CompletionNotifier {
 	deliver(result: CompletionNotification): Promise<boolean>;
+	/** True while a completion is batched or being sent, excluding already queued wakes. */
+	hasPendingSend(): boolean;
 	/** True while a completion is batched, being sent, or accepted as a wake that Pi has not started yet. */
 	hasPendingDelivery(): boolean;
 	/** Releases a completion wake once Pi starts it (native message_start). */
@@ -1104,6 +1106,7 @@ export default function registerSubagentNotify(
 
 	return {
 		deliver,
+		hasPendingSend: () => pending.size > 0,
 		hasPendingDelivery: () => pending.size > 0 || unstartedWakes.length > 0,
 		messageStarted(message) {
 			if (message.role !== "custom" || message.customType !== "subagent-notify") return;

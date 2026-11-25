@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
 import { registerProgramStatusReporter, type ProgramStatusReporter } from "../../src/integrations/program-status.ts";
+import { createParentWake } from "../../src/shared/parent-wake.ts";
 import type { AsyncJobState } from "../../src/shared/types.ts";
 
 type Job = Pick<AsyncJobState, "asyncId" | "status"> & Partial<AsyncJobState>;
@@ -25,21 +26,24 @@ function decode(report: string): Record<string, string> {
 
 const reporters: ProgramStatusReporter[] = [];
 
-function reporter(input: { jobs?: Job[]; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
+function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
 	const writes: string[] = [];
 	const jobs = new Map<string, AsyncJobState>((input.jobs ?? []).map((entry) => [entry.asyncId, entry as AsyncJobState]));
 	const pending = input.pending ?? [];
+	const holds: boolean[] = [];
 	const instance = registerProgramStatusReporter({
 		enabled: input.enabled ?? true,
 		getJobs: () => jobs.values(),
+		hasBackgroundWork: input.hasBackgroundWork ?? (() => false),
+		hasPendingWake: input.hasPendingWake,
 		getPendingRequests: () => pending,
 		write: (data) => writes.push(data),
 		isTTY: input.isTTY ?? true,
 		env: input.env ?? { TERM: "xterm-ghostty" },
 	});
-	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui" });
+	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui", setBackgroundWork: (_key, active) => holds.push(active) });
 	reporters.push(instance);
-	return { instance, writes, jobs, pending, records: () => writes.map(decode) };
+	return { instance, writes, jobs, pending, holds, records: () => writes.map(decode) };
 }
 
 describe("OSC 7501 program status", () => {
@@ -120,6 +124,56 @@ describe("OSC 7501 program status", () => {
 		idle.jobs.set("late", job("late", "failed"));
 		idle.instance.sync();
 		assert.equal(idle.records().at(-1)?.state, "error");
+	});
+
+	it("defers terminal completions until parallel work, delivery, and the parent follow-up drain", () => {
+		let pendingDelivery = false;
+		let liveWork = true;
+		const { instance, jobs, records, holds } = reporter({
+			jobs: [job("first", "running"), job("second", "running")],
+			hasBackgroundWork: () => liveWork || pendingDelivery,
+		});
+		instance.agentStarted();
+		jobs.set("first", job("first", "complete"));
+		instance.agentSettled();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done"));
+
+		jobs.set("second", job("second", "failed"));
+		liveWork = false;
+		pendingDelivery = true;
+		instance.sync();
+		assert.ok(!records().some(({ state }) => state === "done" || state === "error"));
+
+		instance.agentStarted();
+		pendingDelivery = false;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done" || state === "error"));
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.deepEqual(records().filter(({ state }) => state === "done" || state === "error").map(({ state }) => state), ["done", "error"]);
+	});
+
+	it("releases a failed wake after its reservation expires, but not while Pi is preparing it", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		let now = 0;
+		let idle = true;
+		const wake = createParentWake({ sendMessage() {} }, () => now);
+		wake.bindSession({ isIdle: () => idle, sessionManager: { getSessionId: () => "status" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
+		wake.sendMessage({ customType: "review", content: "result", display: false }, { triggerTurn: true });
+		const { holds, records } = reporter({ jobs: [job("review", "complete")], hasPendingWake: wake.isPending });
+		const advance = (ms: number) => { now += ms; t.mock.timers.tick(ms); };
+		advance(9_000);
+		assert.deepEqual(holds, [true]);
+		idle = false;
+		advance(2_000);
+		assert.deepEqual(holds, [true], "preparation keeps the expired reservation live");
+		assert.deepEqual(records(), []);
+		idle = true;
+		advance(1_000);
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
 	});
 
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {

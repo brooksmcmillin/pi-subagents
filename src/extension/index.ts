@@ -469,8 +469,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			agents: merged.agents.map((agent) => agent.maxThinking === discovered.maxThinking ? agent : { ...agent, maxThinking: discovered.maxThinking }),
 		};
 	};
+	const hasOutstandingResults = () => owedResultRunIds.size > 0 || hasLiveSubagentWork(state);
 	const programStatus = registerProgramStatusReporter({
 		enabled: config.programStatus !== false,
+		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend(),
+		hasPendingWake: parentWake.isPending,
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
 		getPendingRequests: () => supervisorChannel.pending.values(),
@@ -499,6 +502,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			onResultDelivered: (runId) => {
 				owedResultRunIds.delete(runId);
 				if (state.asyncJobs.has(runId)) deliveredRunIds.add(runId);
+				programStatus.sync();
 			},
 			observeCompletion: (result) => scheduledRunManager.handleAsyncCompletion(result),
 			observedCompletionRunIds: () => scheduledRunManager.observedCompletionRunIds(),
@@ -888,12 +892,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		fleetStatus?.refresh();
 	};
 	const asyncCompleteHandler = (payload: unknown) => {
-		handleComplete(payload);
-		// Detached-workflow reconciliation publishes the result, then ends the job
-		// with this event; the next status refresh sees it already terminal.
-		const job = state.asyncJobs.get((payload as { id?: string } | null)?.id ?? "");
-		if (job && job.status !== "queued" && job.status !== "running"
+		// Detached reconciliation publishes before this event. Hold delivery before
+		// handleComplete publishes the terminal job projection to status listeners.
+		const completion = payload as { id?: string; sessionId?: string; state?: AsyncJobState["status"] } | null;
+		const job = state.asyncJobs.get(completion?.id ?? "");
+		if (job && completion?.sessionId === state.currentSessionId
+			&& completion?.state !== "queued" && completion?.state !== "running"
 			&& fs.existsSync(resultFilePath(DIRS.results, job.asyncId))) holdOwedResult(job);
+		handleComplete(payload);
 		refreshResultDelivery();
 		refreshActiveAsyncCapacity();
 		scheduledRunManager.handleAsyncCompletion(payload);
@@ -1260,7 +1266,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			? registerPiWebSessionLiveness({
 				sessionId,
 				...(sessionFile ? { sessionFile } : {}),
-				isActive: () => owedResultRunIds.size > 0 || hasLiveSubagentWork(state) || completionNotifier.hasPendingDelivery() || parentWake.isPending(),
+				isActive: () => hasOutstandingResults() || completionNotifier.hasPendingDelivery() || parentWake.isPending(),
 			})
 			: { registered: false, release: () => {} };
 		releaseHostSessionLiveness = liveness.release;
@@ -1272,7 +1278,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			hasUI: ctx.hasUI === true,
 			runs: activeHerdrRuns(),
 		});
-		programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode });
+		const ui = ctx.ui as ExtensionContext["ui"] & Pick<Parameters<typeof programStatus.sessionStarted>[0], "setBackgroundWork">;
+		programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui.setBackgroundWork });
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
 		supervisorChannel.activateTransport();
