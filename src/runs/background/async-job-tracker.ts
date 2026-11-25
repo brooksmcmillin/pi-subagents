@@ -459,6 +459,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const previous = job.nestedWorkActive;
 		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren,
 			isTerminalJobStatus(job.status) && readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed") : false;
+		if (job.nestedWorkActive) cancelCleanup(job.asyncId);
 		return job.nestedWorkActive !== previous;
 	};
 
