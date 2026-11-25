@@ -6,8 +6,8 @@ import { afterEach, describe, it } from "node:test";
 import { retainLiveForegroundNestedRoute } from "../../src/integrations/pi-web-session-liveness.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { createRetainedNestedRouteTracker } from "../../src/runs/background/retained-nested-route-tracker.ts";
-import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 const routeRoots: string[] = [];
 
@@ -74,6 +74,32 @@ describe("retained foreground nested route tracker", () => {
 		} finally {
 			tracker.clear();
 			reporter.dispose();
+		}
+	});
+
+	it("drains a retained route when the descendant never emits its terminal event", async () => {
+		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
+		const nestedRoute = route("missing-terminal-event-root");
+		const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId, "nested-child");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeNestedEvent(nestedRoute, {
+			type: "subagent.nested.updated", ts: 100, parentRunId: nestedRoute.rootRunId,
+			child: { id: "nested-child", parentRunId: nestedRoute.rootRunId, depth: 1,
+				path: [{ runId: nestedRoute.rootRunId }], state: "running", agent: "worker", asyncDir },
+		});
+		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
+			steps: [{ agent: "worker", status: "failed" }],
+		}));
+		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
+		try {
+			tracker.track(nestedRoute.rootRunId);
+			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
+			assert.equal(projectNestedEvents(nestedRoute).children[0]?.state, "failed");
+		} finally {
+			tracker.clear();
+			fs.rmSync(asyncDir, { recursive: true, force: true });
 		}
 	});
 

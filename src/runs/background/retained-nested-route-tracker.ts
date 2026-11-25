@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import type { SubagentState } from "../../shared/types.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { hasLiveNestedDescendants, projectNestedEvents } from "../shared/nested-events.ts";
+import { reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 
 interface RetainedNestedRouteTrackerOptions {
 	pollIntervalMs?: number;
@@ -38,6 +39,7 @@ export function createRetainedNestedRouteTracker(
 			return;
 		}
 		try {
+			reconcileNestedAsyncDescendants(retained);
 			if (hasLiveNestedDescendants(projectNestedEvents(retained).children)) return;
 			state.retainedForegroundNestedRoutes?.delete(rootRunId);
 			close(rootRunId);

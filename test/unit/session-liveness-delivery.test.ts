@@ -22,7 +22,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
 	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
-	import { resultFilePath, writeAsyncResultFile } from "./src/runs/background/result-files.ts";
+	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
 	import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
@@ -73,9 +73,11 @@ const terminalBeforePublicationScript = String.raw`
 		register(value) { provider = value; return () => {}; },
 	};
 	const closedCase = process.argv[1] === "closed";
+	const pendingCase = process.argv[1] === "pending";
+	const tui = closedCase || pendingCase;
 	const holds = [];
 	const reports = [];
-	if (closedCase) {
+	if (tui) {
 		process.env.TERM = "xterm-256color";
 		process.env.PI_PROGRAM_STATUS = "1";
 		Object.defineProperty(process.stdout, "isTTY", { value: true });
@@ -83,7 +85,7 @@ const terminalBeforePublicationScript = String.raw`
 		process.stdout.write = (chunk, ...args) => typeof chunk === "string" && chunk.startsWith("\x1b]7501;") ? (reports.push(chunk), true) : write(chunk, ...args);
 	}
 	const ctx = {
-		cwd: process.cwd(), hasUI: closedCase, mode: closedCase ? "tui" : undefined, model: undefined, isIdle() { return false; },
+		cwd: process.cwd(), hasUI: tui, mode: tui ? "tui" : undefined, model: undefined, isIdle() { return false; },
 		ui: { setBackgroundWork(_key, active) { holds.push(active); }, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
@@ -104,7 +106,7 @@ const terminalBeforePublicationScript = String.raw`
 		updateActiveRunIndex(asyncDir, state);
 		return asyncDir;
 	};
-	const publishResult = () => writeAsyncResultFile(resultFilePath(DIRS.results, runId), {
+	const publishResult = (pending = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
 		id: runId, runId, agent: "worker", mode: "single", state: "complete", success: true, exitCode: 0,
 		summary: "child complete", timestamp: Date.now(), sessionId, completionOwnerId,
 	});
@@ -117,13 +119,18 @@ const terminalBeforePublicationScript = String.raw`
 	assert.equal(provider.isActive(), true);
 
 	let send;
-	if (process.argv[1] === "event") {
+	if (process.argv[1] === "event" || pendingCase) {
 		// Detached-workflow reconciliation publishes the result and emits the
 		// completion event before the status watcher sees the terminal state.
 		writeStatus("complete");
-		publishResult();
+		publishResult(pendingCase);
+		if (pendingCase) assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		send = nextSend();
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
+		if (pendingCase) {
+			assert.deepEqual(holds, [true]);
+			assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+		}
 		assert.equal((await send).rejected, true);
 		assert.equal(provider.isActive(), true, "a completion event with a rejected send keeps the result owed");
 	} else {
@@ -180,6 +187,7 @@ describe("session liveness through result delivery", () => {
 	for (const [mode, title] of [
 		["status", "stays live from a child's terminal status through a rejected send until its wake starts"],
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
+		["pending", "holds detached terminal status while an owned result exists only in pending storage"],
 		["closed", "releases terminal holds when the result writer definitively closes without publishing"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
