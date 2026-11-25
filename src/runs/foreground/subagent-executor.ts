@@ -472,6 +472,7 @@ interface ExecutorDeps {
 	findPendingAsks?: Parameters<typeof steerAsyncRun>[0]["findPendingAsks"];
 	refreshResultDelivery?: () => void;
 	trackRetainedNestedRoute?: (rootRunId: string) => void;
+	onForegroundControlRemoved?: () => void;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	/** Set when this executor runs inside a child session; carries the runtime settings the host passes instead of environment variables. */
 	childRuntime?: ChildRuntimeConfig;
@@ -606,7 +607,7 @@ function readWorkflowScriptFile(requestedPath: string, requestedCwd: string | un
 	return { script };
 }
 
-export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void): boolean {
+export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void, onRemoved?: () => void): boolean {
 	const control = state.foregroundControls.get(runId);
 	if (control && (!foregroundSchedulingSettled(control) || (control.activeChildren?.size ?? 0) > 0)) return false;
 	if (control?.nestedRoute && trackRetainedNestedRoute) {
@@ -617,8 +618,9 @@ export function removeForegroundControlIfIdle(state: SubagentState, runId: strin
 		}
 	}
 	retainNestedLookupRoute(state, control?.nestedRoute, control?.sessionId);
-	state.foregroundControls.delete(runId);
+	const removed = state.foregroundControls.delete(runId);
 	if (state.lastForegroundControlId === runId) state.lastForegroundControlId = null;
+	if (removed) onRemoved?.();
 	return true;
 }
 
@@ -4571,7 +4573,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						try {
 							finishTrackedForegroundChild();
 						} finally {
-							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onForegroundControlRemoved);
 						}
 					}
 				}
@@ -8422,7 +8424,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt) activeAsyncCapacity.rollback();
 			if (foregroundControl) {
 				settleForegroundSchedulingOwner(foregroundControl);
-				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onForegroundControlRemoved);
 			}
 		}
 

@@ -475,7 +475,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend(),
 		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
 			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
-		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
+		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? parentWake.getQueuedWait() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
 		isParentPreparing: () => withLastUiContext((ctx) => !ctx.isIdle()) === true,
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
@@ -564,6 +564,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	const executorDeps: SubagentExecutorDeps = {
+		onForegroundControlRemoved: programStatus.sync,
 		pi,
 		parentWake,
 		state,
@@ -1204,6 +1205,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		// starts only once that compaction has finished and its status indicator is cleared.
 		resumeWidgetsAfterCompaction();
 		completionNotifier.messageStarted(event.message);
+		parentWake.messageStarted(event.message);
 	});
 
 	pi.on("agent_settled", () => {

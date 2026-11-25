@@ -186,6 +186,36 @@ describe("OSC 7501 program status", () => {
 		assert.equal(records().at(-1)?.state, "done");
 	});
 
+	it("holds a busy wait-subscription wake after a non-waking result is delivered", () => {
+		let now = 0;
+		let idle = true;
+		let delivering = true;
+		const wake = createParentWake({ sendMessage() {} }, () => now);
+		wake.bindSession({ isIdle: () => idle, sessionManager: { getSessionId: () => "wait" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
+		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")],
+			hasBackgroundWork: () => delivering, getQueuedWake: wake.getQueuedWait, isParentPreparing: () => !idle, now: () => now });
+		instance.agentStarted();
+		idle = false;
+		const notice = { customType: "subagent-wait-subscription", content: "review ready", display: true };
+		wake.sendMessage(notice, { triggerTurn: true });
+		delivering = false;
+		instance.sync();
+		idle = true;
+		instance.agentSettled();
+		idle = false;
+		now += 60_000;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.deepEqual(records(), []);
+		instance.agentStarted();
+		wake.messageStarted({ role: "custom", ...notice });
+		assert.equal(wake.getQueuedWait(), undefined);
+		idle = true;
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
 	it("holds a deferred compaction wake across its transition to a parent wake", () => {
 		let now = 0;
 		let compacting = true;
