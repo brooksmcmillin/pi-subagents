@@ -45,7 +45,7 @@ interface AsyncJobTrackerOptions {
 	widgetCollapsed?: boolean;
 	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
-	onJobTerminal?: (job: AsyncJobState) => void;
+	onJobTerminal?: (job: AsyncJobState, publicationClosed: boolean) => void;
 	onJobCleanup?: (asyncId: string) => void;
 	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
 	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
@@ -618,20 +618,21 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						terminalPublications.set(job.asyncId, publication);
 					}
 					const wasPending = publication?.pending;
+					let publicationClosed = false;
 					if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
 						const published = reconciliation.resultPath && fs.existsSync(reconciliation.resultPath);
-						const closed = !published && readProcessTerminal(job.asyncDir, {
+						publicationClosed = !published && readProcessTerminal(job.asyncDir, {
 							runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
 						})?.state === "observed";
-						if (published || closed) {
+						if (published || publicationClosed) {
 							publication = { pending: false };
 							terminalPublications.set(job.asyncId, publication);
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job);
+					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);

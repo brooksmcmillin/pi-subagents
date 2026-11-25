@@ -26,7 +26,7 @@ function decode(report: string): Record<string, string> {
 
 const reporters: ProgramStatusReporter[] = [];
 
-function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWake?: () => string | undefined; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
+function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWake?: () => string | undefined; isParentPreparing?: () => boolean; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
 	const writes: string[] = [];
 	const jobs = new Map<string, AsyncJobState>((input.jobs ?? []).map((entry) => [entry.asyncId, entry as AsyncJobState]));
 	const pending = input.pending ?? [];
@@ -37,6 +37,7 @@ function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasP
 		hasBackgroundWork: input.hasBackgroundWork ?? (() => false),
 		hasPendingWake: input.hasPendingWake,
 		getQueuedWake: input.getQueuedWake,
+		isParentPreparing: input.isParentPreparing,
 		now: input.now,
 		getPendingRequests: () => pending,
 		write: (data) => writes.push(data),
@@ -160,9 +161,10 @@ describe("OSC 7501 program status", () => {
 	it("keeps a queued result across a long busy turn and into its follow-up", () => {
 		let now = 0;
 		let queuedWake: string | undefined;
+		let preparing = false;
 		let running = true;
 		const { instance, jobs, holds, records } = reporter({ jobs: [job("review", "running")],
-			hasBackgroundWork: () => running, getQueuedWake: () => queuedWake, now: () => now });
+			hasBackgroundWork: () => running, getQueuedWake: () => queuedWake, isParentPreparing: () => preparing, now: () => now });
 		instance.agentStarted();
 		queuedWake = "busy-turn-result";
 		running = false;
@@ -170,6 +172,9 @@ describe("OSC 7501 program status", () => {
 		instance.sync();
 		now += 60_000;
 		instance.agentSettled();
+		preparing = true;
+		now += 60_000;
+		instance.sync();
 		assert.deepEqual(holds, [true]);
 		assert.ok(!records().some(({ state }) => state === "done"));
 		instance.agentStarted();

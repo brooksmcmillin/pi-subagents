@@ -72,9 +72,18 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
+	const closedCase = process.argv[1] === "closed";
+	const holds = [];
+	const reports = [];
+	if (closedCase) {
+		process.env.TERM = "xterm-256color";
+		Object.defineProperty(process.stdout, "isTTY", { value: true });
+		const write = process.stdout.write.bind(process.stdout);
+		process.stdout.write = (chunk, ...args) => typeof chunk === "string" && chunk.startsWith("\x1b]7501;") ? (reports.push(chunk), true) : write(chunk, ...args);
+	}
 	const ctx = {
-		cwd: process.cwd(), hasUI: false, model: undefined, isIdle() { return false; },
-		ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+		cwd: process.cwd(), hasUI: closedCase, mode: closedCase ? "tui" : undefined, model: undefined, isIdle() { return false; },
+		ui: { setBackgroundWork(_key, active) { holds.push(active); }, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
 	};
@@ -131,6 +140,23 @@ const terminalBeforePublicationScript = String.raw`
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
 
+		if (closedCase) {
+			assert.deepEqual(holds, [true]);
+			assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+			const instanceId = runId + "-runner";
+			const proof = { version: 1, runId, runnerProcessInstanceId: instanceId, state: "observed", observedAt: Date.now(),
+				instances: [{ kind: "runner", processInstanceId: instanceId, closeObservedAt: Date.now(), exitCode: 0, signal: null }] };
+			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+			events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+			for (let i = 0; i < 130 && holds.at(-1) === true; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.deepEqual(holds, [true, false]);
+			assert.equal(reports.some(report => /state=done:/.test(report)), true);
+			assert.equal(provider.isActive(), false);
+			assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+			process.stdout.write("ok");
+			process.exit(0);
+		}
 		send = nextSend();
 		publishResult();
 		assert.equal((await send).rejected, true);
@@ -153,6 +179,7 @@ describe("session liveness through result delivery", () => {
 	for (const [mode, title] of [
 		["status", "stays live from a child's terminal status through a rejected send until its wake starts"],
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
+		["closed", "releases terminal holds when the result writer definitively closes without publishing"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {
@@ -199,6 +226,7 @@ describe("session liveness through result delivery", () => {
 		});
 		const activeAt: Record<string, boolean | undefined> = {};
 		const terminalHolds: boolean[] = [];
+		const timeline: string[] = [];
 		const holdsAtSettle: Array<boolean | undefined> = [];
 		const term = process.env.TERM;
 		process.env.TERM = "xterm-256color";
@@ -241,14 +269,22 @@ describe("session liveness through result delivery", () => {
 			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
 			await session.bindExtensions({ mode: "tui", uiContext: {
 				setWidget() {}, setStatus() {},
-				setBackgroundWork: (_key: string, active: boolean) => terminalHolds.push(active),
+				setBackgroundWork: (_key: string, active: boolean) => {
+					terminalHolds.push(active);
+					timeline.push(`hold:${active}`);
+				},
 			} as unknown as NonNullable<Parameters<typeof session.bindExtensions>[0]["uiContext"]> });
 			session.subscribe((event) => {
-				if (event.type === "agent_settled") holdsAtSettle.push(terminalHolds.at(-1));
+				if (event.type === "agent_start") timeline.push("start");
+				if (event.type === "agent_settled") {
+					holdsAtSettle.push(terminalHolds.at(-1));
+					timeline.push("settle");
+				}
 			});
 			await session.prompt("Start the original turn.");
 			assert.equal(holdsAtSettle[0], true, "the first settle retains the queued completion hold");
 			assert.deepEqual(terminalHolds, [true, false], "terminal hold clears only after the final follow-up");
+			assert.deepEqual(timeline.slice(-3), ["start", "hold:false", "settle"]);
 			assert.deepEqual(activeAt, { duringTurn: true, atSettle: true, finalSettle: false });
 			assert.equal(session.messages.filter((message) => message.role === "custom" && message.customType === "subagent-notify").length, 2, "Pi started both queued wakes");
 			await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });

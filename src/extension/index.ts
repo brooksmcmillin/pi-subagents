@@ -30,7 +30,7 @@ import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultFilePath } from "../runs/background/result-files.ts";
+import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultFilePath, resultPayloadFileForSessionRun } from "../runs/background/result-files.ts";
 import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createResultDeliveryOwnership } from "../runs/background/result-delivery-ownership.ts";
@@ -476,6 +476,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
 			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
 		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
+		isParentPreparing: () => withLastUiContext((ctx) => !ctx.isIdle()) === true,
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
 		getPendingRequests: () => supervisorChannel.pending.values(),
@@ -484,9 +485,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		widgetEnabled: asyncWidgetEnabled,
 		widgetCollapsed: asyncWidgetCollapsed,
 		widgetLayout: asyncWidgetLayout,
-		onJobTerminal: (job) => {
-			holdOwedResult(job);
+		onJobTerminal: (job, publicationClosed) => {
+			if (publicationClosed && job.sessionId && !resultPayloadFileForSessionRun(DIRS.results, job.sessionId, job.asyncId)) {
+				owedResultRunIds.delete(job.asyncId);
+			} else {
+				holdOwedResult(job);
+			}
 			refreshResultDelivery();
+			programStatus.sync();
 		},
 		onJobCleanup: (asyncId) => deliveredRunIds.delete(asyncId),
 		deliveryOwnerId: resultDeliveryOwnership.deliveryOwnerId,

@@ -27,6 +27,7 @@ export interface ProgramStatusReporterOptions {
 	/** Uses the parent wake reservation, which can expire without a lifecycle event. */
 	hasPendingWake?: () => boolean;
 	getQueuedWake?: () => string | undefined;
+	isParentPreparing?: () => boolean;
 	now?: () => number;
 	/** Pending native supervisor requests that expect a reply. */
 	getPendingRequests: () => Iterable<{ id: string; runId: string }>;
@@ -163,7 +164,8 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 		if (!active) return;
 		const queuedWake = options.getQueuedWake?.();
 		const pendingParentWake = options.hasPendingWake?.();
-		if (queuedWake !== lastQueuedWake || !parentIdle || pendingParentWake) {
+		const queuedWakePreparing = queuedWake !== undefined && options.isParentPreparing?.();
+		if (queuedWake !== lastQueuedWake || !parentIdle || pendingParentWake || queuedWakePreparing) {
 			lastQueuedWake = queuedWake;
 			queuedWakeDeadline = now() + WAKE_PENDING_MS;
 		}
