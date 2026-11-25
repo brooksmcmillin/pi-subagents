@@ -264,12 +264,13 @@ describe("result watcher", () => {
 		}
 	});
 
-	it("hands a non-waking completion to subscribers before releasing its delivery hold", async () => {
+	for (const source of ["indexed scan", "native watch"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
 		const order: string[] = [];
 		const terminalHolds: boolean[] = [];
+		let watchEvent: fs.WatchListener<string> | undefined;
 		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
 			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
@@ -278,12 +279,21 @@ describe("result watcher", () => {
 			notifier: { async deliver() { order.push("non-waking notice"); return true; } },
 			onResultDelivered: () => order.push("release"),
 			onOwnedQueueChanged: reporter.sync,
+			fs: { ...fs, watch(_dir, listener) {
+				watchEvent = listener as typeof watchEvent;
+				const handle = { on: () => handle, close() {}, unref() {} };
+				return handle as unknown as fs.FSWatcher;
+			} },
 		});
 		try {
 			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
+			if (source === "native watch") watcher.startResultWatcher();
 			const resultPath = path.join(resultsDir, "wake-order.json");
 			writeIndexedResult(resultPath, { id: "wake-order", sessionId: "session-current", success: true, summary: "done" });
-			watcher.primeExistingResults();
+			if (source === "native watch") {
+				assert.ok(watchEvent);
+				watchEvent("rename", "wake-order.json");
+			} else watcher.primeExistingResults();
 			assert.equal(state.asyncJobs.size, 0);
 			assert.deepEqual(terminalHolds, [true], "owned indexed work is held before coalescing");
 			assert.deepEqual(order, []);

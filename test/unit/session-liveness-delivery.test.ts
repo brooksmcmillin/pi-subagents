@@ -130,10 +130,30 @@ const terminalBeforePublicationScript = String.raw`
 		publishResult(pendingCase);
 		if (pendingCase) assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		send = nextSend();
-		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
+		const stat = fsDefault.statSync;
+		let pendingProbeDenied = false;
 		if (pendingCase) {
-			assert.deepEqual(holds, [true]);
-			assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+			fsDefault.statSync = (file, ...args) => {
+				if (String(file).includes("result-pending")) {
+					pendingProbeDenied = true;
+					throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+				}
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
+			if (pendingCase) {
+				assert.equal(pendingProbeDenied, true);
+				assert.deepEqual(holds, [true]);
+				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+			}
+		} finally {
+			if (pendingCase) {
+				fsDefault.statSync = stat;
+				syncBuiltinESMExports();
+			}
 		}
 		assert.equal((await send).rejected, true);
 		assert.equal(provider.isActive(), true, "a completion event with a rejected send keeps the result owed");
@@ -211,7 +231,7 @@ describe("session liveness through result delivery", () => {
 	for (const [mode, title] of [
 		["status", "stays live from a child's terminal status through a rejected send until its wake starts"],
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
-		["pending", "holds detached terminal status while an owned result exists only in pending storage"],
+		["pending", "holds detached terminal status while a pending-only result is temporarily inaccessible"],
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 	]) it(title, () => {

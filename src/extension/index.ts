@@ -30,7 +30,7 @@ import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultPayloadFileForSessionRun } from "../runs/background/result-files.ts";
+import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultPayloadVisibility } from "../runs/background/result-files.ts";
 import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createResultDeliveryOwnership } from "../runs/background/result-delivery-ownership.ts";
@@ -906,10 +906,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		// handleComplete publishes the terminal job projection to status listeners.
 		const completion = payload as { id?: string; sessionId?: string; state?: AsyncJobState["status"] } | null;
 		const job = state.asyncJobs.get(completion?.id ?? "");
+		let publicationVisibilityUnknown = false;
 		if (job?.sessionId && completion?.sessionId === state.currentSessionId
-			&& completion?.state !== "queued" && completion?.state !== "running"
-			&& resultPayloadFileForSessionRun(DIRS.results, job.sessionId, job.asyncId)) holdOwedResult(job);
-		handleComplete(payload);
+			&& completion?.state !== "queued" && completion?.state !== "running") {
+			const visibility = resultPayloadVisibility(DIRS.results, job.sessionId, job.asyncId);
+			if (visibility !== "absent") holdOwedResult(job);
+			publicationVisibilityUnknown = visibility === "unknown";
+		}
+		handleComplete(payload, publicationVisibilityUnknown);
 		refreshResultDelivery();
 		refreshActiveAsyncCapacity();
 		scheduledRunManager.handleAsyncCompletion(payload);

@@ -88,7 +88,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	ensurePoller: () => void;
 	refreshWidget: (ctx: ExtensionContext) => void;
 	handleStarted: (data: unknown) => void;
-	handleComplete: (data: unknown) => void;
+	handleComplete: (data: unknown, publicationVisibilityUnknown?: boolean) => void;
 	resetJobs: (ctx?: ExtensionContext) => void;
 	/** `observeStatus` also sees the statuses of other sessions' runs that the listing skips. */
 	restoreActiveJobs: (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => void;
@@ -105,7 +105,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const externalJobBridgeRuns = new Set<string>();
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
-	const terminalPublications = new Map<string, { instanceId: string; pending: true } | { pending: false }>();
+	const terminalPublications = new Map<string, { instanceId?: string; pending: true } | { pending: false }>();
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
 	// runner, so the job keeps its last known state rather than reading as finished (#3295).
 	const unreadableStatusRuns = new Set<string>();
@@ -633,9 +633,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
 						let published = Boolean(reconciliation.resultPath && fs.existsSync(reconciliation.resultPath));
-						if (!published && job.sessionId && readProcessTerminal(job.asyncDir, {
+						if (!published && job.sessionId && (!publication.instanceId || readProcessTerminal(job.asyncDir, {
 							runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
-						})?.state === "observed") {
+						})?.state === "observed")) {
 							const visibility = resultPayloadVisibility(resultsDir, job.sessionId, job.asyncId);
 							published = visibility === "present";
 							publicationClosed = visibility === "absent";
@@ -869,7 +869,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		rerenderLastWidget();
 	};
 
-	const handleComplete = (data: unknown) => {
+	const handleComplete = (data: unknown, publicationVisibilityUnknown = false) => {
 		const result = data as { id?: string; success?: boolean; state?: AsyncJobState["status"]; asyncDir?: string; sessionId?: string; stopped?: boolean };
 		if (typeof state.currentSessionId === "string" && result.sessionId !== state.currentSessionId) return;
 		const asyncId = result.id;
@@ -888,7 +888,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			// Delivery can precede the first terminal status refresh. Remember its
 			// settlement even when no pending publication has been observed yet.
-			terminalPublications.set(asyncId, { pending: false });
+			terminalPublications.set(asyncId, publicationVisibilityUnknown ? { pending: true } : { pending: false });
+			if (publicationVisibilityUnknown) cancelCleanup(asyncId);
 			try {
 				updateAsyncJobNestedProjection(job);
 			} catch (error) {
@@ -901,7 +902,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			rememberFleetJob(state, job);
 		}
 		rerenderLastWidget();
-		if (!nestedRefreshFailed && !job?.nestedWorkActive) scheduleCleanup(asyncId);
+		if (!publicationVisibilityUnknown && !nestedRefreshFailed && !job?.nestedWorkActive) scheduleCleanup(asyncId);
 	};
 
 	const dispose = () => {

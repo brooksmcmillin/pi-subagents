@@ -279,10 +279,9 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
-	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0) => {
+	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0, identity = identityCache.get(file)?.identity) => {
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
-		const identity = identityCache.get(file)?.identity;
 		if (delayMs === 0 && identity?.sessionId && !queuedOwnedResults.has(file)
 			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
 			queuedOwnedResults.add(file);
@@ -892,12 +891,16 @@ export function createResultWatcher(
 				const fileName = file.toString();
 				if (fileName.endsWith(".json")) {
 					identityCache.delete(fileName);
+					let discovered: ResultFileIdentity | undefined;
 					try {
-						writeResultIndexForData(path.join(resultsDir, fileName), JSON.parse(fsApi.readFileSync(path.join(resultsDir, fileName), "utf-8")) as Record<string, unknown>);
+						const resultPath = path.join(resultsDir, fileName);
+						const raw = fsApi.readFileSync(resultPath, "utf-8");
+						discovered = resultFileIdentity(raw, fileName);
+						writeResultIndexForData(resultPath, JSON.parse(raw) as Record<string, unknown>);
 					} catch {
 						// The writer may still be renaming the file; handleResult will retry from the normal result path.
 					}
-					scheduleResult(fileName, true);
+					scheduleResult(fileName, true, 0, discovered);
 				}
 			});
 			state.watcher.on("error", (error) => {
