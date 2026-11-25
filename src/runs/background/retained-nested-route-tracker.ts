@@ -1,8 +1,7 @@
 import * as fs from "node:fs";
-import type { NestedRunSummary, SubagentState } from "../../shared/types.ts";
+import type { SubagentState } from "../../shared/types.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
-import { projectNestedEvents, resolveNestedAsyncDir } from "../shared/nested-events.ts";
-import { readProcessTerminal } from "./process-terminal.ts";
+import { hasLiveOwnedNestedWork, projectNestedEvents } from "../shared/nested-events.ts";
 import { reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 
 interface RetainedNestedRouteTrackerOptions {
@@ -14,22 +13,6 @@ interface RetainedNestedRouteTrackerOptions {
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const REFRESH_DEBOUNCE_MS = 25;
-
-function hasLiveRetainedWork(rootRunId: string, children: NestedRunSummary[] | undefined, ownerExited = false): boolean {
-	for (const child of children ?? []) {
-		const independentlyRunning = child.asyncDir !== undefined;
-		if ((child.state === "queued" || child.state === "running") && (independentlyRunning || !ownerExited)) return true;
-		if (!child.children?.length && !child.steps?.some((step) => step.children?.length)) continue;
-		// An observed runner exit ends its in-process foreground work, not its separately launched async jobs.
-		const asyncDir = resolveNestedAsyncDir(rootRunId, child);
-		const descendantsOwnerExited = asyncDir
-			? readProcessTerminal(asyncDir, { runId: child.id })?.state === "observed"
-			: !independentlyRunning && ownerExited;
-		if (hasLiveRetainedWork(rootRunId, child.children, descendantsOwnerExited)) return true;
-		if (child.steps?.some((step) => hasLiveRetainedWork(rootRunId, step.children, descendantsOwnerExited))) return true;
-	}
-	return false;
-}
 
 export function createRetainedNestedRouteTracker(
 	state: Pick<SubagentState, "retainedForegroundNestedRoutes">,
@@ -57,7 +40,7 @@ export function createRetainedNestedRouteTracker(
 		}
 		try {
 			reconcileNestedAsyncDescendants(retained);
-			if (hasLiveRetainedWork(rootRunId, projectNestedEvents(retained).children)) return;
+			if (hasLiveOwnedNestedWork(rootRunId, projectNestedEvents(retained).children)) return;
 			state.retainedForegroundNestedRoutes?.delete(rootRunId);
 			close(rootRunId);
 			options.onRoutesChanged?.();

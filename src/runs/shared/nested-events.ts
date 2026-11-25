@@ -18,7 +18,7 @@ import {
 } from "../../shared/types.ts";
 import { isSafeNestedPathId, sanitizeNestedPath, type NestedPathEntry } from "./nested-path.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { sanitizeProcessTerminal } from "../background/process-terminal.ts";
+import { readProcessTerminal, sanitizeProcessTerminal } from "../background/process-terminal.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 
 export const NESTED_EVENTS_DIR = path.join(TEMP_ROOT_DIR, "nested-subagent-events");
@@ -1001,6 +1001,21 @@ export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefine
 		if (!terminal(child.state)) return true;
 		if (hasLiveNestedDescendants(child.children)) return true;
 		if (hasLiveNestedDescendants(child.steps?.flatMap((step) => step.children ?? []))) return true;
+	}
+	return false;
+}
+
+/** A closed runner cannot own live in-process work, but its independent async descendants may still run. */
+export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSummary[] | undefined, ownerExited = false): boolean {
+	for (const child of children ?? []) {
+		if (!terminal(child.state) && (child.asyncDir || !ownerExited)) return true;
+		if (!child.children?.length && !child.steps?.some((step) => step.children?.length)) continue;
+		const asyncDir = resolveNestedAsyncDir(rootRunId, child);
+		const childOwnerExited = asyncDir
+			? readProcessTerminal(asyncDir, { runId: child.id })?.state === "observed"
+			: !child.asyncDir && ownerExited;
+		if (hasLiveOwnedNestedWork(rootRunId, child.children, childOwnerExited)) return true;
+		if (child.steps?.some((step) => hasLiveOwnedNestedWork(rootRunId, step.children, childOwnerExited))) return true;
 	}
 	return false;
 }

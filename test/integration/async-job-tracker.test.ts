@@ -506,6 +506,36 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("cleans a tracked async owner once only stranded foreground descendants remain", async () => {
+		const asyncRoot = createTempDir("pi-async-job-owner-close-");
+		const route = createNestedRoute("tracked-async-owner-close");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		const state = createState();
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { platform: "darwin", pollIntervalMs: 10, completionRetentionMs: 5 });
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const foreground = { id: "foreground", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const };
+			const independent = { ...foreground, id: "independent", parentRunId: foreground.id, depth: 2,
+				path: [...foreground.path, { runId: foreground.id }], asyncDir: path.join(asyncRoot, "independent") };
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 100, parentRunId: foreground.parentRunId, child: foreground });
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 101, parentRunId: independent.parentRunId, child: independent });
+			const proof = { version: 1, state: "observed", runId: route.rootRunId, runnerProcessInstanceId: "runner", observedAt: 200,
+				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 200, exitCode: 1, signal: null }] };
+			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, state: "failed", mode: "single", startedAt: 10, lastUpdate: 200, processTerminal: proof }));
+			tracker.handleStarted({ id: route.rootRunId, asyncDir, agent: "owner", nestedRoute: route });
+			await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "failed", "terminal job observed");
+			assert.equal(hasLiveSubagentWork(state), true, "independent async work survives its owner");
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: independent.parentRunId, child: { ...independent, state: "complete" } });
+			await waitForCondition(() => !state.asyncJobs.has(route.rootRunId), "terminal job cleanup");
+			assert.equal(hasLiveSubagentWork(state), false);
+		} finally {
+			tracker.dispose();
+			removeTempDir(asyncRoot);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
 	it("keeps the async widget cleared when it is disabled", () => {
 		const asyncRoot = createTempDir("pi-async-job-widget-disabled-");
 		try {

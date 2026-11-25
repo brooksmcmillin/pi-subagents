@@ -22,7 +22,7 @@ import {
 import { isStatusAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { findNestedRouteForRootId, hasLiveNestedDescendants, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
 import { listAsyncRuns, summarizeAsyncStatus, type AsyncRunSummary } from "./async-status.ts";
 import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
@@ -455,6 +455,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		options.onJobCleanup?.(asyncId);
 	};
 
+	const refreshNestedLiveness = (job: AsyncJobState) => {
+		const previous = job.nestedWorkActive;
+		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren,
+			isTerminalJobStatus(job.status) && readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed") : false;
+		return job.nestedWorkActive !== previous;
+	};
+
 	const refreshJob = (job: AsyncJobState): boolean => {
 		if (unverifiedRuns.has(job.asyncId)) {
 			let stored: ReturnType<typeof readStatus> = null;
@@ -606,9 +613,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.turnBudgetExceeded = status.turnBudgetExceeded ?? job.turnBudgetExceeded;
 				job.wrapUpRequested = status.wrapUpRequested ?? job.wrapUpRequested;
 				job.sessionFile = status.sessionFile ?? job.sessionFile;
+				const nestedLivenessChanged = refreshNestedLiveness(job);
 				if (isTerminalJobStatus(job.status)) {
 					let publication = terminalPublications.get(job.asyncId);
-					if (!publication && status.mode !== "workflow" && status.processTerminal?.state === "pending"
+					if (!publication && status.mode !== "workflow" && (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")
 						&& status.runId === job.asyncId && status.completionOwnerId
 						&& ((status.sessionId === state.currentSessionId && status.completionOwnerId === state.completionOwnerId)
 							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
@@ -634,11 +642,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					// Scan on close too: publication may have raced the payload check.
 					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
-					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
+					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
 					}
 				}
-				return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
+				return nestedLivenessChanged || widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}
 			if (job.status === "queued") {
 				job.status = "running";
@@ -668,7 +676,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			runningJobIds.delete(job.asyncId);
 			rememberFleetJob(state, job);
-			if (!terminalPublications.get(job.asyncId)?.pending && !hasLiveNestedDescendants(job.nestedChildren) && !state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
+			if (!terminalPublications.get(job.asyncId)?.pending && !(job.nestedWorkActive ?? hasLiveNestedDescendants(job.nestedChildren)) && !state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
 		}
 		return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 	};
@@ -882,9 +890,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		}
-		if (job) rememberFleetJob(state, job);
+		if (job) {
+			refreshNestedLiveness(job);
+			rememberFleetJob(state, job);
+		}
 		rerenderLastWidget();
-		if (!nestedRefreshFailed && !hasLiveNestedDescendants(job?.nestedChildren)) scheduleCleanup(asyncId);
+		if (!nestedRefreshFailed && !job?.nestedWorkActive) scheduleCleanup(asyncId);
 	};
 
 	const dispose = () => {

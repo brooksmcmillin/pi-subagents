@@ -72,7 +72,8 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
-	const closedCase = process.argv[1] === "closed";
+	const closedFirst = process.argv[1] === "closed-first";
+	const closedCase = process.argv[1] === "closed" || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
 	const holds = [];
@@ -94,14 +95,16 @@ const terminalBeforePublicationScript = String.raw`
 		const timer = originalSetTimeout(() => reject(new Error("Timed out waiting for a completion send")), 10_000);
 		onSend = (send) => { originalClearTimeout(timer); onSend = undefined; resolve(send); };
 	});
-	const writeStatus = (state) => {
+	const exitProof = () => ({ version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "observed", observedAt: Date.now(),
+		instances: [{ kind: "runner", processInstanceId: runId + "-runner", closeObservedAt: Date.now(), exitCode: 0, signal: null }] });
+	const writeStatus = (state, proof) => {
 		const asyncDir = path.join(DIRS.async, runId);
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeAtomicJson(path.join(asyncDir, "status.json"), {
 			runId, sessionId, completionOwnerId, mode: "single", state,
 			startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
 			steps: [{ agent: "worker", status: state, index: 0 }],
-			...(state === "running" ? {} : { processTerminal: { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
+			...(state === "running" ? {} : { processTerminal: proof ?? { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
 		});
 		updateActiveRunIndex(asyncDir, state);
 		return asyncDir;
@@ -141,21 +144,22 @@ const terminalBeforePublicationScript = String.raw`
 			const timer = originalSetTimeout(() => { watcher.close(); resolve(); }, 6_000);
 			const watcher = fs.watch(asyncDir, () => { originalClearTimeout(timer); watcher.close(); resolve(); });
 		});
-		writeStatus("complete");
-		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
+		const proof = exitProof();
+		if (closedFirst) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+		writeStatus("complete", closedFirst ? proof : undefined);
+		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, closedFirst ? proof : { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
 		await observed;
 		await new Promise((resolve) => originalSetTimeout(resolve, 50));
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
-		assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
+		if (!closedFirst) assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
 
 		if (closedCase) {
-			assert.deepEqual(holds, [true]);
-			assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
-			const instanceId = runId + "-runner";
-			const proof = { version: 1, runId, runnerProcessInstanceId: instanceId, state: "observed", observedAt: Date.now(),
-				instances: [{ kind: "runner", processInstanceId: instanceId, closeObservedAt: Date.now(), exitCode: 0, signal: null }] };
-			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
-			events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+			if (!closedFirst) {
+				assert.deepEqual(holds, [true]);
+				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+				writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+				events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+			}
 			for (let i = 0; i < 130 && holds.at(-1) === true; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 			assert.deepEqual(holds, [true, false]);
 			assert.equal(reports.some(report => /state=done:/.test(report)), true);
@@ -189,6 +193,7 @@ describe("session liveness through result delivery", () => {
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
 		["pending", "holds detached terminal status while an owned result exists only in pending storage"],
 		["closed", "releases terminal holds when the result writer definitively closes without publishing"],
+		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

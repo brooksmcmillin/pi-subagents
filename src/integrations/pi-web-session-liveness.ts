@@ -44,7 +44,7 @@ export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "reta
 
 export function hasLiveSubagentWork(state: LiveWorkState): boolean {
 	for (const job of state.asyncJobs.values()) {
-		if (job.status === "queued" || job.status === "running" || hasLiveNestedDescendants(job.nestedChildren)) return true;
+		if (job.status === "queued" || job.status === "running" || (job.nestedWorkActive ?? hasLiveNestedDescendants(job.nestedChildren))) return true;
 	}
 	for (const control of state.foregroundControls.values()) {
 		if ((control.schedulingOwners ?? 0) > 0
