@@ -103,6 +103,39 @@ describe("retained foreground nested route tracker", () => {
 		}
 	});
 
+	it("ignores stranded foreground work only after its runner exits, keeping independent async work", async () => {
+		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
+		const nestedRoute = route("foreground-owner-exit-root");
+		const ownerId = "async-owner";
+		const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId);
+		const owner = { id: ownerId, parentRunId: nestedRoute.rootRunId, depth: 1,
+			path: [{ runId: nestedRoute.rootRunId }], asyncDir: path.join(asyncRoot, ownerId), agent: "owner" };
+		const foreground = { id: "in-process", parentRunId: ownerId, depth: 2,
+			path: [...owner.path, { runId: ownerId }], state: "running" as const, agent: "foreground" };
+		const independent = { ...foreground, id: "independent", parentRunId: foreground.id, depth: 3,
+			path: [...foreground.path, { runId: foreground.id }], asyncDir: path.join(asyncRoot, "independent") };
+		writeNestedEvent(nestedRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: owner.parentRunId, child: { ...owner, state: "failed" } });
+		writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 201, parentRunId: foreground.parentRunId, child: foreground });
+		writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 202, parentRunId: independent.parentRunId, child: independent });
+		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
+		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
+		try {
+			tracker.track(nestedRoute.rootRunId);
+			fs.mkdirSync(owner.asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(owner.asyncDir, "process-terminal.json"), JSON.stringify({
+				version: 1, state: "observed", runId: ownerId, runnerProcessInstanceId: "runner", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 300, exitCode: 1, signal: null }],
+			}));
+			await new Promise((resolve) => setTimeout(resolve, 35));
+			assert.equal(state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId), true);
+			writeNestedEvent(nestedRoute, { type: "subagent.nested.completed", ts: 400, parentRunId: independent.parentRunId, child: { ...independent, state: "complete" } });
+			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
+		} finally {
+			tracker.clear();
+			fs.rmSync(asyncRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps the route through the handoff race until the first tracker refresh", async () => {
 		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("handoff-root");
