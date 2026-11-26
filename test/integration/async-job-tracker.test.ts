@@ -1536,6 +1536,35 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
+	for (const foreign of [false, true]) it(`keeps a missing-marker-status placeholder until ${foreign ? "foreign status is rejected" : "owned status appears"}`, async (t) => {
+		const asyncRoot = createTempDir("pi-missing-startup-status-");
+		const asyncDir = path.join(asyncRoot, "starting");
+		const statusPath = path.join(asyncDir, "status.json");
+		const resultsDir = path.join(asyncRoot, "results");
+		const output = resultFilePath(resultsDir, "starting");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		const stat = fsDefault.statSync;
+		let reads = 0;
+		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		fs.mkdirSync(asyncDir, { recursive: true });
+		updateActiveRunIndex(asyncDir, "running");
+		fsDefault.statSync = ((file, options) => { if (file === statusPath) reads++; return stat(file, options); }) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		await waitForCondition(() => reads >= 2, "startup and retry read the missing status");
+		assert.equal(state.asyncJobs.get("starting")?.status, "running");
+		assert.equal(hasLiveSubagentWork(state), true);
+		assert.equal(fs.existsSync(statusPath), false);
+		if (foreign) writePendingAsyncResultFile(output, { id: "starting", sessionId: "foreign", success: true });
+		writeRunningAsyncStatus(asyncDir, "starting", foreign ? "foreign" : "parent");
+		if (foreign) {
+			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
+			assert.equal(fs.existsSync(output), false);
+			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
+		} else await waitForCondition(() => state.asyncJobs.get("starting")?.agents?.[0] === "worker", "owned status recovered");
+	});
+
 	it("keeps a restored running job live until temporarily missing status returns", async (t) => {
 		const asyncRoot = createTempDir("pi-restored-live-status-gap-");
 		const asyncDir = path.join(asyncRoot, "restored");

@@ -503,6 +503,9 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
+	const rejectedReread = (current: AsyncStatus | null): ReconcileAsyncRunResult => ({
+		status: null, repaired: false, ...(current === null ? { statusMissing: true } : {}),
+	});
 	const mayWrite = (current: AsyncStatus | null): boolean => !options.expectedRunId || (current
 		? current.runId === options.expectedRunId && current.sessionId === effectiveStatus.sessionId
 		: !status);
@@ -540,7 +543,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			: undefined;
 		if (terminalStatus) {
 			const currentStatus = readStatus(asyncDir);
-			if (!mayWrite(currentStatus)) return { status: null, repaired: false };
+			if (!mayWrite(currentStatus)) return rejectedReread(currentStatus);
 			if (options.expectedRunId && currentStatus !== status) {
 				return { status: currentStatus, repaired: false, resultPath: existingResultPath };
 			}
@@ -594,11 +597,12 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		if (options.expectedRunId) {
 			if (effectiveStatus.sessionId && indexedResultPayloadVisibility(resultsDir, effectiveStatus.sessionId, runId) !== "absent") {
 				const current = readStatus(asyncDir);
-				return { status: mayWrite(current) ? current ?? status : null, repaired: false };
+				return mayWrite(current) ? { status: current ?? status, repaired: false } : rejectedReread(current);
 			}
 			const current = readStatus(asyncDir);
 			// readStatus returns the same cached snapshot while the file is unchanged.
-			if (!mayWrite(current) || current !== status) return { status: mayWrite(current) ? current : null, repaired: false };
+			if (!mayWrite(current)) return rejectedReread(current);
+			if (current !== status) return { status: current, repaired: false };
 		}
 		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, reason, ownerExited,
 			ownerExited ? options.adoptCompletionOwnerId : undefined, preservePublicResult);

@@ -915,6 +915,26 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	for (const matchingPayload of [false, true]) it(`reports missing exact status at the ${matchingPayload ? "result" : "failure"} repair pre-write check`, () => {
+		const root = tempRoot("pi-stale-prewrite-missing-");
+		try {
+			const asyncDir = path.join(root, "run");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "run.json");
+			const statusPath = path.join(asyncDir, "status.json");
+			writeStatus(asyncDir, { runId: "run", sessionId: "parent", mode: "single", state: "running", pid: 12345, pidNamespaceScope: "pid:[same]", startedAt: 1000 });
+			if (matchingPayload) writeAsyncResultFile(resultPath, { id: "run", sessionId: "parent", success: true });
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "run", expectedSessionId: "parent", resultsDir,
+				now: () => 2000, pidNamespaceScope: () => "pid:[same]", kill: () => { fs.rmSync(statusPath); throw errno("ESRCH"); } });
+			assert.deepEqual(result, { status: null, repaired: false, statusMissing: true });
+			assert.equal(fs.existsSync(statusPath), false);
+			assert.equal(fs.existsSync(resultPath), matchingPayload);
+			if (matchingPayload) assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf-8")).success, true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("does not publish failed repair after the PID probe finds a replaced session", () => {
 		const root = tempRoot("pi-stale-pid-session-swap-");
 		try {

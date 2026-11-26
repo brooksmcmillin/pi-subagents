@@ -23,6 +23,7 @@ import { isStatusAccessError, isStorageAccessError, readStatus, resolveWatchPath
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { activeRunMarkerAgeMs, DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS } from "./active-run-index.ts";
 import { listAsyncRuns, summarizeAsyncStatus, type AsyncRunSummary } from "./async-status.ts";
 import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
@@ -529,9 +530,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				return true;
 			}
 			let stored: ReturnType<typeof readStatus> = null;
+			let statusMissing = false;
 			let summary: AsyncRunSummary | undefined;
 			try {
 				stored = readStatus(job.asyncDir);
+				statusMissing = stored === null;
 				if (stored?.runId === job.asyncId) summary = summarizeAsyncStatus(job.asyncDir, stored);
 			} catch (error) {
 				if (isStatusAccessError(error, job.asyncDir)) {
@@ -542,6 +545,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
+				if (!pending && statusMissing) {
+					try {
+						const age = activeRunMarkerAgeMs(job.asyncDir, options.now?.());
+						if (age !== undefined && age <= DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) return false;
+					} catch (error) {
+						if (isStorageAccessError(error)) return false;
+					}
+				}
 				if (hasRestoredNestedWork(job, pending)) return false;
 				if (pending?.pending && pending.instanceId && !options.hasDeliveredResult?.(job.asyncId)
 					&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: pending.instanceId })?.state !== "observed") return false;
