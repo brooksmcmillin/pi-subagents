@@ -6,9 +6,9 @@ import { DIRS, type AsyncStatus, type Details, type SubagentState } from "../../
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { deliverStopRequest, stopInboxClosedPath } from "../background/control-channel.ts";
 import { readProcessTerminal } from "../background/process-terminal.ts";
-import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
-import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
+import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
+import { reconcileVerifiedAsyncRun } from "../background/stale-run-reconciler.ts";
+import { SUBAGENT_STOPPED_MESSAGE, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
@@ -36,9 +36,28 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 		return `process-terminal proof is ${proof?.state === "unknown" ? `unknown (${proof.reason})` : proof?.state ?? "missing"}`;
 	}
 	if (!status.sessionId) return "session identity is missing";
-	// The validated lookup skips unreadable or foreign files; those must be refused below, not replaced.
-	const existingResultPath = resultPayloadPathForSessionRun(resultsDir, status.sessionId, status.runId)
-		?? resultPayloadFileForSessionRun(resultsDir, status.sessionId, status.runId);
+	const publicPath = resultFilePath(resultsDir, status.runId);
+	// Check the publication destination independently; an owned pending payload can mask it.
+	try {
+		if (!fs.statSync(publicPath).isFile()
+			|| !resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(publicPath, "utf-8")), status.sessionId, status.runId)) {
+			return "public paused result identity does not match the run";
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "public paused result is unavailable";
+	}
+	let inaccessible = false;
+	let indexUnavailable = false;
+	const markInaccessible = () => { inaccessible = true; };
+	let existingResultPath: string | undefined;
+	try {
+		existingResultPath = resultPayloadPathForSessionRun(resultsDir, status.sessionId, status.runId, markInaccessible, { promote: false });
+	} catch (error) {
+		if (!isStorageAccessError(error)) throw error;
+		indexUnavailable = true;
+	}
+	existingResultPath ??= resultPayloadFileForSessionRun(resultsDir, status.sessionId, status.runId, markInaccessible);
+	if (inaccessible || (indexUnavailable && !existingResultPath)) return "paused result storage is unavailable";
 	let existingResult: Record<string, unknown>;
 	if (!existingResultPath) {
 		// Delivery deletes the paused result, and an interrupted parent may never have received one; seal from status.
@@ -116,7 +135,7 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 		steps,
 	};
 	delete stoppedStatus.activityState;
-	writeAsyncResultFile(resultFilePath(resultsDir, status.runId), stoppedResult);
+	writeAsyncResultFile(publicPath, stoppedResult);
 	writeAtomicJson(path.join(asyncDir, "status.json"), stoppedStatus);
 	updateActiveRunIndex(asyncDir, "stopped", status.toolCallId, { retryCapacityErrors: true, terminalIndexBeforeRelease: true });
 }
@@ -160,15 +179,18 @@ export function stopAsyncRun(
 		return { content: [{ type: "text", text: `Stop requested for async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
 	}
 	if (!target) return null;
-	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
+	let status = readStatus(target.asyncDir);
 	// A relaunched workflow stops the exact child run it re-attached from its relaunch chain, whichever session launched it.
-	if (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId) {
+	if ((status && status.runId !== target.asyncId)
+		|| (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId)) {
 		return {
 			content: [{ type: "text", text: `Async run '${target.asyncId}' was not found in the active session.` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
 	}
+	// A paused run is already terminal for reconciliation; don't promote a result before sealing validates its destination.
+	if (status && status.state !== "paused") status = reconcileVerifiedAsyncRun(target.asyncDir, status, { kill });
 	const pausedWholeRun = status?.state === "paused" && childId === undefined;
 	if (!status || (status.state !== "running" && status.state !== "queued" && !pausedWholeRun)) {
 		return {

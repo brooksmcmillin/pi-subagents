@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isStorageAccessError } from "../../shared/utils.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { withFileLease } from "../../shared/file-lease.ts";
 import { MISSION_BINDING_FILE } from "../../missions/lifecycle.ts";
@@ -88,9 +89,9 @@ function pendingSessionDirs(resultsDir: string, sessionId: string): string[] {
 	return indexSegmentAliases(sessionId).map((segment) => path.join(resultsDir, RESULT_PENDING_DIR, segment));
 }
 
-function firstExistingResultFile(paths: string[]): string | undefined {
+function firstExistingResultFile(paths: string[], onInaccessible?: () => void): string | undefined {
 	for (const filePath of paths) {
-		if (existingResultFile(filePath)) return filePath;
+		if (existingResultFile(filePath, onInaccessible)) return filePath;
 	}
 	return undefined;
 }
@@ -315,6 +316,9 @@ export function retireResultSnapshot(publicPath: string, read: ResultSnapshot, p
 		for (const candidate of new Set([...resultPayloadCandidates(publicPath, read), payloadPath])) {
 			const current = readResultPayload(candidate);
 			if (current === undefined || !readByConsumer(publicPath, read, candidate, current)) continue;
+			// A public file beside pending bytes may belong to an unrelated publication.
+			if (candidate === publicPath && current !== read.snapshot && read.sessionId
+				&& !resultTextMatchesSessionRun(current, read.sessionId, read.runId)) continue;
 			try {
 				fs.rmSync(candidate, { force: true });
 			} catch (error) {
@@ -339,11 +343,12 @@ export function acknowledgeMissionObserverSnapshot(publicPath: string, read: Res
 	}, leaseWaitMs);
 }
 
-function existingResultFile(resultPath: string): boolean {
+function existingResultFile(resultPath: string, onInaccessible?: () => void): boolean {
 	try {
 		return fs.statSync(resultPath).isFile();
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Failed to inspect async result payload '${resultPath}':`, error);
+		if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Failed to inspect async result payload '${resultPath}':`, error);
 		return false;
 	}
 }
@@ -358,11 +363,20 @@ export function resultPayloadMatchesSessionRun(data: unknown, sessionId: string,
 	return (nonEmptyString(record.runId) ?? nonEmptyString(record.id)) === runId && nonEmptyString(record.sessionId) === sessionId;
 }
 
-function pendingResultPayloadMatches(filePath: string, sessionId: string, runId: string): boolean {
+function resultTextMatchesSessionRun(raw: string, sessionId: string, runId: string): boolean {
+	try {
+		return resultPayloadMatchesSessionRun(JSON.parse(raw), sessionId, runId);
+	} catch {
+		return false;
+	}
+}
+
+function resultPayloadFileMatches(filePath: string, sessionId: string, runId: string, onInaccessible?: () => void): boolean {
 	try {
 		return resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(filePath, "utf-8")), sessionId, runId);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${filePath}':`, error);
+		if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid async result '${filePath}':`, error);
 		return false;
 	}
 }
@@ -371,21 +385,25 @@ function assertPendingResultPayloadMatches(filePath: string, sessionId: string, 
 	return resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(filePath, "utf-8")), sessionId, runId);
 }
 
-export function promotePendingResultFile(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), options: { logFailure?: boolean } = {}): "none" | "promoted" | "pending" {
+export function promotePendingResultFile(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), options: { logFailure?: boolean; onInaccessible?: () => void } = {}): "none" | "promoted" | "pending" {
 	if (file !== path.basename(file) || !file.endsWith(".json")) return "none";
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
+	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId), options.onInaccessible);
 	if (!pendingPath) return "none";
 	const resultPath = path.join(resultsDir, file);
 	try {
+		if (!assertPendingResultPayloadMatches(pendingPath, sessionId, runId)) return "none";
+		const publicSnapshot = readResultPayload(resultPath);
+		if (publicSnapshot !== undefined && !resultTextMatchesSessionRun(publicSnapshot, sessionId, runId)) return "pending";
 		// POSIX rename replaces the destination atomically. Deleting it first lets a
 		// losing promoter unlink the result that another promoter just published.
 		fs.renameSync(pendingPath, resultPath);
-		return existingResultFile(resultPath) ? "promoted" : "pending";
+		return existingResultFile(resultPath, options.onInaccessible) ? "promoted" : "pending";
 	} catch (error) {
+		if (error instanceof SyntaxError) return "none";
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "EEXIST" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) {
-			const pendingExists = existingResultFile(pendingPath);
-			const resultExists = existingResultFile(resultPath);
+			const pendingExists = existingResultFile(pendingPath, options.onInaccessible);
+			const resultExists = existingResultFile(resultPath, options.onInaccessible);
 			if (pendingExists) {
 				if (!resultExists && options.logFailure !== false && !isUnaddressableResultCandidate(error)) console.error(`Failed to promote pending async result '${pendingPath}' to '${resultPath}':`, error);
 				return "pending";
@@ -405,32 +423,59 @@ interface ResultPayloadLocation {
 	state: "public" | "pending";
 }
 
-function pendingResultLocationForSessionRun(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId)): ResultPayloadLocation | undefined {
+function pendingResultLocationForSessionRun(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), onInaccessible?: () => void): ResultPayloadLocation | undefined {
 	if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
-	if (!pendingPath || !pendingResultPayloadMatches(pendingPath, sessionId, runId)) return undefined;
+	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId), onInaccessible);
+	if (!pendingPath || !resultPayloadFileMatches(pendingPath, sessionId, runId, onInaccessible)) return undefined;
 	return { file, path: pendingPath, state: "pending" };
 }
 
 export function fallbackResultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
-	if (!pendingPath || !assertPendingResultPayloadMatches(pendingPath, sessionId, runId)) return undefined;
-	return pendingPath;
+	return pendingResultLocationForSessionRun(resultsDir, sessionId, runId)?.path;
 }
 
 /** Any pending or public result file for the run, without validating its contents. */
-export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
-	return firstExistingResultFile([...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)]);
+export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void): string | undefined {
+	return firstExistingResultFile([...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)], onInaccessible);
 }
 
-function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEntry): ResultPayloadLocation | undefined {
+/** Do not infer absence from an inaccessible pending or public location. */
+export function resultPayloadVisibility(resultsDir: string, sessionId: string, runId: string, resolvedPath?: string): "present" | "absent" | "unknown" {
+	let unknown = false;
+	const candidates = [...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)];
+	if (resolvedPath && !candidates.includes(resolvedPath)) candidates.unshift(resolvedPath);
+	for (const candidate of candidates) {
+		try {
+			if (fs.statSync(candidate).isFile() && resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(candidate, "utf-8")), sessionId, runId)) return "present";
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (!(error instanceof SyntaxError) && code !== "ENOENT" && code !== "ENAMETOOLONG") unknown = true;
+		}
+	}
+	return unknown ? "unknown" : "absent";
+}
+
+function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEntry, onInaccessible?: () => void): ResultPayloadLocation | undefined {
 	if (entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
-	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file);
+	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file, { onInaccessible });
 	if (pendingState === "pending") {
-		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file);
+		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file, onInaccessible);
 	}
 	const resultPath = path.join(resultsDir, entry.file);
-	if (pendingState === "promoted" || existingResultFile(resultPath)) return { file: entry.file, path: resultPath, state: "public" };
+	const canonical = resultFileName(entry.runId);
+	if (entry.file === canonical) {
+		return pendingState === "promoted" || existingResultFile(resultPath, onInaccessible)
+			? { file: entry.file, path: resultPath, state: "public" }
+			: undefined;
+	}
+	if (resultPayloadFileMatches(resultPath, entry.sessionId, entry.runId, onInaccessible)) {
+		return { file: entry.file, path: resultPath, state: "public" };
+	}
+	// An old alias can now belong to a different publication; look for the exact canonical result.
+	const canonicalPath = path.join(resultsDir, canonical);
+	if (resultPayloadFileMatches(canonicalPath, entry.sessionId, entry.runId, onInaccessible)) {
+		return { file: canonical, path: canonicalPath, state: "public" };
+	}
 	return undefined;
 }
 
@@ -442,7 +487,7 @@ function readResultIndexForSessionRun(resultsDir: string, sessionId: string, run
 			return entry;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EPERM" || code === "EACCES") throw error;
+			if (code === "EPERM" || code === "EACCES" || code === "EIO") throw error;
 			if (code !== "ENOENT" && code !== "ENOTDIR" && !isUnaddressableResultCandidate(error)) {
 				console.error(`Ignoring invalid async result index for '${runId}':`, error);
 			}
@@ -451,10 +496,28 @@ function readResultIndexForSessionRun(resultsDir: string, sessionId: string, run
 	return undefined;
 }
 
-export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
+export function indexedResultPayloadVisibility(resultsDir: string, sessionId: string, runId: string): ReturnType<typeof resultPayloadVisibility> {
+	try {
+		const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
+		const indexedPath = entry && entry.file === path.basename(entry.file) && entry.file.endsWith(".json") ? path.join(resultsDir, entry.file) : undefined;
+		return resultPayloadVisibility(resultsDir, sessionId, runId, indexedPath);
+	} catch (error) {
+		if (isStorageAccessError(error)) return "unknown";
+		throw error;
+	}
+}
+
+export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void, options?: { promote: false }): string | undefined {
 	const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
-	return (entry ? resultPayloadLocationFromIndex(resultsDir, entry) : undefined)?.path
-		?? pendingResultLocationForSessionRun(resultsDir, sessionId, runId)?.path;
+	if (options?.promote === false) {
+		const pending = pendingResultLocationForSessionRun(resultsDir, sessionId, runId, undefined, onInaccessible);
+		if (pending) return pending.path;
+		if (!entry || entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
+		const indexedPath = path.join(resultsDir, entry.file);
+		return existingResultFile(indexedPath, onInaccessible) ? indexedPath : undefined;
+	}
+	return (entry ? resultPayloadLocationFromIndex(resultsDir, entry, onInaccessible) : undefined)?.path
+		?? pendingResultLocationForSessionRun(resultsDir, sessionId, runId, undefined, onInaccessible)?.path;
 }
 
 export function resultPayloadPathForMissionObserverRun(resultsDir: string, runId: string): string | undefined {
@@ -493,13 +556,13 @@ export function resultPayloadPathForIndexedRun(resultsDir: string, runId: string
 	return undefined;
 }
 
-function indexedResultFile(resultsDir: string, entry: ResultIndexEntry, includePending = false): string | undefined {
-	const location = resultPayloadLocationFromIndex(resultsDir, entry);
+function indexedResultFile(resultsDir: string, entry: ResultIndexEntry, includePending = false, onInaccessible?: () => void): string | undefined {
+	const location = resultPayloadLocationFromIndex(resultsDir, entry, onInaccessible);
 	if (!location) return undefined;
 	return includePending || location.state === "public" ? location.file : undefined;
 }
 
-function listIndexFiles(dir: string): string[] {
+function listIndexFiles(dir: string, onUnreadableDirectory?: () => void): string[] {
 	let files: string[];
 	try {
 		files = fs.readdirSync(dir, { withFileTypes: true })
@@ -507,24 +570,29 @@ function listIndexFiles(dir: string): string[] {
 			.map((entry) => path.join(dir, entry.name));
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
+		if (onUnreadableDirectory && isStorageAccessError(error)) {
+			onUnreadableDirectory();
+			return [];
+		}
 		if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) return [];
 		throw error;
 	}
 	return files;
 }
 
-function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false): string[] {
+function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void, onIncompleteDiscovery?: () => void): string[] {
 	const candidates = new Set<string>();
-	for (const entryPath of listIndexFiles(dir)) {
+	for (const entryPath of listIndexFiles(dir, onIncompleteDiscovery)) {
 		try {
 			const entry = parseResultIndexEntry(JSON.parse(fs.readFileSync(entryPath, "utf-8")));
 			if (!entry) {
 				fs.rmSync(entryPath, { force: true });
 				continue;
 			}
-			const resultFile = indexedResultFile(resultsDir, entry, includePending);
+			const resultFile = indexedResultFile(resultsDir, entry, includePending, onIncompleteDiscovery);
 			if (resultFile) candidates.add(resultFile);
 		} catch (error) {
+			if (isStorageAccessError(error)) onUnreadableEntry?.(path.basename(entryPath));
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid async result index '${entryPath}':`, error);
 		}
 	}
@@ -539,13 +607,17 @@ export function resultFilesForSession(resultsDir: string, sessionId: string): st
 	return [...files];
 }
 
-function pendingResultFilesForSession(resultsDir: string, sessionId: string): string[] {
+function pendingResultFilesForSession(resultsDir: string, sessionId: string, onUnreadablePending?: () => void): string[] {
 	const files = new Set<string>();
 	for (const dir of pendingSessionDirs(resultsDir, sessionId)) {
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(dir, { withFileTypes: true });
 		} catch (error) {
+			if (onUnreadablePending && isStorageAccessError(error)) {
+				onUnreadablePending();
+				continue;
+			}
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) continue;
 			throw error;
@@ -558,19 +630,20 @@ function pendingResultFilesForSession(resultsDir: string, sessionId: string): st
 				const runId = nonEmptyString(data.runId) ?? nonEmptyString(data.id);
 				if (runId && nonEmptyString(data.sessionId) === sessionId) files.add(resultFileName(runId));
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${pendingPath}':`, error);
+				if (isStorageAccessError(error) && onUnreadablePending) onUnreadablePending();
+				else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${pendingPath}':`, error);
 			}
 		}
 	}
 	return [...files];
 }
 
-export function resultCandidateFilesForSession(resultsDir: string, sessionId: string): string[] {
+export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void, onIncompleteDiscovery?: () => void): string[] {
 	const files = new Set<string>();
 	for (const dir of sessionIndexDirs(resultsDir, sessionId)) {
-		for (const file of resultFilesFromIndexDir(resultsDir, dir, true)) files.add(file);
+		for (const file of resultFilesFromIndexDir(resultsDir, dir, true, onUnreadableEntry, onIncompleteDiscovery)) files.add(file);
 	}
-	for (const file of pendingResultFilesForSession(resultsDir, sessionId)) files.add(file);
+	for (const file of pendingResultFilesForSession(resultsDir, sessionId, onIncompleteDiscovery)) files.add(file);
 	return [...files];
 }
 

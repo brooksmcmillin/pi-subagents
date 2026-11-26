@@ -107,6 +107,12 @@ export function readProcessTerminal(asyncDir: string, fallback?: { runId?: strin
 	}
 }
 
+export function hasObservedRunnerClose(asyncDir: string, runId: string, recorded?: ProcessTerminal): boolean {
+	const expected = { runId, runnerProcessInstanceId: recorded?.runnerProcessInstanceId };
+	return sanitizeProcessTerminal(recorded, expected)?.state === "observed"
+		|| readProcessTerminal(asyncDir, expected)?.state === "observed";
+}
+
 function stepProcessTerminalProof(
 	proof: ProcessTerminal,
 	childIndex: number,

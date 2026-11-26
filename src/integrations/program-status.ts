@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AsyncJobState } from "../shared/types.ts";
+import { WAKE_PENDING_MS } from "../shared/parent-wake.ts";
 import { sanitizeDisplayText } from "../shared/display-text.ts";
 
 /**
@@ -22,6 +23,12 @@ export interface ProgramStatusReporterOptions {
 	/** `programStatus` from the user config; only `false` turns it off. */
 	enabled: boolean;
 	getJobs: () => Iterable<AsyncJobState>;
+	hasBackgroundWork: () => boolean;
+	/** Uses the parent wake reservation, which can expire without a lifecycle event. */
+	hasPendingWake?: () => boolean;
+	getQueuedWakes?: () => Iterable<string>;
+	isParentPreparing?: () => boolean;
+	now?: () => number;
 	/** Pending native supervisor requests that expect a reply. */
 	getPendingRequests: () => Iterable<{ id: string; runId: string }>;
 	write?: (data: string) => void;
@@ -31,7 +38,7 @@ export interface ProgramStatusReporterOptions {
 
 export interface ProgramStatusReporter {
 	/** Only the interactive TUI session on a real terminal reports. */
-	sessionStarted(input: { hasUI: boolean; mode?: string }): void;
+	sessionStarted(input: { hasUI: boolean; mode?: string; session?: { manager: object; id: string }; setBackgroundWork?: (key: string, active: boolean) => void }): boolean;
 	sync(): void;
 	agentStarted(): void;
 	agentSettled(): void;
@@ -135,6 +142,15 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	const sent = new Map<string, string>();
 	let active = false;
 	let parentIdle = true;
+	let setBackgroundWork: ((key: string, active: boolean) => void) | undefined;
+	let reportedBackgroundWork = false;
+	let wakeRefresh: ReturnType<typeof setTimeout> | undefined;
+	const now = options.now ?? Date.now;
+	const reloadKey = Symbol.for("pi-subagents.program-status-reload-wakes");
+	const globals = globalThis as typeof globalThis & { [reloadKey]?: WeakMap<object, { id: string; deadlines: Map<string, number | null> }> };
+	const reloadWakes = globals[reloadKey] ??= new WeakMap();
+	let session: { manager: object; id: string } | undefined;
+	let wakeDeadlines = new Map<string, number | null>();
 	// A request counts as waiting on the user only after the parent settled without answering it.
 	let unansweredAtSettle = new Set<string>();
 	// Pi clears every OSC 7501 record when it suspends on Ctrl+Z and re-reports only its own root
@@ -149,6 +165,37 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	// finished ones, each most recently updated first, up to the cap. Only the difference is written.
 	const sync = (): void => {
 		if (!active) return;
+		const queuedWakes = new Set(options.getQueuedWakes?.());
+		for (const key of wakeDeadlines.keys()) if (!queuedWakes.has(key)) wakeDeadlines.delete(key);
+		const pendingParentWake = options.hasPendingWake?.();
+		const extend = !parentIdle || pendingParentWake || options.isParentPreparing?.();
+		const time = now();
+		let pendingWake = Boolean(pendingParentWake);
+		for (const key of queuedWakes) {
+			const previous = wakeDeadlines.get(key);
+			const deadline = previous === null ? null : extend || previous === undefined ? time + WAKE_PENDING_MS : previous;
+			const live = deadline !== null && time < deadline;
+			wakeDeadlines.set(key, live ? deadline : null);
+			pendingWake ||= live;
+		}
+		if (parentIdle && pendingWake) {
+			if (!wakeRefresh) {
+				wakeRefresh = setTimeout(() => {
+					wakeRefresh = undefined;
+					sync();
+				}, 1_000);
+				wakeRefresh.unref();
+			}
+		} else {
+			clearTimeout(wakeRefresh);
+			wakeRefresh = undefined;
+		}
+		const backgroundWork = pendingWake || options.hasBackgroundWork();
+		// Let the parent enter its follow-up turn before releasing its completion hold.
+		if (backgroundWork !== reportedBackgroundWork && (backgroundWork || parentIdle)) {
+			reportedBackgroundWork = backgroundWork;
+			setBackgroundWork?.("pi-subagents", backgroundWork);
+		}
 		const blockedRuns = new Set<string>();
 		if (parentIdle) {
 			for (const request of options.getPendingRequests()) {
@@ -161,8 +208,8 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			if (!id) continue;
 			const state = programState(job, blockedRuns.has(job.asyncId));
 			// Child results belong to the working parent first, not the user. Omission also
-			// clears previously shown results when the parent resumes handling them.
-			if (!parentIdle && (state === "done" || state === "error")) continue;
+			// clears previously shown results when work resumes.
+			if ((!parentIdle || backgroundWork) && (state === "done" || state === "error")) continue;
 			const report = programStatusReport({ state, id, ...(state === "blocked" ? { kind: "question" as const } : {}), title: jobLabel(job), msg: message(job, state) });
 			candidates.push({ id, report, active: state === "working" || state === "blocked", updatedAt: job.updatedAt ?? job.startedAt ?? 0 });
 		}
@@ -185,13 +232,19 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	};
 
 	return {
-		sessionStarted({ hasUI, mode }) {
+		sessionStarted({ hasUI, mode, session: current, setBackgroundWork: reportBackgroundWork }) {
+			session = current;
+			const handoff = session && reloadWakes.get(session.manager);
+			if (session) reloadWakes.delete(session.manager);
+			wakeDeadlines = handoff && handoff.id === session?.id ? handoff.deadlines : new Map();
+			setBackgroundWork = reportBackgroundWork;
 			active = options.enabled && hasUI && mode === "tui" && isTTY && env.TERM !== "dumb" && env.PI_PROGRAM_STATUS !== "0";
 			if (active && !listeningForResume && process.platform !== "win32") {
 				process.on("SIGCONT", resend);
 				listeningForResume = true;
 			}
 			sync();
+			return active;
 		},
 		sync,
 		agentStarted() {
@@ -199,15 +252,26 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			sync();
 		},
 		agentSettled() {
+			// A busy turn can queue a wake long before delivering it at the next boundary.
+			if (!parentIdle) {
+				const deadline = now() + WAKE_PENDING_MS;
+				for (const key of options.getQueuedWakes?.() ?? []) if (wakeDeadlines.get(key) !== null) wakeDeadlines.set(key, deadline);
+			}
 			parentIdle = true;
 			unansweredAtSettle = new Set([...options.getPendingRequests()].map((request) => request.id));
 			sync();
 		},
 		dispose(shutdownReason) {
+			if (shutdownReason === "reload" && session) reloadWakes.set(session.manager, { id: session.id, deadlines: wakeDeadlines });
 			if (active && shutdownReason !== "quit") {
 				for (const id of sent.keys()) write(programStatusReport({ state: "clear", id }));
 			}
 			sent.clear();
+			clearTimeout(wakeRefresh);
+			wakeRefresh = undefined;
+			// Pi retires the old runner's keys on replacement. Clearing here could flash done before the new runner reports.
+			setBackgroundWork = undefined;
+			reportedBackgroundWork = false;
 			active = false;
 			if (listeningForResume) {
 				process.off("SIGCONT", resend);

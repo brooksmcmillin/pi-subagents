@@ -7,13 +7,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { buildCompletionKey } from "../../src/runs/background/completion-dedupe.ts";
 import { createResultWatcher as createRawResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { collectWaitCompletions } from "../../src/runs/background/wait-completions.ts";
 import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
-import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
+import { recordSessionReplacement, recordSessionStart } from "../../src/shared/session-succession.ts";
 import { missionObserverIndexPath, resultPayloadPathForMissionObserverRun, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { tryLease } from "../../src/shared/file-lease.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
 import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
@@ -263,6 +265,115 @@ describe("result watcher", () => {
 		}
 	});
 
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native payload EIO retry", "native identity EIO", "native stat retry", "native stat recovery retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const order: string[] = [];
+		const terminalHolds: boolean[] = [];
+		let watchEvent: fs.WatchListener<string> | undefined;
+		const denyDiscovery = source.endsWith("retry");
+		const reload = source === "native reload retry";
+		const recoverOnProbe = source === "native stat recovery retry";
+		const injectStatFailure = reload || recoverOnProbe || source === "native stat retry";
+		let denyStat = injectStatFailure;
+		let statDenied = false;
+		const originalStat = fsDefault.statSync;
+		const stat = ((file, options) => {
+			if (denyStat && resultReads >= 2 && String(file).endsWith("wake-order.json")) {
+				if (recoverOnProbe && new Error().stack?.includes("resultPayloadVisibility")) {
+					denyStat = false;
+					return originalStat(file, options);
+				}
+				assert.deepEqual(terminalHolds, [true]);
+				statDenied = true;
+				throw Object.assign(new Error("transient stat denial"), { code: "EACCES" });
+			}
+			return originalStat(file, options);
+		}) as typeof fs.statSync;
+		let resultReads = 0;
+		let payloadRetryObserved = false;
+		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
+			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
+		const createWatcher = (watcherState: typeof state) => createResultWatcher({ events: { on: () => () => {}, emit(event) {
+			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) order.push("subscriber wake");
+		} } }, watcherState, resultsDir, 60_000, {
+			notifier: { async deliver() { assert.deepEqual(terminalHolds, [true]); order.push("non-waking notice"); return true; } },
+			onResultDelivered: () => order.push("release"),
+			onOwnedQueueChanged: reporter.sync,
+			fs: { ...fs,
+				watch(_dir, listener) {
+					watchEvent = listener as typeof watchEvent;
+					const handle = { on: () => handle, close() {}, unref() {} };
+					return handle as unknown as fs.FSWatcher;
+				},
+				statSync: stat,
+				readFileSync: ((file, options) => {
+					if (String(file).endsWith("wake-order.json")) {
+						resultReads++;
+						if ((source.startsWith("native payload") && resultReads === 3) || (source === "native identity EIO" && resultReads === 2)) {
+							payloadRetryObserved = true;
+							assert.deepEqual(terminalHolds, [true]);
+							throw Object.assign(new Error("transient payload failure"), { code: source.includes("EIO") ? "EIO" : "EACCES" });
+						}
+						if (denyDiscovery && resultReads === 1) throw Object.assign(new Error("transient discovery failure"), { code: "EACCES" });
+					}
+					return fs.readFileSync(file, options);
+				}) as typeof fs.readFileSync,
+			},
+		});
+		let watcher = createWatcher(state);
+		try {
+			if (denyStat) {
+				fsDefault.statSync = stat;
+				syncBuiltinESMExports();
+			}
+			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
+			if (source !== "indexed scan") watcher.startResultWatcher();
+			const resultPath = path.join(resultsDir, "wake-order.json");
+			writeIndexedResult(resultPath, { id: "wake-order", sessionId: "session-current", success: true, summary: "done" });
+			if (source !== "indexed scan") {
+				assert.ok(watchEvent);
+				watchEvent("rename", "wake-order.json");
+				if (source === "native identity EIO") fs.appendFileSync(resultPath, " "); // Force a fresh identity read after native discovery.
+			} else watcher.primeExistingResults();
+			assert.equal(state.asyncJobs.size, 0);
+			assert.deepEqual(terminalHolds, denyDiscovery ? [] : [true], "hold begins when ownership is known");
+			assert.deepEqual(order, []);
+			if (denyStat) {
+				assert.equal(await waitForPredicate(() => statDenied), true);
+				assert.deepEqual(terminalHolds, [true]);
+				if (reload) {
+					const manager = {};
+					watcher.captureReloadHolds(manager);
+					reporter.dispose("reload");
+					watcher.stopResultWatcher();
+					terminalHolds.length = 0;
+					watcher = createWatcher({ ...createState(), currentSessionId: "session-current" });
+					watcher.startResultWatcher();
+					watcher.restoreReloadHolds(manager);
+					reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
+					assert.deepEqual(terminalHolds, [true], "handoff restored before payload access recovered");
+					assert.deepEqual(order, []);
+				}
+				denyStat = false;
+			}
+			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
+			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
+			assert.deepEqual(terminalHolds, [true, false]);
+			if (source.startsWith("native payload") || source === "native identity EIO") assert.equal(payloadRetryObserved, true);
+			if (recoverOnProbe) assert.equal(statDenied, true);
+		} finally {
+			if (injectStatFailure) {
+				fsDefault.statSync = originalStat;
+				syncBuiltinESMExports();
+			}
+			reporter.dispose();
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("records an id-alias result when runId is empty", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-id-alias-"));
 		try {
@@ -325,6 +436,44 @@ describe("result watcher", () => {
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
+	});
+
+	it("drops a reclaimed predecessor queue on an index storage retry", async (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-revoked-queue-"));
+		const predecessor = "queue-predecessor";
+		const successor = "queue-successor";
+		const resultPath = path.join(resultsDir, "reclaimed.json");
+		const state = createState();
+		state.currentSessionId = successor;
+		recordSessionReplacement(successor, predecessor);
+		writeIndexedResult(resultPath, { id: "reclaimed", sessionId: predecessor, success: true });
+		const originalRead = fsDefault.readFileSync;
+		let denied = 0;
+		let queueChanges = 0;
+		let delivered = 0;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			ownership: createResultDeliveryOwnership(state),
+			onOwnedQueueChanged: () => queueChanges++,
+			notifier: { deliver: async () => { delivered++; return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); recordSessionStart(successor, true); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.primeExistingResults();
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "reclaimed.json") {
+				denied++;
+				recordSessionStart(predecessor, false);
+				assert.equal(watcher.hasPendingResults(), false, "the successor no longer owes the queued result");
+				throw Object.assign(new Error("index remains unreadable"), { code: "EIO" });
+			}
+			return originalRead(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		assert.equal(await waitForPredicate(() => queueChanges === 2), true, "revoked retry drops its cached queue entry");
+		assert.equal(state.resultFileCoalescer.flush("reclaimed.json"), false, "no retry was scheduled after reclaim");
+		assert.equal(denied, 1);
+		assert.equal(delivered, 0);
+		assert.equal(fs.existsSync(resultPath), true);
 	});
 
 	it("delivers a result once when the Pi process that launched it has exited, and keeps one from a live Pi", async () => {
@@ -881,6 +1030,7 @@ describe("result watcher", () => {
 
 	it("does not redeliver user notification after reload while observer retry is pending", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-observer-reload-"));
+		const route = createNestedRoute("observer-reload");
 		const originalError = console.error;
 		try {
 			console.error = () => {};
@@ -909,23 +1059,34 @@ describe("result watcher", () => {
 				firstWatcher.stopResultWatcher();
 			}
 
+			fs.writeFileSync(path.join(path.dirname(route.eventSink), "registry.json"), "{");
 			const secondState = createState();
 			secondState.currentSessionId = "session-current";
+			let queueChanges = 0;
+			const owedResults = new Set(["observer-reload"]);
 			const secondWatcher = createResultWatcher(pi, secondState, resultsDir, 60_000, {
-				observeCompletion: () => { observerCalls += 1; },
+				observeCompletion: () => { if (++observerCalls === 2) throw new Error("observer still unavailable"); },
 				notifier: { deliver: async () => { deliveries += 1; return true; } },
+				onOwnedQueueChanged: () => queueChanges++,
+				onResultDelivered: (runId) => { owedResults.delete(runId); },
 			});
 			try {
 				secondWatcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => observerCalls === 2), true);
+				assert.equal(owedResults.size, 0, "durably accepted result settles restored delivery debt before observer recovery");
+				assert.equal(fs.existsSync(resultPath), true);
+				secondWatcher.primeExistingResults();
 				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+				assert.equal(queueChanges, 0, "acknowledged cleanup never reactivates terminal liveness");
 			} finally {
 				secondWatcher.stopResultWatcher();
 			}
 
-			assert.equal(observerCalls, 2);
+			assert.equal(observerCalls, 3);
 			assert.equal(deliveries, 1);
 			assert.equal(emitted, 1);
 		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
@@ -1037,6 +1198,34 @@ describe("result watcher", () => {
 		} finally {
 			manager.stop();
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const seen of [true, false]) it(`keeps the owned hold when a snapshot is replaced during ${seen ? "dedupe" : "subscriber dispatch"}`, async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-dedupe-replaced-"));
+		const file = "dedupe-replaced.json";
+		const resultPath = path.join(resultsDir, file);
+		const initial = { id: "dedupe-replaced", sessionId: "session-current", success: true, summary: "seen" };
+		const state = createState();
+		state.currentSessionId = initial.sessionId;
+		if (seen) state.completionSeen.set(buildCompletionKey(initial, `result:${file}`), Date.now());
+		const order: string[] = [];
+		const replace = () => fs.writeFileSync(resultPath, JSON.stringify({ ...initial, completionOwnerId: COMPLETION_OWNER_ID, id: "replacement", runId: "replacement", summary: "replacement" }));
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event, data) {
+			if (!seen && event === SUBAGENT_ASYNC_COMPLETE_EVENT && (data as { summary?: string }).summary === "seen") replace();
+		} } }, state, resultsDir, 60_000, {
+			observeCompletion: (result) => { if (seen && result.summary === "seen") replace(); },
+			notifier: { deliver: async (result) => { order.push(String(result.summary)); return true; } },
+			onOwnedQueueChanged: () => order.push(watcher.hasQueuedOwnedResults() ? "held" : "released"),
+		});
+		try {
+			writeIndexedResult(resultPath, initial);
+			watcher.primeExistingResults();
+			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			assert.deepEqual(order, seen ? ["held", "replacement", "released"] : ["held", "seen", "replacement", "released"]);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1259,6 +1448,71 @@ describe("result watcher", () => {
 			assert.equal(fs.existsSync(path.join(resultsDir, "stale-0.json")), true);
 		} finally {
 			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	for (const scenario of ["pending canonical collision", "pending alias collision", "public canonical with stale alias"]) it(`delivers the reconciled result without changing foreign bytes: ${scenario}`, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-foreign-alias-"));
+		const resultsDir = path.join(root, "results");
+		const asyncDir = path.join(root, "async");
+		const canonical = path.join(resultsDir, "canonical-run.json");
+		const output = scenario === "pending canonical collision" ? canonical : path.join(resultsDir, "indexed-alias.json");
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const delivered: string[] = [];
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			notifier: { async deliver(result) { delivered.push(result.runId); return true; } },
+		});
+		try {
+			fs.mkdirSync(asyncDir);
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "canonical-run", sessionId: "session-current", mode: "single", state: "running", startedAt: 1 }));
+			const owned = { id: "canonical-run", sessionId: "session-current", success: true, completionOwnerId: COMPLETION_OWNER_ID };
+			if (scenario === "public canonical with stale alias") {
+				writeAsyncResultFile(output, owned);
+				fs.renameSync(output, canonical);
+			} else {
+				writePendingAsyncResultFile(output, owned);
+			}
+			const foreign = JSON.stringify({ id: "other-run", sessionId: "other-session", success: true });
+			fs.writeFileSync(output, foreign);
+			const repaired = reconcileAsyncRun(asyncDir, { expectedRunId: "canonical-run", expectedSessionId: "session-current", resultsDir });
+			assert.equal(repaired.status?.state, "complete");
+			assert.ok(repaired.resultPath && repaired.resultPath !== output);
+			await watcher.deliverPendingResults();
+			assert.deepEqual(delivered, ["canonical-run"]);
+			assert.equal(fs.readFileSync(output, "utf-8"), foreign);
+			assert.equal(fs.existsSync(repaired.resultPath), false);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("marks and retires the indexed public alias reached by run id on first delivery", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-public-alias-"));
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const alias = path.join(resultsDir, "public-alias.json");
+		const canonical = path.join(resultsDir, "canonical-run.json");
+		let delivered = 0;
+		let markedAtAlias: unknown;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
+			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) markedAtAlias = JSON.parse(fs.readFileSync(alias, "utf-8")).notificationDeliveredAt;
+		} } }, state, resultsDir, 60_000, {
+			observedCompletionRunIds: () => ["canonical-run"],
+			notifier: { async deliver() { delivered++; return true; } },
+		});
+		try {
+			writeIndexedResult(alias, { id: "canonical-run", runId: "canonical-run", sessionId: "session-current", success: true, summary: "done" });
+			fs.rmSync(path.join(resultsDir, "result-index", "sessions"), { recursive: true });
+			await watcher.deliverPendingResults();
+			assert.equal(delivered, 1);
+			assert.equal(typeof markedAtAlias, "number");
+			assert.equal(fs.existsSync(alias), false);
+			assert.equal(fs.existsSync(canonical), false);
+		} finally {
+			watcher.stopResultWatcher();
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
@@ -2120,7 +2374,22 @@ describe("result watcher", () => {
 			};
 			const state = createState();
 			state.currentSessionId = "session-1";
-			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			let watchEvent: fs.WatchListener<string> | undefined;
+			let denyDiscovery = true;
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, { fs: { ...fs,
+				watch(_dir, listener) {
+					watchEvent = listener as typeof watchEvent;
+					const handle = { on: () => handle, close() {}, unref() {} };
+					return handle as unknown as fs.FSWatcher;
+				},
+				readFileSync: ((file, options) => {
+					if (denyDiscovery && String(file).endsWith("async-nested-retry.json")) {
+						denyDiscovery = false;
+						throw Object.assign(new Error("transient discovery failure"), { code: "EACCES" });
+					}
+					return fs.readFileSync(file, options);
+				}) as typeof fs.readFileSync,
+			} });
 			const resultPath = path.join(resultsDir, "async-nested-retry.json");
 			const { output: logged, restore } = captureConsole();
 			try {
@@ -2134,9 +2403,11 @@ describe("result watcher", () => {
 					sessionId: "session-1",
 					intercomTarget: "subagent-chat-main",
 				});
-				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
-
+				watcher.startResultWatcher();
+				assert.ok(watchEvent);
+				watchEvent("rename", "async-nested-retry.json");
+				assert.equal(watcher.hasQueuedOwnedResults(), false);
+				assert.equal(await waitForPredicate(() => watcher.hasQueuedOwnedResults()), true);
 				assert.equal(fs.existsSync(resultPath), true);
 				assert.equal(emitted.length, 0);
 				assert.ok(
@@ -2681,7 +2952,142 @@ describe("result watcher", () => {
 		}
 	});
 
-	it("retries delivery after a transient session index access denial", async () => {
+	it("scans a healthy result after an unreadable indexed sibling", async (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-index-sibling-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const originalRead = fsDefault.readFileSync;
+		const order: string[] = [];
+		for (const id of ["a-denied", "z-healthy"]) writeIndexedResult(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-1", success: true, summary: id });
+		const deniedPath = path.join(resultsDir, "a-denied.json");
+		const ownedBytes = fs.readFileSync(deniedPath, "utf-8");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", success: true }));
+		let denied = 0;
+		let denyIndex = true;
+		let denyEnumeration = false;
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (denyIndex && String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "a-denied.json"
+				&& (denyEnumeration || new Error().stack?.includes("readResultIndexForSessionRun"))) {
+				denied++;
+				throw Object.assign(new Error("index read failed"), { code: "EIO" });
+			}
+			return originalRead(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			notifier: { deliver: async (result) => { order.push(String(result.summary)); return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.primeExistingResults();
+		assert.equal(await waitForPredicate(() => order.includes("z-healthy")), true);
+		assert.ok(denied > 0);
+		assert.deepEqual(order, ["z-healthy"]);
+		assert.equal(await waitForPredicate(() => !fs.existsSync(path.join(resultsDir, "z-healthy.json"))), true);
+		assert.equal(watcher.hasQueuedOwnedResults(), false);
+		assert.equal(state.asyncJobs.size, 0);
+		fs.writeFileSync(deniedPath, ownedBytes);
+		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned public payload despite index EIO");
+		denyEnumeration = true;
+		const denialsBeforeEnumeration = denied;
+		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned payload when enumeration cannot read its entry");
+		assert.ok(denied > denialsBeforeEnumeration);
+		assert.equal(watcher.hasQueuedOwnedResults(), false, "fallback does not schedule delivery");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
+		assert.equal(watcher.hasPendingResults(), false, "enumeration fallback rejects the wrong run");
+		denyEnumeration = false;
+		assert.equal(watcher.hasPendingResults(), false, "exact lookup fallback also rejects the wrong run");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
+		assert.equal(watcher.hasPendingResults(), false, "canonical fallback still verifies ownership");
+		writeIndexedResult(deniedPath, { id: "a-denied", sessionId: "session-1", success: true, summary: "owned" });
+		denyIndex = false;
+		watcher.primeExistingResults();
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		denyIndex = true;
+		const previousDenials = denied;
+		assert.equal(watcher.hasPendingResults(), true, "known queue protects switches without consulting the index");
+		assert.equal(denied, previousDenials);
+	});
+
+	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload", "index directory", "pending-only directory", "public stat", "pending-only stat", "public path recheck stat", "public signature stat"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
+		const pendingOnly = failure.startsWith("pending-only");
+		const failListing = failure.endsWith("directory");
+		const failStat = failure.endsWith("stat");
+		const recheckStat = failure === "public path recheck stat" || failure === "public signature stat";
+		const failPayload = failure.endsWith("payload");
+		const hasNestedOwner = failure === "index with nested ownership fields";
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const output = path.join(resultsDir, "saved.json");
+		if (pendingOnly) writePendingAsyncResultFile(output, { id: "saved", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID, success: true });
+		else writeIndexedResult(output, { id: "saved", sessionId: "session-1", success: true });
+		assert.equal(fs.existsSync(output), !pendingOnly);
+		if (hasNestedOwner) {
+			fs.writeFileSync(output, JSON.stringify({ id: "saved", sessionId: "session-1", success: true,
+				completionOwnerId: "departed-canonical-owner", completionOwnerProcess: { pid: 2147483647 },
+				structuredOutput: { parentWorkflowRunId: "not-the-parent" } }));
+		}
+		const read = fsDefault.readFileSync;
+		const readdir = fsDefault.readdirSync;
+		const stat = fsDefault.statSync;
+		let failing = true;
+		let denials = 0;
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (failing && !failListing && !failStat && (failPayload ? (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output) : String(file).includes(`${path.sep}result-index${path.sep}`))) {
+				denials++;
+				throw Object.assign(new Error("index unreadable"), { code: "EIO" });
+			}
+			return read(file, ...args);
+		}) as typeof fs.readFileSync;
+		if (failListing) {
+			const inaccessibleRoot = (pendingOnly ? path.join(resultsDir, "result-pending") : path.join(resultsDir, "result-index", "sessions")) + path.sep;
+			if (pendingOnly) fs.rmSync(path.join(resultsDir, "result-index"), { recursive: true, force: true });
+			fsDefault.readdirSync = ((file, options) => {
+				if (failing && String(file).startsWith(inaccessibleRoot)) {
+					denials++;
+					throw Object.assign(new Error("directory listing unavailable"), { code: pendingOnly ? "EACCES" : "EIO" });
+				}
+				return Reflect.apply(readdir, fsDefault, [file, options]);
+			}) as typeof fs.readdirSync;
+		}
+		if (failStat) fsDefault.statSync = ((file, options) => {
+			if (failing && (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output)) {
+				const stack = recheckStat ? new Error().stack ?? "" : "";
+				const failHere = !recheckStat || (stack.includes("resultSignature")
+					&& (failure === "public path recheck stat" ? stack.includes("resultPayloadPath") : !stack.includes("resultPayloadPath")));
+				if (failHere) {
+					denials++;
+					throw Object.assign(new Error("payload stat unavailable"), { code: "EIO" });
+				}
+			}
+			return stat(file, options);
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		let delivered = 0;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			platform: "darwin", ...(hasNestedOwner ? { ownership: createResultDeliveryOwnership(state) } : {}),
+			timers: { setTimeout: (callback, delay) => setTimeout(callback, Math.min(delay ?? 0, 100)) },
+			notifier: { deliver: async () => { delivered++; return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; fsDefault.readdirSync = readdir; fsDefault.statSync = stat; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.startResultWatcher();
+		if (hasNestedOwner || recheckStat) {
+			assert.equal(watcher.hasPendingResults(), true, "switch sees the exact owned payload despite storage error");
+			assert.equal(watcher.hasQueuedOwnedResults(), false, "switch check does not schedule delivery");
+		}
+		watcher.primeExistingResults();
+		assert.equal(state.asyncJobs.size, 0);
+		assert.equal(watcher.hasQueuedOwnedResults(), !failListing && !failStat && !failPayload && !pendingOnly);
+		const startupDenials = denials;
+		assert.ok(startupDenials > 0);
+		assert.equal(await waitForPredicate(() => denials > startupDenials, 4500), true, "first retry still sees EIO");
+		assert.equal(watcher.hasQueuedOwnedResults(), !failListing && !failStat && !failPayload && !pendingOnly);
+		assert.equal(delivered, 0);
+		failing = false;
+		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults(), 4500), true);
+	});
+
+	for (const indexEIO of [false, true]) it(`retries native delivery after a transient ${indexEIO ? "unowned index EIO" : "session index access denial"}`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-index-retry-"));
 		const originalError = console.error;
 		const originalReadFileSync = fsDefault.readFileSync;
@@ -2703,9 +3109,9 @@ describe("result watcher", () => {
 				if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
 					indexReads += 1;
 				}
-				if (indexReads === 2 && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				if (indexReads === (indexEIO ? 1 : 2) && String(file).includes(`${path.sep}result-index${path.sep}`)) {
 					const error = new Error("permission denied") as NodeJS.ErrnoException;
-					error.code = "EACCES";
+					error.code = indexEIO ? "EIO" : "EACCES";
 					throw error;
 				}
 				return originalReadFileSync(file, ...args);
@@ -2713,11 +3119,18 @@ describe("result watcher", () => {
 			syncBuiltinESMExports();
 
 			const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { emitted.push(event); } } }, state, resultsDir, 60_000, {
-				fs: { ...fs, watch: (_path, callback) => { watchEvent = callback as typeof watchEvent; return fakeWatcher; } },
+				fs: { ...fs,
+					watch: (_path, callback) => { watchEvent = callback as typeof watchEvent; return fakeWatcher; },
+					...(indexEIO ? { readFileSync: ((file, ...args) => {
+						if (file === resultPath && indexReads === 0) throw Object.assign(new Error("initial native discovery unavailable"), { code: "ENOENT" });
+						return originalReadFileSync(file, ...args);
+					}) as typeof fs.readFileSync } : {}),
+				},
 			});
 			try {
 				watcher.startResultWatcher();
 				watchEvent?.("change", "index-retry.json");
+				if (indexEIO) assert.equal(watcher.hasQueuedOwnedResults(), false);
 				assert.equal(await waitForPredicate(() => emitted.includes("subagent:async-complete")), true);
 			} finally {
 				watcher.stopResultWatcher();

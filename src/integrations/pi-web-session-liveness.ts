@@ -1,4 +1,4 @@
-import { hasLiveNestedDescendants, projectNestedEvents } from "../runs/shared/nested-events.ts";
+import { hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents } from "../runs/shared/nested-events.ts";
 import type { NestedRouteInfo, SubagentState } from "../shared/types.ts";
 
 export const PI_WEB_SESSION_LIVENESS_REGISTRY_KEY = "@agegr/pi-web/session-liveness/v1";
@@ -34,9 +34,9 @@ function resolveRegistry(): PiWebSessionLivenessRegistry | null {
 	return registry as PiWebSessionLivenessRegistry;
 }
 
-export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "retainedForegroundNestedRoutes">, route: NestedRouteInfo): boolean {
+export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "retainedForegroundNestedRoutes">, route: NestedRouteInfo, ownerExited = false): boolean {
 	const nested = projectNestedEvents(route);
-	if (!hasLiveNestedDescendants(nested.children)) return false;
+	if (!hasLiveOwnedNestedWork(route.rootRunId, nested.children, ownerExited)) return false;
 	state.retainedForegroundNestedRoutes ??= new Map();
 	state.retainedForegroundNestedRoutes.set(route.rootRunId, route);
 	return true;
@@ -44,7 +44,7 @@ export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "reta
 
 export function hasLiveSubagentWork(state: LiveWorkState): boolean {
 	for (const job of state.asyncJobs.values()) {
-		if (job.status === "queued" || job.status === "running" || hasLiveNestedDescendants(job.nestedChildren)) return true;
+		if (job.status === "queued" || job.status === "running" || (job.nestedWorkActive ?? hasLiveNestedDescendants(job.nestedChildren))) return true;
 	}
 	for (const control of state.foregroundControls.values()) {
 		if ((control.schedulingOwners ?? 0) > 0

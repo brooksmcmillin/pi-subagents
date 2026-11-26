@@ -471,7 +471,8 @@ interface ExecutorDeps {
 	activateSupervisorTransport?: () => void;
 	findPendingAsks?: Parameters<typeof steerAsyncRun>[0]["findPendingAsks"];
 	refreshResultDelivery?: () => void;
-	trackRetainedNestedRoute?: (rootRunId: string) => void;
+	trackRetainedNestedRoute?: (rootRunId: string, ownerExited?: boolean) => void;
+	onForegroundControlRemoved?: () => void;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	/** Set when this executor runs inside a child session; carries the runtime settings the host passes instead of environment variables. */
 	childRuntime?: ChildRuntimeConfig;
@@ -606,19 +607,21 @@ function readWorkflowScriptFile(requestedPath: string, requestedCwd: string | un
 	return { script };
 }
 
-export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void): boolean {
+export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string, ownerExited?: boolean) => void, onRemoved?: () => void): boolean {
 	const control = state.foregroundControls.get(runId);
 	if (control && (!foregroundSchedulingSettled(control) || (control.activeChildren?.size ?? 0) > 0)) return false;
 	if (control?.nestedRoute && trackRetainedNestedRoute) {
 		try {
-			if (retainLiveForegroundNestedRoute(state, control.nestedRoute)) trackRetainedNestedRoute(runId);
+			const ownerExited = control.nestedRoute.rootRunId === runId;
+			if (retainLiveForegroundNestedRoute(state, control.nestedRoute, ownerExited)) trackRetainedNestedRoute(control.nestedRoute.rootRunId, ownerExited);
 		} catch (error) {
 			console.error(`Failed to retain live nested descendants for foreground run '${runId}':`, error);
 		}
 	}
 	retainNestedLookupRoute(state, control?.nestedRoute, control?.sessionId);
-	state.foregroundControls.delete(runId);
+	const removed = state.foregroundControls.delete(runId);
 	if (state.lastForegroundControlId === runId) state.lastForegroundControlId = null;
+	if (removed) onRemoved?.();
 	return true;
 }
 
@@ -4571,7 +4574,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						try {
 							finishTrackedForegroundChild();
 						} finally {
-							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onForegroundControlRemoved);
 						}
 					}
 				}
@@ -7540,8 +7543,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				if (paramsWithResolvedCwd.dir) {
 					try {
 						const location = resolveAsyncRunLocation(paramsWithResolvedCwd, DIRS.async, DIRS.results);
-						const runId = location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir);
 						const directoryStatus = location.asyncDir ? readStatus(location.asyncDir) : null;
+						const runId = targetRunId ?? directoryStatus?.runId ?? location.resolvedId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir);
 						if (directoryStatus?.mode === "workflow") {
 							return steerWorkflowRun({ state: deps.state, runId, asyncDir: location.asyncDir!, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index, signal });
 						}
@@ -8422,7 +8425,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt) activeAsyncCapacity.rollback();
 			if (foregroundControl) {
 				settleForegroundSchedulingOwner(foregroundControl);
-				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onForegroundControlRemoved);
 			}
 		}
 

@@ -10,7 +10,7 @@ import {
 } from "../../src/integrations/pi-web-session-liveness.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { removeForegroundControlIfIdle } from "../../src/runs/foreground/subagent-executor.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import { TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 function clearRegistry(): void {
 	delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(PI_WEB_SESSION_LIVENESS_REGISTRY_KEY)];
@@ -29,7 +29,7 @@ function nestedRoute(rootRunId: string) {
 	return route;
 }
 
-function writeNestedState(route: ReturnType<typeof nestedRoute>, state: "running" | "complete", ts: number): void {
+function writeNestedState(route: ReturnType<typeof nestedRoute>, state: "running" | "complete", ts: number, independent = false): void {
 	writeNestedEvent(route, {
 		type: state === "running" ? "subagent.nested.updated" : "subagent.nested.completed",
 		ts,
@@ -43,6 +43,7 @@ function writeNestedState(route: ReturnType<typeof nestedRoute>, state: "running
 			path: [{ runId: route.rootRunId, stepIndex: 0 }],
 			state,
 			agent: "worker",
+			...(independent ? { asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "nested-child") } : {}),
 			lastUpdate: ts,
 		},
 	});
@@ -131,7 +132,7 @@ describe("pi-web session liveness integration", () => {
 	it("transfers a live nested route before removing its settled foreground control", () => {
 		const state = makeState() as SubagentState;
 		const route = nestedRoute("settled-foreground-root");
-		writeNestedState(route, "running", 100);
+		writeNestedState(route, "running", 100, true);
 		state.foregroundControls.set(route.rootRunId, {
 			runId: route.rootRunId,
 			mode: "single",

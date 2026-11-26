@@ -19,10 +19,11 @@ import {
 	SUBAGENT_STEERING_NOTICE_EVENT,
 	WIDGET_ANIMATION_INTERVAL_MS,
 } from "../../shared/types.ts";
-import { isStatusAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
+import { isStatusAccessError, isStorageAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { findNestedRouteForRootId, hasLiveNestedDescendants, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { activeRunMarkerAgeMs, DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS } from "./active-run-index.ts";
 import { listAsyncRuns, summarizeAsyncStatus, type AsyncRunSummary } from "./async-status.ts";
 import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
@@ -30,11 +31,12 @@ import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
-import { readProcessTerminal } from "./process-terminal.ts";
+import { hasObservedRunnerClose, readProcessTerminal } from "./process-terminal.ts";
+import { indexedResultPayloadVisibility } from "./result-files.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
-import { ownerSessionIds } from "../shared/run-ownership.ts";
+import { ownerSessionIds, ownsRun } from "../shared/run-ownership.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -45,7 +47,9 @@ interface AsyncJobTrackerOptions {
 	widgetCollapsed?: boolean;
 	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
-	onJobTerminal?: (job: AsyncJobState) => void;
+	onJobTerminal?: (job: AsyncJobState, publicationClosed: boolean) => void;
+	getOwedResultRunIds?: () => ReadonlySet<string>;
+	hasDeliveredResult?: (runId: string) => boolean;
 	onJobCleanup?: (asyncId: string) => void;
 	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
 	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
@@ -87,11 +91,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	ensurePoller: () => void;
 	refreshWidget: (ctx: ExtensionContext) => void;
 	handleStarted: (data: unknown) => void;
-	handleComplete: (data: unknown) => void;
+	handleComplete: (data: unknown, publicationVisibilityUnknown?: boolean) => void;
 	resetJobs: (ctx?: ExtensionContext) => void;
 	/** `observeStatus` also sees the statuses of other sessions' runs that the listing skips. */
 	restoreActiveJobs: (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => void;
-	dispose: () => void;
+	dispose: (shutdownReason?: string) => void;
 } {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const livenessIntervalMs = options.pollIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS;
@@ -104,13 +108,24 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const externalJobBridgeRuns = new Set<string>();
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
-	const terminalPublications = new Map<string, { instanceId: string; pending: true } | { pending: false }>();
+	type PendingPublication = { instanceId?: string; pending: true; provisional?: true; deliverySessionId?: string };
+	type PublicationObligation = PendingPublication | { pending: false; instanceId?: string };
+	const terminalPublications = new Map<string, PublicationObligation>();
+	type ReloadObligation = PublicationObligation & { nested?: { route: NonNullable<AsyncJobState["nestedRoute"]>; sessionId: string; rootExited: boolean } };
+	const unverifiedPublications = new Map<string, ReloadObligation>();
+	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
+	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, ReloadObligation>; retrySessions?: Map<string, string> }> };
+	const reloadPublications = globals[handoffKey] ??= new WeakMap();
+	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
 	// runner, so the job keeps its last known state rather than reading as finished (#3295).
 	const unreadableStatusRuns = new Set<string>();
 	// Restored runs whose status.json was unreadable, so their owner is unknown. Each is counted as
 	// this session's until a read shows otherwise; nothing writes to it before then.
 	const unverifiedRuns = new Set<string>();
+	const restoredJobs = new WeakSet<AsyncJobState>();
+	const verifiedRootClose = new WeakSet<AsyncJobState>();
 	const supervisorNoticeTimers = new Map<string, { asyncId: string; timer: ReturnType<typeof setTimeout> }>();
 	let rootWatcher: fs.FSWatcher | undefined;
 	let nextLivenessAt = Date.now() + livenessIntervalMs;
@@ -236,8 +251,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const scheduleCleanup = (asyncId: string) => {
 		cancelCleanup(asyncId);
+		if (options.getOwedResultRunIds?.().has(asyncId)) return;
 		const timer = setTimeout(() => {
 			state.cleanupTimers.delete(asyncId);
+			if (options.getOwedResultRunIds?.().has(asyncId)) return;
 			closeJobWatcher(asyncId);
 			const job = state.asyncJobs.get(asyncId);
 			retainNestedLookupRoute(state, job?.nestedRoute, job?.sessionId);
@@ -445,29 +462,105 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		terminalPublications.delete(asyncId);
 		unreadableStatusRuns.delete(asyncId);
 		unverifiedRuns.delete(asyncId);
+		unverifiedPublications.delete(asyncId);
 		clearSupervisorNotices(asyncId);
 	};
-	const forgetJob = (asyncId: string) => {
+	const forgetJob = (asyncId: string, keepFleetEntry = false) => {
 		cancelCleanup(asyncId);
 		closeJobWatcher(asyncId);
 		state.asyncJobs.delete(asyncId);
-		state.fleetJobs?.delete(asyncId);
+		if (!keepFleetEntry) state.fleetJobs?.delete(asyncId);
 		options.onJobCleanup?.(asyncId);
 	};
 
+	const rootWriterClosed = (job: AsyncJobState, status: ReturnType<typeof readStatus>) =>
+		(status ? status.runId === job.asyncId && (!job.sessionId || status.sessionId === job.sessionId) : !job.sessionId)
+		&& hasObservedRunnerClose(job.asyncDir, job.asyncId, status?.processTerminal);
+
+	const refreshNestedLiveness = (job: AsyncJobState, status?: ReturnType<typeof readStatus>) => {
+		const previous = job.nestedWorkActive;
+		let ownerExited = false;
+		if (job.nestedChildren?.length && isTerminalJobStatus(job.status)) {
+			try {
+				const stored = status === undefined ? readStatus(job.asyncDir) : status;
+				ownerExited = stored ? rootWriterClosed(job, stored) : verifiedRootClose.has(job);
+				if (stored) {
+					if (ownerExited) verifiedRootClose.add(job);
+					else verifiedRootClose.delete(job);
+				}
+			} catch { /* No verified closure; keep ownership live. */ }
+		}
+		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren, ownerExited) : false;
+		if (job.nestedWorkActive) cancelCleanup(job.asyncId);
+		return job.nestedWorkActive !== previous;
+	};
+
+	const publicationOwner = (status: NonNullable<ReturnType<typeof readStatus>>): string | undefined => {
+		if (!state.completionOwnerId || !ownsRun(state.currentSessionId, status.sessionId)) return;
+		const owner = options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) ?? status.completionOwnerId;
+		if (owner === state.completionOwnerId || owner === OWNING_SESSION_COMPLETION_OWNER) return owner;
+	};
+
+	const hasRestoredNestedWork = (job: AsyncJobState, handoff: ReloadObligation | undefined): boolean => {
+		const nested = handoff?.nested;
+		if (!nested || nested.route.rootRunId !== job.asyncId || !ownsRun(state.currentSessionId, nested.sessionId)) return false;
+		try {
+			reconcileNestedAsyncDescendants(nested.route, { resultsDir, kill: options.kill, now: options.now });
+			const rootExited = nested.rootExited || Boolean(handoff.instanceId
+				&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: handoff.instanceId })?.state === "observed");
+			return hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(nested.route).children, rootExited);
+		} catch {
+			return true; // The original owner verified this route; retry after storage recovers.
+		}
+	};
+
 	const refreshJob = (job: AsyncJobState): boolean => {
-		if (unverifiedRuns.has(job.asyncId)) {
+		const verifyingIdentity = unverifiedRuns.has(job.asyncId);
+		if (verifyingIdentity) {
+			const pending = unverifiedPublications.get(job.asyncId);
+			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
+			const handoffSession = deliverySession ?? pending?.nested?.sessionId;
+			if ((handoffSession && !ownsRun(state.currentSessionId, handoffSession))
+				|| (job.sessionId && !ownsRun(state.currentSessionId, job.sessionId))) {
+				forgetJob(job.asyncId);
+				return true;
+			}
+			if (deliverySession && options.hasDeliveredResult?.(job.asyncId)
+				&& !hasRestoredNestedWork(job, pending)) {
+				forgetJob(job.asyncId);
+				return true;
+			}
 			let stored: ReturnType<typeof readStatus> = null;
+			let statusMissing = false;
 			let summary: AsyncRunSummary | undefined;
 			try {
 				stored = readStatus(job.asyncDir);
-				if (stored) summary = summarizeAsyncStatus(job.asyncDir, stored);
+				statusMissing = stored === null;
+				if (stored?.runId === job.asyncId) summary = summarizeAsyncStatus(job.asyncDir, stored);
 			} catch (error) {
-				if (isStatusAccessError(error, job.asyncDir)) return false;
-				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
+				if (isStatusAccessError(error, job.asyncDir)) {
+					const verifiedPublication = Boolean(deliverySession && pending?.instanceId);
+					if (!verifiedPublication && !(pending?.pending === false && pending.nested)) return false;
+					// Previously verified obligations can settle from exact delivery and close evidence below.
+				} else console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
-			if (!stored || !summary || (owners && !owners.has(stored.sessionId))) {
+			const expectedSession = job.sessionId ?? handoffSession;
+			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (expectedSession && stored.sessionId !== expectedSession)) {
+				if (statusMissing && (!pending || (pending.pending && pending.provisional))) {
+					try {
+						const age = activeRunMarkerAgeMs(job.asyncDir, options.now?.());
+						if (age !== undefined && age <= DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) return false;
+					} catch (error) {
+						if (isStorageAccessError(error)) return false;
+					}
+				}
+				if (hasRestoredNestedWork(job, pending)) return false;
+				if (pending?.pending && pending.instanceId && !options.hasDeliveredResult?.(job.asyncId)
+					&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: pending.instanceId })?.state !== "observed") return false;
+				// Only a previously verified delivery obligation can survive without status.
+				if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && !options.hasDeliveredResult?.(job.asyncId)
+					&& indexedResultPayloadVisibility(resultsDir, deliverySession, job.asyncId) !== "absent") return false;
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -484,6 +577,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// Become the job a normal restore would have made, but keep the placeholder's state so the
 			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
 			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
+			if (pending?.pending && !pending.provisional) {
+				const ownerId = publicationOwner(stored);
+				if (ownerId
+					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
+					job.completionOwnerId = ownerId;
+					terminalPublications.set(job.asyncId, pending);
+					// Restore the delivery hold before reconciliation touches the payload.
+					if (isTerminalJobStatus(stored.state)) options.onJobTerminal?.(job, false);
+				}
+				unverifiedPublications.delete(job.asyncId);
+			}
+			restoredJobs.add(job);
 			rememberFleetJob(state, job);
 			unverifiedRuns.delete(job.asyncId);
 		}
@@ -498,15 +603,35 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		};
-		let bridgeSweepAttempted = false;
-		try {
-			emitNewControlEvents(job);
-			const bridgeAlreadyRequired = externalJobBridgeRuns.has(job.asyncId) || externalJobBridgeEligibility(job.steps) === "required";
-			if (bridgeAlreadyRequired) {
-				externalJobBridgeRuns.add(job.asyncId);
-				bridgeSweepAttempted = true;
-				serviceExternalJobBridgeRequests(job.asyncDir);
+		const settleWithoutStatus = (unreadable = false, preserveTerminal = false): boolean => {
+			const publication = terminalPublications.get(job.asyncId);
+			if (publication?.instanceId && readProcessTerminal(job.asyncDir, {
+				runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
+			})?.state === "observed") verifiedRootClose.add(job);
+			const nestedChanged = refreshNestedLiveness(job, null);
+			const writerPending = publication?.pending && publication.instanceId && !verifiedRootClose.has(job)
+				&& !options.hasDeliveredResult?.(job.asyncId);
+			const owedSession = options.getOwedResultRunIds?.().has(job.asyncId) ? job.sessionId : undefined;
+			if (writerPending || (owedSession && indexedResultPayloadVisibility(resultsDir, owedSession, job.asyncId) !== "absent")) {
+				cancelCleanup(job.asyncId);
+				return nestedChanged;
 			}
+			if (owedSession) options.onJobTerminal?.(job, true);
+			if (nestedRefreshFailed || job.nestedWorkActive) {
+				cancelCleanup(job.asyncId);
+				return nestedChanged;
+			}
+			if (unreadable) {
+				// Keep watching for late descendants for the original terminal retention window.
+				if (!state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
+				return nestedChanged;
+			}
+			retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
+			if (preserveTerminal) rememberFleetJob(state, job);
+			forgetJob(job.asyncId, preserveTerminal);
+			return true;
+		};
+		const refreshNested = () => {
 			try {
 				if (job.nestedRoute) reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now });
 			} catch (error) {
@@ -514,11 +639,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 			refreshNestedProjection();
+		};
+		let bridgeSweepAttempted = false;
+		try {
+			const restored = restoredJobs.has(job);
+			const exact = restored || Boolean(job.sessionId);
 			const reconciliation = reconcileAsyncRun(job.asyncDir, {
+				expectedRunId: exact ? job.asyncId : undefined,
+				expectedSessionId: exact ? job.sessionId : undefined,
 				resultsDir,
 				kill: options.kill,
 				now: options.now,
-				startedRun: {
+				startedRun: restored || isTerminalJobStatus(job.status) ? undefined : {
 					runId: job.asyncId,
 					pid: job.pid,
 					sessionId: job.sessionId,
@@ -531,7 +663,28 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			const status = reconciliation.status ?? readStatus(job.asyncDir);
+			if (reconciliation.identityMismatch && !restored && !isTerminalJobStatus(job.status)) {
+				forgetJob(job.asyncId);
+				return true;
+			}
+			if (!reconciliation.identityMismatch) emitNewControlEvents(job);
+			const bridgeAlreadyRequired = externalJobBridgeRuns.has(job.asyncId) || externalJobBridgeEligibility(job.steps) === "required";
+			if (bridgeAlreadyRequired && !reconciliation.identityMismatch) {
+				externalJobBridgeRuns.add(job.asyncId);
+				bridgeSweepAttempted = true;
+				serviceExternalJobBridgeRequests(job.asyncDir);
+			}
+			refreshNested();
+			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
+				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) {
+					const age = activeRunMarkerAgeMs(job.asyncDir, options.now?.());
+					if (age !== undefined && age <= DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) return false;
+					if (job.sessionId && ownsRun(state.currentSessionId, job.sessionId) && !options.hasDeliveredResult?.(job.asyncId)
+						&& indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") return false;
+				}
+				return settleWithoutStatus(false, reconciliation.statusMissing === true && isTerminalJobStatus(job.status));
+			}
+			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
 			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
 				const bridgeEligibility = externalJobBridgeEligibility(status?.steps);
@@ -606,38 +759,51 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.turnBudgetExceeded = status.turnBudgetExceeded ?? job.turnBudgetExceeded;
 				job.wrapUpRequested = status.wrapUpRequested ?? job.wrapUpRequested;
 				job.sessionFile = status.sessionFile ?? job.sessionFile;
+				const nestedLivenessChanged = refreshNestedLiveness(job, status);
 				if (isTerminalJobStatus(job.status)) {
+					const nestedOnly = unverifiedPublications.get(job.asyncId)?.pending === false;
+					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false, instanceId: unverifiedPublications.get(job.asyncId)?.instanceId });
 					let publication = terminalPublications.get(job.asyncId);
-					if (!publication && status.mode !== "workflow" && status.processTerminal?.state === "pending"
-						&& status.runId === job.asyncId && status.completionOwnerId
-						&& ((status.sessionId === state.currentSessionId && status.completionOwnerId === state.completionOwnerId)
-							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
-							|| (typeof status.sessionId === "string"
-								&& options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) === OWNING_SESSION_COMPLETION_OWNER))) {
-						publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
-						terminalPublications.set(job.asyncId, publication);
+					if (!publication?.instanceId && status.mode !== "workflow" && status.runId === job.asyncId
+						&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")) {
+						const owner = publicationOwner(status);
+						if (owner) {
+							job.completionOwnerId = owner;
+							const instanceId = status.processTerminal.runnerProcessInstanceId;
+							publication = publication ? { ...publication, instanceId } : { instanceId, pending: true };
+							terminalPublications.set(job.asyncId, publication);
+						}
 					}
 					const wasPending = publication?.pending;
-					if (publication?.pending) {
+					let publicationClosed = reconciliation.noPublication === true;
+					if (publicationClosed) {
+						publication = { pending: false, instanceId: publication?.instanceId };
+						terminalPublications.set(job.asyncId, publication);
+					} else if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
-						const published = reconciliation.resultPath && fs.existsSync(reconciliation.resultPath);
-						const closed = !published && readProcessTerminal(job.asyncDir, {
-							runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
-						})?.state === "observed";
-						if (published || closed) {
-							publication = { pending: false };
+						const visibility = job.sessionId ? indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) : "unknown";
+						const published = visibility === "present";
+						publicationClosed = visibility === "absent" && (!publication.instanceId
+							|| (status.processTerminal?.runnerProcessInstanceId === publication.instanceId && rootWriterClosed(job, status))
+							|| readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed");
+						if (published || publicationClosed) {
+							publication = { pending: false, instanceId: publication.instanceId };
 							terminalPublications.set(job.asyncId, publication);
 						} else cancelCleanup(job.asyncId);
 					}
+					if (!publicationClosed && publication?.pending === false && job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
+						publicationClosed = indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) === "absent";
+					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job);
+					if (!nestedOnly && (publicationClosed || !isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending))) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
-					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
+					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
 					}
 				}
-				return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
+				unverifiedPublications.delete(job.asyncId);
+				return nestedLivenessChanged || widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}
 			if (job.status === "queued") {
 				job.status = "running";
@@ -653,10 +819,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
 			}
-			if (isStatusAccessError(error, job.asyncDir)) {
+			if (isStatusAccessError(error, job.asyncDir) && job.sessionId && isTerminalJobStatus(job.status)) {
+				refreshNested();
+				return settleWithoutStatus(true);
+			}
+			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
 				if (!unreadableStatusRuns.has(job.asyncId)) {
 					unreadableStatusRuns.add(job.asyncId);
-					console.error(`Cannot read async status for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);
+					console.error(`Cannot read async status or result storage for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);
 				}
 				return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}
@@ -667,7 +837,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			runningJobIds.delete(job.asyncId);
 			rememberFleetJob(state, job);
-			if (!terminalPublications.get(job.asyncId)?.pending && !hasLiveNestedDescendants(job.nestedChildren) && !state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
+			if (!terminalPublications.get(job.asyncId)?.pending && !(job.nestedWorkActive ?? hasLiveNestedDescendants(job.nestedChildren)) && !state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
 		}
 		return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 	};
@@ -854,7 +1024,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		rerenderLastWidget();
 	};
 
-	const handleComplete = (data: unknown) => {
+	const handleComplete = (data: unknown, publicationVisibilityUnknown = false) => {
 		const result = data as { id?: string; success?: boolean; state?: AsyncJobState["status"]; asyncDir?: string; sessionId?: string; stopped?: boolean };
 		if (typeof state.currentSessionId === "string" && result.sessionId !== state.currentSessionId) return;
 		const asyncId = result.id;
@@ -873,7 +1043,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			// Delivery can precede the first terminal status refresh. Remember its
 			// settlement even when no pending publication has been observed yet.
-			terminalPublications.set(asyncId, { pending: false });
+			const instanceId = terminalPublications.get(asyncId)?.instanceId;
+			terminalPublications.set(asyncId, publicationVisibilityUnknown ? { pending: true, instanceId } : { pending: false, instanceId });
+			if (publicationVisibilityUnknown) cancelCleanup(asyncId);
 			try {
 				updateAsyncJobNestedProjection(job);
 			} catch (error) {
@@ -881,12 +1053,61 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		}
-		if (job) rememberFleetJob(state, job);
+		if (job) {
+			refreshNestedLiveness(job);
+			rememberFleetJob(state, job);
+		}
 		rerenderLastWidget();
-		if (!nestedRefreshFailed && !hasLiveNestedDescendants(job?.nestedChildren)) scheduleCleanup(asyncId);
+		if (!publicationVisibilityUnknown && !nestedRefreshFailed && !job?.nestedWorkActive) scheduleCleanup(asyncId);
 	};
 
-	const dispose = () => {
+	const dispose = (shutdownReason?: string) => {
+		if (shutdownReason === "reload" && publicationSession) {
+			const runs = new Map(unverifiedPublications);
+			const retrySessions = new Map<string, string>();
+			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
+			for (const runId of options.getOwedResultRunIds?.() ?? []) {
+				const publication = runs.get(runId);
+				const job = state.asyncJobs.get(runId);
+				runs.set(runId, { ...publication, pending: true, deliverySessionId: job?.sessionId });
+			}
+			for (const job of state.asyncJobs.values()) {
+				if (!job.sessionId || !ownsRun(publicationSession.id, job.sessionId)) continue;
+				if (job.asyncDir === path.join(asyncDirRoot, job.asyncId) && !isTerminalJobStatus(job.status)) {
+					let verified = unverifiedRuns.has(job.asyncId) || restoredJobs.has(job);
+					if (!verified) {
+						try {
+							const stored = readStatus(job.asyncDir);
+							verified = stored?.runId === job.asyncId && stored.sessionId === job.sessionId;
+						} catch {
+							// A launch event alone does not verify the stored run.
+						}
+					}
+					if (verified) retrySessions.set(job.asyncId, job.sessionId);
+				}
+				const route = job.nestedRoute;
+				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
+				let nestedActive = job.nestedWorkActive;
+				let rootExited = verifiedRootClose.has(job);
+				try {
+					const stored = readStatus(job.asyncDir);
+					if (!isTerminalJobStatus(job.status)) {
+						if (!stored || stored.runId !== job.asyncId || !ownsRun(publicationSession.id, stored.sessionId)
+							|| !isTerminalJobStatus(stored.state)) continue;
+					}
+					rootExited = stored ? rootWriterClosed(job, stored) : verifiedRootClose.has(job);
+					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children, rootExited);
+				} catch {
+					// The replacement can retry the exact owned route if it is temporarily unreadable.
+					nestedActive = true;
+				}
+				if (nestedActive) {
+					const publication = runs.get(job.asyncId) ?? (isTerminalJobStatus(job.status) ? { pending: false, instanceId: terminalPublications.get(job.asyncId)?.instanceId } : { pending: true, provisional: true });
+					runs.set(job.asyncId, { ...publication, nested: { route, sessionId: job.sessionId, rootExited } });
+				}
+			}
+			if (runs.size || retrySessions.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs, retrySessions });
+		}
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
 		rootWatcher?.close();
@@ -901,6 +1122,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		terminalPublications.clear();
 		unreadableStatusRuns.clear();
 		unverifiedRuns.clear();
+		unverifiedPublications.clear();
 		clearSupervisorNotices();
 	};
 
@@ -925,29 +1147,61 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (ctx?.hasUI) state.lastUiContext = ctx;
 		state.statusProjectionSessionId = null;
 		if (!state.currentSessionId) return;
-		let runs: AsyncRunSummary[];
-		const unreadable: Array<{ runId: string; asyncDir: string }> = [];
+		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
+		const saved = publicationSession && reloadPublications.get(publicationSession.manager);
+		const handoff = saved?.sessionId === state.currentSessionId ? saved : undefined;
+		// Tracked jobs reconcile in refreshJob, which observes publication settlement.
+		const trackedRuns = new Set(state.asyncJobs.keys());
+		let runs: AsyncRunSummary[] = [];
+		const unreadable: Array<{ runId: string; asyncDir: string; verifiedSessionId?: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
-				states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
-				onUnreadableActiveRun: (runId, asyncDir) => unreadable.push({ runId, asyncDir }),
+				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
+				expectedRetrySessions: handoff?.retrySessions, trackedRuns,
+				onUnreadableActiveRun: (runId, asyncDir, verifiedSessionId) => unreadable.push({ runId, asyncDir, verifiedSessionId }),
 			}, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
-			return;
+			// Exact handoff entries do not depend on the active index being readable.
+			for (const [runId, verifiedSessionId] of handoff?.retrySessions ?? []) {
+				if (path.basename(runId) !== runId || runId === "." || runId === ".." || !ownsRun(state.currentSessionId, verifiedSessionId)) continue;
+				unreadable.push({ runId, asyncDir: path.join(asyncDirRoot, runId), verifiedSessionId });
+			}
 		}
+		const pending = handoff?.runs;
+		if (pending) for (const [runId, publication] of pending) {
+			if (path.basename(runId) !== runId || runId === "." || runId === "..") continue;
+			const job: AsyncJobState = { asyncId: runId, asyncDir: path.join(asyncDirRoot, runId), status: "running", sessionId: handoff?.retrySessions?.get(runId), updatedAt: Date.now() };
+			state.asyncJobs.set(runId, job);
+			runningJobIds.add(runId);
+			unverifiedRuns.add(runId);
+			unverifiedPublications.set(runId, publication);
+			refreshJob(job);
+			if (state.asyncJobs.has(runId)) watchJob(job);
+		}
+		if (publicationSession) reloadPublications.delete(publicationSession.manager);
 		for (const run of runs) {
+			if (pending?.has(run.id) || (isTerminalJobStatus(run.state) && path.basename(run.asyncDir) !== run.id)) continue;
 			const job = summaryToJob(run);
+			restoredJobs.add(job);
 			state.asyncJobs.set(run.id, job);
+			if (isTerminalJobStatus(job.status)) {
+				// Active-index discovery does not establish whether publication has settled.
+				job.status = "running";
+				unverifiedRuns.add(job.asyncId);
+				unverifiedPublications.set(job.asyncId, { pending: true, provisional: true });
+				refreshJob(job);
+				if (!state.asyncJobs.has(job.asyncId)) continue;
+			}
 			if (job.status === "running") runningJobIds.add(job.asyncId);
 			rememberFleetJob(state, job);
 			watchJob(job);
 		}
 		// An unreadable run may still be working: idle must not be reported until a read settles it.
-		for (const { runId, asyncDir } of unreadable) {
+		for (const { runId, asyncDir, verifiedSessionId } of unreadable) {
 			if (state.asyncJobs.has(runId)) continue;
-			const job: AsyncJobState = { asyncId: runId, asyncDir, status: "running", sessionId: state.currentSessionId, updatedAt: Date.now() };
+			const job: AsyncJobState = { asyncId: runId, asyncDir, status: "running", sessionId: verifiedSessionId, updatedAt: Date.now() };
 			try {
 				job.controlEventCursor = restoredControlEventCursor(asyncDir);
 			} catch {
@@ -959,7 +1213,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			watchJob(job);
 		}
 		state.statusProjectionSessionId = state.currentSessionId;
-		if (runs.length === 0 && unreadable.length === 0) return;
+		if (state.asyncJobs.size === 0) return;
 		ensurePoller();
 		rerenderLastWidget();
 	};

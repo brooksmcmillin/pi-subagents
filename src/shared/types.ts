@@ -2200,6 +2200,7 @@ export interface AsyncJobState {
 	controlEventCursor?: number;
 	nestedRoute?: NestedRouteInfo;
 	nestedChildren?: NestedRunSummary[];
+	nestedWorkActive?: boolean;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	workflow?: Details["workflow"];

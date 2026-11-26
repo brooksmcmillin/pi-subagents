@@ -20,11 +20,11 @@ import {
 	resolveSubagentResultStatus,
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
-import { resolveWatchPath } from "../../shared/utils.ts";
+import { isStorageAccessError, resolveWatchPath } from "../../shared/utils.ts";
 import { FileLeaseBusyError } from "../../shared/file-lease.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
 import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
-import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
+import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultPayloadVisibility, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 import { reportSessionWarning } from "../../shared/session-warnings.ts";
@@ -71,6 +71,7 @@ type ResultWatcherDeps = {
 	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds" | "deliveryOwnerId">;
 	/** Called once the parent has this run's result: the notifier accepted it, or an earlier delivery already did. */
 	onResultDelivered?: (runId: string) => void;
+	onOwnedQueueChanged?: () => void;
 };
 
 type ResultFileChild = {
@@ -111,6 +112,7 @@ type ResultFileData = CompletionNotification & {
 };
 
 type ResultFileIdentity = {
+	acknowledged: boolean;
 	sessionId?: string;
 	completionOwnerId?: string;
 	completionOwnerProcess?: unknown;
@@ -124,32 +126,25 @@ interface ResultScanStats {
 	startedAt: number;
 }
 
-/** The last `"property": <value>` whose value matches `valuePattern`, parsed without reading the whole file; malformed reads as none. */
-function jsonPropertyValue(raw: string, property: string, valuePattern: string): unknown {
-	let encoded: string | undefined;
-	for (const match of raw.matchAll(new RegExp(`"${property}"\\s*:\\s*(${valuePattern})`, "g"))) encoded = match[1];
-	if (!encoded) return undefined;
-	try {
-		return JSON.parse(encoded) as unknown;
-	} catch {
-		return undefined;
-	}
-}
-
-function jsonStringProperty(raw: string, property: string): string | undefined {
-	const value = jsonPropertyValue(raw, property, `"(?:\\\\.|[^"\\\\])*"`);
-	return typeof value === "string" && value ? value : undefined;
+function parsedResultIdentity(data: ResultFileData, runId: string): ResultFileIdentity {
+	return {
+		acknowledged: hasDeliveredNotification(data),
+		runId,
+		sessionId: typeof data.sessionId === "string" ? data.sessionId : undefined,
+		completionOwnerId: typeof data.completionOwnerId === "string" ? data.completionOwnerId : undefined,
+		completionOwnerProcess: data.completionOwnerProcess,
+		parentWorkflowRunId: typeof data.parentWorkflowRunId === "string" ? data.parentWorkflowRunId : undefined,
+	};
 }
 
 function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
-	return {
-		sessionId: jsonStringProperty(raw, "sessionId"),
-		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
-		// Recorded as a flat object, so a brace-free match is the whole value.
-		completionOwnerProcess: jsonPropertyValue(raw, "completionOwnerProcess", `\\{[^{}]*\\}`),
-		parentWorkflowRunId: jsonStringProperty(raw, "parentWorkflowRunId"),
-		runId: file.replace(/\.json$/i, ""),
-	};
+	const runId = file.replace(/\.json$/i, "");
+	try {
+		return parsedResultIdentity(JSON.parse(raw) as ResultFileData, runId);
+	} catch {
+		// Incomplete results are retried by the delivery parser without an ownership hold.
+		return { acknowledged: false, runId };
+	}
 }
 
 function reportResultWatcherWarning(state: SubagentState, message: string, error?: unknown, key = message): void {
@@ -229,8 +224,11 @@ export function createResultWatcher(
 	startResultWatcher: () => void;
 	transitionResultDelivery: () => void;
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
+	captureReloadHolds: (manager: object) => void;
+	restoreReloadHolds: (manager: object) => void;
 	deliverPendingResults: () => Promise<void>;
 	hasPendingResults: () => boolean;
+	hasQueuedOwnedResults: () => boolean;
 	refreshResultDelivery: () => void;
 	stopResultWatcher: () => void;
 } {
@@ -246,6 +244,7 @@ export function createResultWatcher(
 	});
 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
 	const pendingTriggerTurn = new Map<string, boolean>();
+	const queuedOwnedResults = new Map<string, ResultFileIdentity>();
 	const incompleteResultRetries = new Map<string, number>();
 	const processing = new Set<string>();
 	const handling = new Set<Promise<void>>();
@@ -260,6 +259,7 @@ export function createResultWatcher(
 	let deliveryActive = true;
 	let deliveryEpoch = 0;
 	let resultScanTimer: ReturnType<typeof setInterval> | null = null;
+	let discoveryRetry: ReturnType<typeof setTimeout> | undefined;
 	// The sole in-memory ownership lease. It is acquired for one active session
 	// and revoked before the watcher, queues, or callbacks are torn down.
 	let activeSessionId: string | null = null;
@@ -276,27 +276,60 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
-	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0) => {
+	const stillOwns = (identity: ResultFileIdentity): boolean => Boolean(identity.sessionId
+		&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId)));
+	const hasQueuedOwnedResults = () => [...queuedOwnedResults.values()].some(stillOwns);
+	const canRetryResult = (file: string) => {
+		const identity = queuedOwnedResults.get(file);
+		return !identity || stillOwns(identity);
+	};
+
+	const holdOwnedResult = (file: string, identity: ResultFileIdentity) => {
+		const alreadyHeld = queuedOwnedResults.has(file);
+		queuedOwnedResults.set(file, identity);
+		if (alreadyHeld) return;
+		deps.onOwnedQueueChanged?.();
+	};
+
+	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0, identity = identityCache.get(file)?.identity) => {
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
+		if (delayMs === 0 && identity?.sessionId && !identity.acknowledged
+			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
+			holdOwnedResult(file, identity);
+		}
 		state.resultFileCoalescer.schedule(file, delayMs);
 	};
 
+	const reloadKey = Symbol.for("pi-subagents.result-watcher-reload-holds");
+	const globals = globalThis as typeof globalThis & { [reloadKey]?: WeakMap<object, { sessionId: string; results: Map<string, ResultFileIdentity> }> };
+	const reloadHolds = globals[reloadKey] ??= new WeakMap();
+	const captureReloadHolds = (manager: object) => {
+		if (state.currentSessionId && queuedOwnedResults.size) reloadHolds.set(manager, { sessionId: state.currentSessionId, results: new Map(queuedOwnedResults) });
+	};
+	const restoreReloadHolds = (manager: object) => {
+		const handoff = reloadHolds.get(manager);
+		reloadHolds.delete(manager);
+		if (handoff?.sessionId !== state.currentSessionId) return;
+		for (const [file, identity] of handoff?.results ?? []) scheduleResult(file, false, 0, identity);
+	};
+
 	const publicResultPath = (file: string): string => path.join(resultsDir, file);
-	const publicResultFileExists = (file: string): boolean => {
+	const publicResultFileExists = (file: string, onInaccessible?: () => void): boolean => {
 		try {
 			return fsApi.statSync(publicResultPath(file)).isFile();
 		} catch (error) {
-			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'`, error);
+			if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+			else if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'`, error);
 			return false;
 		}
 	};
-	const resultPayloadPath = (file: string, observed?: ReadonlySet<string>): string | undefined => {
+	const resultPayloadPath = (file: string, observed?: ReadonlySet<string>, onInaccessible?: () => void): string | undefined => {
 		if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
 		const runId = file.replace(/\.json$/i, "");
 		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
 			if (!sessionId) continue;
-			const sessionResult = resultPayloadPathForSessionRun(resultsDir, sessionId, runId);
+			const sessionResult = resultPayloadPathForSessionRun(resultsDir, sessionId, runId, onInaccessible);
 			if (sessionResult) return sessionResult;
 		}
 		const observerResult = resultPayloadPathForMissionObserverRun(resultsDir, runId);
@@ -305,10 +338,10 @@ export function createResultWatcher(
 			const indexedResult = resultPayloadPathForIndexedRun(resultsDir, runId);
 			if (indexedResult) return indexedResult;
 		}
-		return publicResultFileExists(file) ? publicResultPath(file) : undefined;
+		return publicResultFileExists(file, onInaccessible) ? publicResultPath(file) : undefined;
 	};
-	const resultSignature = (file: string, observed?: ReadonlySet<string>): string | undefined => {
-		const resultPath = resultPayloadPath(file, observed);
+	const resultSignature = (file: string, observed?: ReadonlySet<string>, onInaccessible?: () => void): string | undefined => {
+		const resultPath = resultPayloadPath(file, observed, onInaccessible);
 		if (!resultPath) {
 			identityCache.delete(file);
 			return undefined;
@@ -320,15 +353,16 @@ export function createResultWatcher(
 		} catch (error) {
 			identityCache.delete(file);
 			if (isAccessDenied(error)) throw error;
-			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
+			if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+			else if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
 	};
-	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>): { identity: ResultFileIdentity; signature: string } | undefined => {
-		const resultPath = resultPayloadPath(file, observed);
+	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>, processingOwned = false, onUnreadablePayload?: () => void): { identity: ResultFileIdentity; signature: string } | undefined => {
+		const resultPath = resultPayloadPath(file, observed, onUnreadablePayload);
 		if (!resultPath) return undefined;
 		try {
-			const signature = knownSignature ?? resultSignature(file, observed);
+			const signature = knownSignature ?? resultSignature(file, observed, onUnreadablePayload);
 			if (!signature) return undefined;
 			const cached = identityCache.get(file);
 			if (cached?.signature === signature) return { identity: cached.identity, signature };
@@ -337,7 +371,8 @@ export function createResultWatcher(
 			return { identity, signature };
 		} catch (error) {
 			identityCache.delete(file);
-			if (isAccessDenied(error)) throw error;
+			if (isStorageAccessError(error)) onUnreadablePayload?.();
+			if (isAccessDenied(error) || (processingOwned && (error as NodeJS.ErrnoException)?.code === "EIO")) throw error;
 			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
@@ -352,14 +387,20 @@ export function createResultWatcher(
 		}
 	};
 
-	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string): boolean => {
-		const inspected = inspectResult(file, knownSignature, observed);
-		if (!inspected) return false;
+	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false, onMissingIdentity?: () => void, onUnreadablePayload?: () => void): boolean => {
+		const inspected = inspectResult(file, knownSignature, observed, holdForDelivery && queuedOwnedResults.has(file), onUnreadablePayload);
+		if (!inspected) {
+			onMissingIdentity?.();
+			return false;
+		}
 		const { identity } = inspected;
 		// Missing identity stays on the normal parser path so malformed or legacy
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
-		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return true;
+		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
+			if (holdForDelivery && !identity.acknowledged) holdOwnedResult(file, identity);
+			return true;
+		}
 		// Acknowledgment removes the observer index; gating on the mission binding instead
 		// re-ran mission sync for an unowned result on every scan.
 		if (identity.runId && fsApi.existsSync(missionObserverIndexPath(resultsDir, identity.runId))) return true;
@@ -367,27 +408,51 @@ export function createResultWatcher(
 		return Boolean(deps.observeCompletion && !deps.observedCompletionRunIds);
 	};
 
-	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot): void => {
+	const markDeliverySettled = (file: string, runId: string) => {
+		const dequeued = queuedOwnedResults.delete(file);
+		deps.onResultDelivered?.(runId);
+		if (dequeued) deps.onOwnedQueueChanged?.();
+	};
+
+	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot, publicPath: string): void => {
 		identityCache.delete(file);
 		try {
-			if (retireResultSnapshot(publicResultPath(file), read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
+			if (retireResultSnapshot(publicPath, read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
 		} catch (error) {
 			if (isAbsentResultCandidate(error)) return;
 			if (!(error instanceof FileLeaseBusyError)) reportResultWatcherWarning(state, `Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
+	const retryInaccessibleOwnedResult = (file: string, triggerTurn: boolean) => {
+		const identity = queuedOwnedResults.get(file);
+		if (identity?.sessionId && identity.runId
+			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))
+			&& resultPayloadVisibility(resultsDir, identity.sessionId, identity.runId, publicResultPath(file)) !== "absent") {
+			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+		}
+	};
+
 	const handleResult = async (file: string, triggerTurn: boolean) => {
 		if (processing.has(file)) return;
 		let observed: ReadonlySet<string> | undefined;
 		try {
-			if (!shouldProcessResult(file)) {
+			let identityReadFailed = false;
+			let unreadablePayload = false;
+			const missingIdentity = () => { identityReadFailed = true; };
+			const payloadReadFailed = () => { unreadablePayload = true; };
+			if (!shouldProcessResult(file, undefined, undefined, true, missingIdentity, payloadReadFailed)) {
 				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
 				observed = observedRunIds();
-				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed)) return;
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true, missingIdentity, payloadReadFailed)) {
+					if (unreadablePayload && canRetryResult(file)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					else if (identityReadFailed) retryInaccessibleOwnedResult(file, triggerTurn);
+					return;
+				}
 			}
 		} catch (error) {
-			if (!isAccessDenied(error)) throw error;
+			if (!isStorageAccessError(error)) throw error;
+			if (!canRetryResult(file)) return;
 			reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			return;
@@ -398,13 +463,17 @@ export function createResultWatcher(
 		// The public payload is read just before the payload itself, so anything published after the
 		// read differs from both.
 		let publicAtRead: string | undefined;
+		const publicPathFor = (payloadPath: string) => path.dirname(payloadPath) === resultsDir ? payloadPath : publicResultPath(file);
 		const readPayload = (payloadPath: string): string => {
-			publicAtRead = readResultPayload(publicResultPath(file));
+			publicAtRead = readResultPayload(publicPathFor(payloadPath));
 			return fsApi.readFileSync(payloadPath, "utf-8");
 		};
 		try {
 			const payloadPath = resultPayloadPath(file, observed);
-			if (!payloadPath) return;
+			if (!payloadPath) {
+				retryInaccessibleOwnedResult(file, triggerTurn);
+				return;
+			}
 			resultPath = payloadPath;
 			let raw = readPayload(resultPath);
 			let identity = resultFileIdentity(raw, file);
@@ -450,7 +519,7 @@ export function createResultWatcher(
 			let read: ResultSnapshot = { runId, sessionId, toolCallId, snapshot: raw, ...(publicAtRead !== undefined && publicAtRead !== raw ? { stalePublic: publicAtRead } : {}) };
 			const markReplacedPayload = (): boolean => {
 				try {
-					if (!resultSnapshotReplaced(publicResultPath(file), read)) return false;
+					if (!resultSnapshotReplaced(publicPathFor(resultPath), read)) return false;
 				} catch (error) {
 					if (isAccessDenied(error)) throw error;
 					reportResultWatcherWarning(state, `Failed to re-read subagent result file '${publicResultPath(file)}'`, error);
@@ -493,6 +562,18 @@ export function createResultWatcher(
 				resultsDir,
 				sessionId,
 			});
+			const completionKey = buildCompletionKey(data, `result:${file}`);
+			if (hasDeliveredNotification(data)) {
+				if (markReplacedPayload()) return;
+				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
+				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
+				deps.onResultDelivered?.(runId);
+				if (!observerSucceeded || !completionPersisted) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				else removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
+				return;
+			}
+			const lastSeenAt = state.completionSeen.get(completionKey);
+			if (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs) holdOwnedResult(file, identity);
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(state, data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {
@@ -505,24 +586,21 @@ export function createResultWatcher(
 				}
 			}
 
-			const completionKey = buildCompletionKey(data, `result:${file}`);
-			const alreadyDelivered = hasDeliveredNotification(data);
-			const lastSeenAt = state.completionSeen.get(completionKey);
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch) || markReplacedPayload()) return;
+				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
 				deps.onResultDelivered?.(runId);
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				removeDeliveredResult(file, triggerTurn, read);
+				removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
 				return;
 			}
 
@@ -572,22 +650,6 @@ export function createResultWatcher(
 				};
 			}), nestedChildren);
 
-			if (alreadyDelivered) {
-				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
-				if (!observerSucceeded) {
-					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-					return;
-				}
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
-				deps.onResultDelivered?.(runId);
-				if (!completionPersisted) {
-					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-					return;
-				}
-				removeDeliveredResult(file, triggerTurn, read);
-				return;
-			}
 
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
@@ -639,9 +701,8 @@ export function createResultWatcher(
 			}
 			// A newer payload replaced this one; keep the hold until that one is delivered.
 			if (markReplacedPayload()) return;
-			deps.onResultDelivered?.(runId);
 			try {
-				const marked = markDeliveredNotification(publicResultPath(file), data, read, Date.now());
+				const marked = markDeliveredNotification(publicPathFor(resultPath), data, read, Date.now());
 				identityCache.delete(file);
 				if (!marked) {
 					rereadReplacedPayload = true;
@@ -677,6 +738,13 @@ export function createResultWatcher(
 			} catch (error) {
 				reportResultWatcherWarning(state, `Completion observer failed for '${resultPath}'`, error);
 			}
+			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+			// A completion subscriber may queue a wake or publish a replacement.
+			if (markReplacedPayload()) {
+				deps.onResultDelivered?.(runId);
+				return;
+			}
+			markDeliverySettled(file, runId);
 			if (!observerSucceeded) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
@@ -686,9 +754,10 @@ export function createResultWatcher(
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
-			removeDeliveredResult(file, triggerTurn, read);
+			removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
 		} catch (error) {
-			if (isAccessDenied(error)) {
+			if (isAccessDenied(error) || ((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) {
+				if (!canRetryResult(file)) return;
 				reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'; will retry`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			} else if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'`, error);
@@ -703,7 +772,11 @@ export function createResultWatcher(
 		pendingTriggerTurn.delete(file);
 		const run = handleResult(file, triggerTurn);
 		handling.add(run);
-		void run.finally(() => handling.delete(run));
+		const epoch = deliveryEpoch;
+		void run.finally(() => {
+			handling.delete(run);
+			if (epoch === deliveryEpoch && !processing.has(file) && !pendingTriggerTurn.has(file) && queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
+		});
 	}, deps.coalesceDelayMs ?? 50);
 	state.resultFileCoalescer = resultFileCoalescer;
 
@@ -719,29 +792,33 @@ export function createResultWatcher(
 		if (resultScanLogging === "activity" && stats.files === 0 && stats.scheduled === 0) return;
 		reportSessionWarning(state, `Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`, "slow-result-scan");
 	};
-	const indexedResultCandidates = (observed: ReadonlySet<string>): string[] => {
+	const indexedResultCandidates = (observed: ReadonlySet<string>, onUnreadableEntry?: (file: string) => void, onUnreadablePending?: () => void): string[] => {
 		const files = new Set<string>();
 		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
 			if (!sessionId) continue;
-			for (const file of resultCandidateFilesForSession(resultsDir, sessionId)) files.add(file);
+			for (const file of resultCandidateFilesForSession(resultsDir, sessionId, onUnreadableEntry, onUnreadablePending)) files.add(file);
 		}
 		for (const runId of state.asyncJobs.keys()) files.add(`${runId}.json`);
 		for (const file of missionObserverResultCandidateFiles(resultsDir)) files.add(file);
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadablePayload?: (file: string) => void, onUnreadablePending?: () => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
 			const observed = observedRunIds();
-			for (const file of indexedResultCandidates(observed)) {
+			for (const file of indexedResultCandidates(observed, onStorageError, onUnreadablePending)) {
 				stats.files += 1;
-				const signature = resultSignature(file, observed);
-				if (!signature) continue;
-				if (!shouldProcessResult(file, observed, signature)) continue;
-				stats.scheduled += 1;
-				files.push(file);
+				try {
+					const signature = resultSignature(file, observed, () => onUnreadablePayload?.(file));
+					if (!signature || !shouldProcessResult(file, observed, signature, false, undefined, () => onUnreadablePayload?.(file))) continue;
+					stats.scheduled += 1;
+					files.push(file);
+				} catch (error) {
+					if (isStorageAccessError(error)) onStorageError?.(file);
+					if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to inspect indexed subagent result '${file}'`, error);
+				}
 			}
 			logScanStats(stats);
 		} catch (error) {
@@ -749,28 +826,69 @@ export function createResultWatcher(
 		}
 		return files;
 	};
-	const hasPendingResults = () => eligibleResultFiles().some((file) => {
-		const payloadPath = resultPayloadPath(file);
-		if (!payloadPath) return false;
+	const pendingCanonicalIdentity = (file: string): ResultFileIdentity | undefined => {
+		if (file !== path.basename(file) || !file.endsWith(".json")) return;
+		try {
+			const raw = fsApi.readFileSync(publicResultPath(file), "utf-8");
+			const data = parseResult(raw);
+			const runId = data.runId || data.id;
+			if (typeof runId !== "string" || `${runId}.json` !== file || typeof data.sessionId !== "string" || hasDeliveredNotification(data)) return;
+			const identity = parsedResultIdentity(data, runId);
+			if (stillOwns(identity)) return identity;
+		} catch {
+			// An unreadable index does not authorize guessing a payload's identity.
+		}
+	};
+	const isPendingOwnedResult = (file: string): boolean => {
+		if (file !== path.basename(file) || !file.endsWith(".json")) return false;
 		let raw: string;
 		try {
+			const payloadPath = resultPayloadPath(file);
+			if (!payloadPath) return false;
 			raw = fsApi.readFileSync(payloadPath, "utf-8");
 		} catch (error) {
 			// Removed since the scan means delivered; an unreadable file is still owed to someone, so the switch asks.
+			if (isStorageAccessError(error)) return Boolean(pendingCanonicalIdentity(file));
 			return !isNotFound(error);
 		}
-		const identity = resultFileIdentity(raw, file);
-		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
 		try {
-			return !hasDeliveredNotification(parseResult(raw));
-		} catch {
-			// A partial write is retried by the watcher; until then it counts as undelivered.
-			return true;
+			const identity = parsedResultIdentity(parseResult(raw), file.replace(/\.json$/i, ""));
+			return !identity.acknowledged && stillOwns(identity);
+		} catch (error) {
+			// Only the switch prompt is conservative for incomplete data; this never claims delivery ownership.
+			return isIncompleteJson(error) && [state.currentSessionId, ...claimedSessionIds()].some((sessionId) =>
+				sessionId && resultCandidateFilesForSession(resultsDir, sessionId).includes(file));
 		}
-	});
+	};
+	const hasPendingResults = () => {
+		if (hasQueuedOwnedResults()) return true;
+		const inaccessible = new Set<string>();
+		const noteInaccessible = (file: string) => inaccessible.add(file);
+		const eligible = eligibleResultFiles(noteInaccessible, noteInaccessible);
+		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => pendingCanonicalIdentity(file) !== undefined);
+	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;
-		for (const file of eligibleResultFiles()) scheduleResult(file, triggerTurn);
+		const inaccessible = new Set<string>();
+		const unreadablePayloads = new Set<string>();
+		let retryScan = false;
+		for (const file of eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadablePayloads.add(file), () => { retryScan = true; })) scheduleResult(file, triggerTurn);
+		for (const file of inaccessible) {
+			const identity = pendingCanonicalIdentity(file);
+			if (identity) {
+				unreadablePayloads.delete(file);
+				scheduleResult(file, triggerTurn, 0, identity);
+			} else retryScan = true;
+		}
+		if (retryScan && deliveryActive && !discoveryRetry) {
+			discoveryRetry = timers.setTimeout(() => {
+				discoveryRetry = undefined;
+				primeExistingResults({ triggerTurn });
+			}, POLL_INTERVAL_MS);
+			discoveryRetry.unref?.();
+		}
+		// Retry discovery without claiming ownership until the payload can be read.
+		for (const file of unreadablePayloads) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 	};
 	/** Hand every result that is already on disk to the notifier now, without coalescing or batch delays. */
 	const deliverPendingResults = async (): Promise<void> => {
@@ -869,12 +987,16 @@ export function createResultWatcher(
 				const fileName = file.toString();
 				if (fileName.endsWith(".json")) {
 					identityCache.delete(fileName);
+					let discovered: ResultFileIdentity | undefined;
 					try {
-						writeResultIndexForData(path.join(resultsDir, fileName), JSON.parse(fsApi.readFileSync(path.join(resultsDir, fileName), "utf-8")) as Record<string, unknown>);
+						const resultPath = path.join(resultsDir, fileName);
+						const raw = fsApi.readFileSync(resultPath, "utf-8");
+						discovered = resultFileIdentity(raw, fileName);
+						writeResultIndexForData(resultPath, JSON.parse(raw) as Record<string, unknown>);
 					} catch {
 						// The writer may still be renaming the file; handleResult will retry from the normal result path.
 					}
-					scheduleResult(fileName, true);
+					scheduleResult(fileName, true, 0, discovered);
 				}
 			});
 			state.watcher.on("error", (error) => {
@@ -895,10 +1017,16 @@ export function createResultWatcher(
 		}
 	};
 
+	const clearDiscoveryRetry = () => {
+		if (discoveryRetry) timers.clearTimeout(discoveryRetry);
+		discoveryRetry = undefined;
+	};
 	const transitionResultDelivery = () => {
+		clearDiscoveryRetry();
 		deliveryActive = true;
 		activeSessionId = state.currentSessionId;
 		deliveryEpoch += 1;
+		queuedOwnedResults.clear();
 		identityCache.clear();
 	};
 
@@ -910,12 +1038,14 @@ export function createResultWatcher(
 		state.watcher = null;
 		clearResultPoller();
 		clearResultScan();
+		clearDiscoveryRetry();
 		state.resultFileCoalescer.clear();
 		pendingTriggerTurn.clear();
+		queuedOwnedResults.clear();
 		processing.clear();
 		identityCache.clear();
 		incompleteResultRetries.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, hasPendingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, captureReloadHolds, restoreReloadHolds, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }

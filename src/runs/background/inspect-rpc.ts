@@ -2,12 +2,12 @@ import * as fs from "node:fs";
 import { sanitizeDisplayText, truncateDisplayText } from "../../shared/display-text.ts";
 import { decodeUtf8Tail } from "../../shared/utf8.ts";
 import { DIRS, type AsyncStatus, type NestedRunSummary, type SubagentState } from "../../shared/types.ts";
-import { readStatus } from "../../shared/utils.ts";
+import { isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { readSessionMessagesTail, type SessionTranscriptMessage } from "./fleet-view.ts";
 import { completionReplayPath, readCompletionArchive, readCompletionReplay } from "./completion-replay.ts";
 import { resultPayloadPathForSessionRun } from "./result-files.ts";
 import { resolveSubagentRunId } from "./run-id-resolver.ts";
-import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
+import { reconcileVerifiedAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
 /** On-demand inspection of current-session async children. Re-reads canonical artifacts after the same reconciliation as status; nothing is persisted or broadcast. */
@@ -234,8 +234,13 @@ function readSessionBackedOutput(sessionPath: string, trustedRoots: string[], tr
 }
 
 function readResultOutput(resultsDir: string, sessionId: string, runId: string, stepIndex: number | undefined, trustedRoots: string[], stepAgent: string | undefined, now: () => number, trustedSessionFileRoot?: string): { output?: string; errorText?: string } {
-	const resultPath = resultPayloadPathForSessionRun(resultsDir, sessionId, runId);
-	if (resultPath) return resultOutput(JSON.parse(fs.readFileSync(resultPath, "utf-8")) as unknown, stepIndex);
+	try {
+		const resultPath = resultPayloadPathForSessionRun(resultsDir, sessionId, runId);
+		if (resultPath) return resultOutput(JSON.parse(fs.readFileSync(resultPath, "utf-8")) as unknown, stepIndex);
+	} catch (error) {
+		if (!isStorageAccessError(error)) throw error;
+		// A readable, session-validated replay still provides output when result storage is unavailable.
+	}
 	// Read the raw record first: readCompletionReplay best-effort deletes
 	// invalid or expired records, so reading after it cannot distinguish
 	// "never existed" from "failed validation".
@@ -359,7 +364,9 @@ export function buildInspectReply(request: InspectRequest, deps: InspectDeps = {
 		} else {
 			if (!resolved.location.asyncDir) return errorReply(request, "stale", `Async run '${request.asyncId}' has no remaining artifacts.`);
 			asyncDir = resolved.location.asyncDir;
-			status = reconcileAsyncRun(asyncDir, { resultsDir, kill: deps.kill, now: deps.now }).status ?? readStatus(asyncDir);
+			const snapshot = readStatus(asyncDir);
+			status = snapshot && ownsRun(currentSessionId, snapshot.sessionId)
+				? reconcileVerifiedAsyncRun(asyncDir, snapshot, { resultsDir, kill: deps.kill, now: deps.now }) : snapshot;
 		}
 		if (!status) return errorReply(request, "stale", `Async run '${request.asyncId}' artifacts are no longer available.`);
 		if (!ownsRun(currentSessionId, status.sessionId)) {
@@ -374,8 +381,9 @@ export function buildInspectReply(request: InspectRequest, deps: InspectDeps = {
 			if (!ownsRun(currentSessionId, node.status.sessionId)) {
 				return errorReply(request, "foreign_session", "Inspection is only available for async runs owned by the current session.");
 			}
-			reconcileAsyncRun(node.asyncDir, { resultsDir, kill: deps.kill, now: deps.now });
-			node.status = readStatus(node.asyncDir) ?? node.status;
+			const refreshed = reconcileVerifiedAsyncRun(node.asyncDir, node.status, { resultsDir, kill: deps.kill, now: deps.now });
+			if (!refreshed) return errorReply(request, "stale", "The requested child run artifacts are no longer available.");
+			node.status = refreshed;
 		}
 
 		const step = node.stepIndex !== undefined ? node.status.steps?.[node.stepIndex] : undefined;

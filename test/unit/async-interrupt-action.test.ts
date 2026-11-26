@@ -8,12 +8,13 @@ import { acquireActiveAsyncCapacity, ActiveAsyncCapacityError, getActiveAsyncCap
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
 import { consumeSteerRequests, consumeStopRequestPayload, interruptRequestPath } from "../../src/runs/background/control-channel.ts";
-import { removeResultIndex, resultFilePath, writeAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { removeResultIndex, resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { TERMINAL_RUN_INDEX_DIR } from "../../src/runs/background/terminal-run-index.ts";
 import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
 import { reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { stopAsyncRun } from "../../src/runs/foreground/async-stop-action.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
 import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import { steerWorkflowForegroundTarget } from "../../src/runs/foreground/workflow-foreground-steering.ts";
@@ -1181,6 +1182,108 @@ describe("async interrupt action", () => {
 			assert.equal(consumeStopRequestPayload(asyncDir)?.type, "stop");
 			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
 		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("writes a live stop request even when its completion index is unreadable", () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-result-eio-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: true, sessionId: "session" });
+		const read = fs.readFileSync;
+		let denied = false;
+		try {
+			fs.readFileSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === `${runId}.json`) {
+					denied = true;
+					throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+				}
+				return read(file, ...args);
+			}) as typeof fs.readFileSync;
+			syncBuiltinESMExports();
+			const result = stopAsyncRun(state, runId, () => true);
+			assert.equal(denied, true);
+			assert.equal(result?.isError, undefined);
+			assert.equal(consumeStopRequestPayload(asyncDir)?.source, "stop-action");
+		} finally {
+			fs.readFileSync = read;
+			syncBuiltinESMExports();
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	for (const payloadCase of ["owned", "missing", "foreign"] as const) it(`handles an unreadable paused result index (exact payload: ${payloadCase})`, () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-paused-eio-${payloadCase}-${Date.now().toString(36)}`;
+		const asyncDir = createPausedAsync(state, runId);
+		const payloadPath = path.join(RESULTS_DIR, `${runId}.json`);
+		const statusPath = path.join(asyncDir, "status.json");
+		const read = fs.readFileSync;
+		let denied = false;
+		try {
+			writeJson(path.join(asyncDir, "process-terminal.json"), observedProof(runId, "runner-a"));
+			if (payloadCase === "missing") fs.unlinkSync(payloadPath);
+			if (payloadCase === "foreign") {
+				writePendingAsyncResultFile(payloadPath, { id: runId, sessionId: "session", state: "paused" });
+				writeJson(payloadPath, { id: runId, sessionId: "foreign" });
+			}
+			const original = payloadCase === "missing" ? undefined : read(payloadPath, "utf-8");
+			fs.readFileSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === `${runId}.json`) {
+					denied = true;
+					throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+				}
+				return read(file, ...args);
+			}) as typeof fs.readFileSync;
+			syncBuiltinESMExports();
+			const result = stopAsyncRun(state, runId, () => true, { asyncDir, resolvedId: runId });
+			assert.equal(denied, payloadCase !== "foreign", "reject the foreign destination before reading the index");
+			if (payloadCase === "owned") {
+				assert.equal(result?.isError, undefined);
+				assert.equal(JSON.parse(read(statusPath, "utf-8")).state, "stopped");
+				assert.equal(JSON.parse(read(payloadPath, "utf-8")).results[0].output, "done");
+			} else {
+				assert.equal(result?.isError, true);
+				assert.equal(JSON.parse(read(statusPath, "utf-8")).state, "paused");
+				if (original === undefined) assert.equal(fs.existsSync(payloadPath), false);
+				else assert.equal(read(payloadPath, "utf-8"), original);
+			}
+		} finally {
+			fs.readFileSync = read;
+			syncBuiltinESMExports();
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("does not synthesize a paused result when pending payload stat returns EIO", () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-paused-stat-eio-${Date.now().toString(36)}`;
+		const asyncDir = createPausedAsync(state, runId);
+		const payloadPath = resultFilePath(RESULTS_DIR, runId);
+		const stat = fs.statSync;
+		let denied = false;
+		try {
+			writeJson(path.join(asyncDir, "process-terminal.json"), observedProof(runId, "runner-a"));
+			fs.unlinkSync(payloadPath);
+			fs.statSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-pending${path.sep}`) && path.basename(String(file)) === `${runId}.json`) {
+					denied = true;
+					throw Object.assign(new Error("pending storage unavailable"), { code: "EIO" });
+				}
+				return Reflect.apply(stat, fs, [file, ...args]);
+			}) as typeof fs.statSync;
+			syncBuiltinESMExports();
+			const result = stopAsyncRun(state, runId, () => true, { asyncDir, resolvedId: runId });
+			assert.equal(denied, true);
+			assert.equal(result?.isError, true);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "paused");
+			assert.equal(fs.existsSync(payloadPath), false);
+		} finally {
+			fs.statSync = stat;
+			syncBuiltinESMExports();
 			cleanup(runId, asyncDir);
 		}
 	});

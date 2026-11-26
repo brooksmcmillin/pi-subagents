@@ -15,15 +15,20 @@ import { SUBAGENT_ASYNC_COMPLETE_EVENT } from "../../src/shared/types.ts";
 // send is rejected, and whose accepted wake is started by the parent later.
 const terminalBeforePublicationScript = String.raw`
 	import assert from "node:assert/strict";
-	import * as fs from "node:fs";
+	import fsDefault, * as fs from "node:fs";
+	import { syncBuiltinESMExports } from "node:module";
 	import * as path from "node:path";
 	import { createEventBus } from "@earendil-works/pi-coding-agent";
 	import registerSubagentExtension from "./src/extension/index.ts";
 	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
-	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
+	import { recordSessionReplacement, recordSessionStart } from "./src/shared/session-succession.ts";
+	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT, TEMP_ROOT_DIR } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
-	import { resultFilePath, writeAsyncResultFile } from "./src/runs/background/result-files.ts";
-	import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
+	import { ACTIVE_RUN_INDEX_DIR, readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+	import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "./src/runs/shared/nested-events.ts";
+	import { reconcileNestedAsyncDescendants } from "./src/runs/background/stale-run-reconciler.ts";
+	import { listAsyncRuns } from "./src/runs/background/async-status.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
 	// so a terminal status is observed before the result file exists.
@@ -72,9 +77,62 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
+	const workflowReload = process.argv[1] === "workflow-reload";
+	const noStatusReload = process.argv[1] === "published-no-status-reload";
+	const closeWithStatusEIO = process.argv[1] === "statusless-writer-close-eio";
+	const delayedStatusless = process.argv[1] === "statusless-delayed-writer" || closeWithStatusEIO;
+	const statuslessWithoutReload = process.argv[1] === "statusless-delayed-no-reload";
+	const ackNestedEIO = process.argv[1] === "published-ack-nested-eio";
+	const ackStatusEIO = process.argv[1] === "published-ack-status-eio" || ackNestedEIO;
+	const ackRoute = ackNestedEIO ? createNestedRoute(runId) : undefined;
+	const ackChild = { id: "independent", parentRunId: runId, depth: 1, path: [{ runId }], agent: "worker",
+		asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", runId, "independent"), state: "running" };
+	if (ackRoute) writeNestedEvent(ackRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId, child: ackChild });
+	const vanishedResult = process.argv[1] === "published-vanished";
+	const publishedReload = process.argv[1] === "published-reload" || noStatusReload || vanishedResult || ackStatusEIO;
+	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
+	const provisionalReload = process.argv[1] === "provisional-reload";
+	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
+	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
+	const reclaimedAfterReload = process.argv[1] === "inherited-reclaimed-after-reload";
+	const originalReopened = process.argv[1] === "inherited-reclaimed" || reclaimedAfterReload;
+	const inheritedPublication = process.argv[1] === "inherited-publication" || originalReopened;
+	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
+	const forgetRestored = process.argv[1] === "forget-restored";
+	const completeBeforeRefresh = process.argv[1] === "forget-completion-first";
+	const forgetPublished = process.argv[1] === "forget-published-started" || completeBeforeRefresh;
+	const inPlaceCloseEIO = process.argv[1] === "in-place-close-eio";
+	const forgetStarted = process.argv[1] === "forget-started" || forgetPublished || inPlaceCloseEIO;
+	const startedRoute = forgetStarted && !inPlaceCloseEIO ? createNestedRoute(runId) : undefined;
+	if (startedRoute) {
+		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId,
+			child: { id: "foreground", parentRunId: runId, depth: 1, path: [{ runId }], agent: "worker", state: "running" } });
+		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 101, parentRunId: runId, child: ackChild });
+	}
+	const aliasEvent = process.argv[1] === "closed-event-alias";
+	const indexedAlias = process.argv[1] === "closed-index-alias" || aliasEvent;
+	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
+	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
+	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun || forgetRestored || delayedStatusless || statuslessWithoutReload;
+	const statusOnlyClosure = process.argv[1] === "closed-overlay";
+	const indexDenied = process.argv[1] === "closed-index-denied";
+	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied || indexedAlias;
+	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
+	const pendingCase = process.argv[1] === "pending";
+	const tui = closedCase || pendingCase || forgetStarted;
+	const holds = [];
+	const reports = [];
+	if (tui) {
+		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
+		Object.defineProperty(process.stdout, "isTTY", { value: true });
+		const write = process.stdout.write.bind(process.stdout);
+		process.stdout.write = (chunk, ...args) => typeof chunk === "string" && chunk.startsWith("\x1b]7501;") ? (reports.push(chunk), true) : write(chunk, ...args);
+	}
 	const ctx = {
-		cwd: process.cwd(), hasUI: false, model: undefined, isIdle() { return false; },
-		ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+		cwd: process.cwd(), hasUI: tui, mode: tui ? "tui" : undefined, model: undefined, isIdle() { return false; },
+		ui: { setBackgroundWork(_key, active) { holds.push(active); }, notify() {}, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
 	};
@@ -82,38 +140,417 @@ const terminalBeforePublicationScript = String.raw`
 		const timer = originalSetTimeout(() => reject(new Error("Timed out waiting for a completion send")), 10_000);
 		onSend = (send) => { originalClearTimeout(timer); onSend = undefined; resolve(send); };
 	});
-	const writeStatus = (state) => {
+	const exitProof = () => ({ version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "observed", observedAt: Date.now(),
+		instances: [{ kind: "runner", processInstanceId: runId + "-runner", closeObservedAt: Date.now(), exitCode: 0, signal: null }] });
+	const writeStatus = (state, proof, markerState = state) => {
 		const asyncDir = path.join(DIRS.async, runId);
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeAtomicJson(path.join(asyncDir, "status.json"), {
-			runId, sessionId, completionOwnerId, mode: "single", state,
+			runId: mismatchedMarker ? "different-run" : runId, sessionId: runSessionId, completionOwnerId, mode: workflowReload ? "workflow" : "single", state,
 			startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
 			steps: [{ agent: "worker", status: state, index: 0 }],
-			...(state === "running" ? {} : { processTerminal: { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
+			...(state === "running" ? {} : { processTerminal: proof ?? { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
 		});
-		updateActiveRunIndex(asyncDir, state);
+		updateActiveRunIndex(asyncDir, markerState);
 		return asyncDir;
 	};
-	const publishResult = () => writeAsyncResultFile(resultFilePath(DIRS.results, runId), {
+	const publishResult = (pending = false, acknowledged = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
 		id: runId, runId, agent: "worker", mode: "single", state: "complete", success: true, exitCode: 0,
 		summary: "child complete", timestamp: Date.now(), sessionId, completionOwnerId,
+		...(acknowledged ? { notificationDeliveredAt: Date.now() } : {}),
 	});
 
 	registerSubagentExtension(pi);
-	for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
-	assert.equal(provider.isActive(), false);
-	const asyncDir = writeStatus("running");
-	events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+	let asyncDir;
+	if (restoredCase) {
+		const observed = provisionalReload ? exitProof() : undefined;
+		asyncDir = writeStatus(mismatchedRunningMarker || restoreDeadRun ? "running" : "complete", observed, "running");
+		if (observed) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), observed);
+	}
+	const unrelatedRoute = mismatchedMarker ? createNestedRoute("different-run") : undefined;
+	if (unrelatedRoute) {
+		const childDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", unrelatedRoute.rootRunId, "nested-child");
+		fs.mkdirSync(childDir, { recursive: true });
+		writeNestedEvent(unrelatedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: "different-run",
+			child: { id: "nested-child", parentRunId: "different-run", depth: 1, path: [{ runId: "different-run" }], agent: "worker", state: "running", asyncDir: childDir } });
+		writeAtomicJson(path.join(childDir, "status.json"), { runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
+			steps: [{ agent: "worker", status: "failed" }] });
+		const resultsDir = path.join(TEMP_ROOT_DIR, "mismatch-results");
+		const publicPath = resultFilePath(resultsDir, unrelatedRoute.rootRunId);
+		writePendingAsyncResultFile(publicPath, { id: unrelatedRoute.rootRunId, sessionId, completionOwnerId, state: "complete", success: true, timestamp: Date.now() });
+		const pendingDir = path.join(resultsDir, "result-pending", sessionId);
+		assert.ok(fs.readdirSync(pendingDir).includes("different-run.json"));
+		listAsyncRuns(DIRS.async, { states: ["queued", "running"], includeTerminalPublication: true, sessionId, resultsDir });
+		assert.ok(fs.readdirSync(pendingDir).includes("different-run.json"), "unrelated payload stays pending during listing");
+		assert.equal(fs.existsSync(publicPath), false);
+	}
+	const restoreStat = fsDefault.statSync;
+	let restoredRefreshDenied = false;
+	let secondRestore = false;
+	if (denyFirstRefresh) {
+		fsDefault.statSync = (file, ...args) => {
+			if ((provisionalReload || !restoredRefreshDenied) && String(file) === path.join(asyncDir, "status.json")
+				&& new Error().stack.includes("at refreshJob")) {
+				restoredRefreshDenied = true;
+				throw Object.assign(new Error("terminal refresh inaccessible"), { code: secondRestore ? "EIO" : "EACCES" });
+			}
+			return restoreStat(file, ...args);
+		};
+		syncBuiltinESMExports();
+	}
+	try {
+		for (const handler of handlers.get("session_start")) await handler({ reason: restoredCase ? "reload" : "startup" }, ctx);
+		if (denyFirstRefresh) assert.equal(restoredRefreshDenied, true);
+		if (provisionalReload) {
+			assert.equal(readActiveRunIndex(DIRS.async).includes(runId), false);
+			assert.deepEqual(holds, [true]);
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+			handlers.clear();
+			holds.length = 0;
+			restoredRefreshDenied = false;
+			secondRestore = true;
+			registerSubagentExtension(pi);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+			assert.equal(restoredRefreshDenied, true, "second runtime probed the exact markerless status");
+			assert.deepEqual(holds, [true]);
+		}
+	} finally {
+		if (denyFirstRefresh) {
+			fsDefault.statSync = restoreStat;
+			syncBuiltinESMExports();
+		}
+	}
+	if (restoreDeadRun || indexedAlias) {
+		const publicPath = resultFilePath(DIRS.results, indexedAlias ? "alternate" : runId);
+		const bytes = JSON.stringify({ id: runId, sessionId: "other-session", success: true });
+		const stat = fsDefault.statSync;
+		let visibilityDenied = false;
+		try {
+			if (indexedAlias) {
+				writeAsyncResultFile(publicPath, { id: runId, runId, sessionId, completionOwnerId, success: true, notificationDeliveredAt: Date.now() });
+				fsDefault.statSync = (file, ...args) => {
+					if (String(file) === publicPath) {
+						visibilityDenied ||= new Error().stack.includes(aliasEvent ? "asyncCompleteHandler" : "indexedResultPayloadVisibility");
+						throw Object.assign(new Error("indexed alias temporarily inaccessible"), { code: "EACCES" });
+					}
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				asyncDir = writeStatus("running");
+				events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+				writeStatus("complete", exitProof());
+				if (aliasEvent) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+				else events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, exitProof());
+				for (let i = 0; i < 130 && !visibilityDenied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(visibilityDenied, true);
+				assert.deepEqual(holds, [true]);
+				assert.equal(provider.isActive(), true);
+			} else {
+				assert.deepEqual(holds, [true]);
+				fs.mkdirSync(DIRS.results, { recursive: true });
+				fs.writeFileSync(publicPath, bytes);
+				const statusPath = path.join(asyncDir, "status.json");
+				writeAtomicJson(statusPath, { ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 2147483647 });
+			}
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		for (let i = 0; i < 180 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		if (restoreDeadRun) {
+			assert.equal(fs.readFileSync(publicPath, "utf-8"), bytes);
+			assert.ok(reports.some(report => /state=error:/.test(report)));
+		} else {
+			// Acknowledged results do not hold liveness while their coalesced cleanup runs.
+			for (let i = 0; i < 100 && fs.existsSync(publicPath); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(fs.existsSync(publicPath), false, "owned acknowledged alias was retired");
+		}
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (mismatchedMarker) {
+		assert.equal(readActiveRunIndex(DIRS.async).includes(runId), true, "the directory was discovered via its active marker");
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, []);
+		assert.equal(reports.some(report => report.includes("differentrun")), false);
+		assert.equal(projectNestedEvents(unrelatedRoute).children[0]?.state, "running", "unrelated route did not receive a repaired terminal event");
+		reconcileNestedAsyncDescendants(unrelatedRoute);
+		assert.equal(projectNestedEvents(unrelatedRoute).children[0]?.state, "failed", "the fixture would have been repaired if visited");
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (restoredCase) {
+		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+		assert.deepEqual(holds, [true]);
+	} else {
+		assert.equal(provider.isActive(), false);
+		asyncDir = writeStatus("running");
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir, nestedRoute: ackRoute ?? startedRoute });
+	}
 	assert.equal(provider.isActive(), true);
+	if (delayedStatusless || statuslessWithoutReload) {
+		const statusPath = path.join(asyncDir, "status.json");
+		fs.rmSync(statusPath);
+		updateActiveRunIndex(asyncDir, "failed");
+		const stat = fsDefault.statSync;
+		let refreshed = false;
+		fsDefault.statSync = (file, ...args) => {
+			if (file === statusPath && new Error().stack.includes("at refreshJob")) refreshed = true;
+			return stat(file, ...args);
+		};
+		syncBuiltinESMExports();
+		try {
+			for (let i = 0; i < 130 && !refreshed; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(refreshed, true);
+			assert.deepEqual(holds, [true]);
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		if (closeWithStatusEIO) {
+			fsDefault.statSync = (file, ...args) => {
+				if (file === statusPath) throw Object.assign(new Error("status temporarily unreadable"), { code: "EIO" });
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
+		if (delayedStatusless) {
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+			handlers.clear();
+			holds.length = 0;
+			registerSubagentExtension(pi);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+		}
+		assert.equal(provider.isActive(), true);
+		assert.deepEqual(holds, [true]);
+		if (!closeWithStatusEIO) publishResult(false, true);
+		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
+		for (let i = 0; i < 150 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (originalReopened) {
+		const statusPath = path.join(asyncDir, "status.json");
+		const stat = fsDefault.statSync;
+		try {
+			if (reclaimedAfterReload) {
+				updateActiveRunIndex(asyncDir, "failed");
+				fsDefault.statSync = (file, ...args) => {
+					if (file === statusPath) throw Object.assign(new Error("status unreadable"), { code: "EIO" });
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+				handlers.clear();
+				holds.length = 0;
+				registerSubagentExtension(pi);
+				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+			}
+			assert.deepEqual(holds, [true]);
+			recordSessionStart(runSessionId, false);
+			for (let i = 0; i < 140 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(provider.isActive(), false);
+			assert.deepEqual(holds, [true, false]);
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		assert.equal(fs.existsSync(statusPath), true, "original session keeps its own status");
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (forgetStarted) {
+		writeStatus("complete");
+		if (completeBeforeRefresh) {
+			publishResult(false, true);
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+		}
+		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
+		for (let i = 0; i < 130 && !reports.some(report => report.includes("state=clear:")); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.ok(reports.some(report => report.includes("state=clear:")), "terminal child was projected while the root still held");
+	}
+	if (forgetRestored || forgetStarted) {
+		if (forgetPublished) {
+			if (!completeBeforeRefresh) {
+				publishResult(false, true);
+				events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			}
+			const pathToResult = resultFilePath(DIRS.results, runId);
+			for (let i = 0; i < 100 && fs.existsSync(pathToResult); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(fs.existsSync(pathToResult), false);
+		}
+		assert.deepEqual(holds, [true]);
+		const statusPath = path.join(asyncDir, "status.json");
+		if (inPlaceCloseEIO) {
+			const stat = fsDefault.statSync;
+			let denied = false;
+			fsDefault.statSync = (file, ...args) => {
+				if (file === statusPath) { denied = true; throw Object.assign(new Error("root status unreadable"), { code: "EIO" }); }
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+			fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+			for (let i = 0; i < 130 && !denied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(denied, true);
+			assert.deepEqual(holds, [true]);
+		} else fs.rmSync(statusPath);
+		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
+		if (startedRoute) {
+			await new Promise(resolve => originalSetTimeout(resolve, 100));
+			assert.equal(provider.isActive(), true, "independent child still contributes liveness");
+			assert.deepEqual(holds, [true]);
+			writeNestedEvent(startedRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: runId, child: { ...ackChild, state: "complete" } });
+		}
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (provisionalReload) {
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (repeatReload) {
+		const proof = exitProof();
+		const stat = fsDefault.statSync;
+		const readdir = fsDefault.readdirSync;
+		let listingDenied = false;
+		let denyListing = false;
+		let denyStatus = false;
+		let statusDenied = false;
+		fsDefault.readdirSync = (dir, ...args) => {
+			if (denyListing && String(dir) === path.join(DIRS.async, ACTIVE_RUN_INDEX_DIR)) {
+				listingDenied = true;
+				throw Object.assign(new Error("active listing inaccessible"), { code: "EACCES" });
+			}
+			return readdir(dir, ...args);
+		};
+		let denyResult = !publishedReload;
+		fsDefault.statSync = (file, ...args) => {
+			if (denyStatus && String(file) === path.join(asyncDir, "status.json")) {
+				statusDenied = true;
+				throw Object.assign(new Error("temporarily inaccessible status"), { code: ackStatusEIO ? "EIO" : "EACCES" });
+			}
+			if (denyResult && (String(file).includes("result-pending") || (publishedReload && String(file) === resultFilePath(DIRS.results, runId)))) {
+				throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+			}
+			return stat(file, ...args);
+		};
+		syncBuiltinESMExports();
+		try {
+			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+			writeStatus("complete", proof);
+			if (publishedReload) publishResult();
+			if (workflowReload || publishedReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			if (ackStatusEIO) publishResult(false, true);
+			denyResult = true;
+			if (noStatusReload) fs.rmSync(path.join(asyncDir, "status.json"));
+			if (vanishedResult) fs.rmSync(resultFilePath(DIRS.results, runId));
+			assert.equal(readActiveRunIndex(DIRS.async)?.includes(runId), false);
+			for (let i = 0; i < (vanishedResult ? 0 : 2); i++) {
+				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+				handlers.clear();
+				holds.length = 0;
+				denyStatus = ackStatusEIO || (i === 0 && !workflowReload && !publishedReload);
+				denyListing = i === 0 && publishedReload;
+				registerSubagentExtension(pi);
+				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+				if (denyStatus) assert.equal(statusDenied, true);
+				if (denyListing) assert.equal(listingDenied, true);
+				assert.deepEqual(holds, [true]);
+				assert.equal(provider.isActive(), true);
+			}
+			if (ackStatusEIO) {
+				denyResult = false;
+				if (ackRoute) {
+					for (let i = 0; i < 120 && fs.existsSync(resultFilePath(DIRS.results, runId)); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+					assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+					assert.equal(provider.isActive(), true, "acknowledgement must not clear independent nested work");
+					assert.deepEqual(holds, [true]);
+					writeNestedEvent(ackRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: runId, child: { ...ackChild, state: "complete" } });
+				}
+				for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(provider.isActive(), false, "acknowledgement settles without status recovery");
+				assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+			}
+		} finally {
+			fsDefault.statSync = stat;
+			fsDefault.readdirSync = readdir;
+			syncBuiltinESMExports();
+		}
+		if (publishedReload && !vanishedResult && !ackStatusEIO) {
+			ctx.isIdle = () => true;
+			rejectNextSend = false;
+			const sent = nextSend();
+			publishResult();
+			const accepted = await sent;
+			assert.equal(accepted.rejected, false);
+			assert.equal(provider.isActive(), true);
+			assert.deepEqual(holds, [true]);
+			for (const handler of handlers.get("agent_start")) handler({}, ctx);
+			for (const handler of handlers.get("message_start")) handler({ message: { role: "custom", ...accepted.message } });
+			for (const handler of handlers.get("agent_settled") ?? []) await handler({}, ctx);
+		}
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
 
 	let send;
-	if (process.argv[1] === "event") {
+	if (process.argv[1] === "event" || pendingCase) {
 		// Detached-workflow reconciliation publishes the result and emits the
 		// completion event before the status watcher sees the terminal state.
 		writeStatus("complete");
-		publishResult();
+		publishResult(pendingCase);
+		if (pendingCase) assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		send = nextSend();
-		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
+		const stat = fsDefault.statSync;
+		let pendingProbeDenied = false;
+		let trackerRetryDenied = false;
+		if (pendingCase) {
+			fsDefault.statSync = (file, ...args) => {
+				if (String(file).includes("result-pending")) {
+					pendingProbeDenied = true;
+					if ((new Error().stack ?? "").includes("/src/runs/background/async-job-tracker.ts")) trackerRetryDenied = true;
+					throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+				}
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
+		try {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
+			if (pendingCase) {
+				assert.equal(pendingProbeDenied, true);
+				for (let i = 0; i < 130 && !trackerRetryDenied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(trackerRetryDenied, true, "terminal tracker retried before storage became readable");
+				assert.deepEqual(holds, [true]);
+				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+			}
+		} finally {
+			if (pendingCase) {
+				fsDefault.statSync = stat;
+				syncBuiltinESMExports();
+			}
+		}
 		assert.equal((await send).rejected, true);
 		assert.equal(provider.isActive(), true, "a completion event with a rejected send keeps the result owed");
 	} else {
@@ -124,13 +561,80 @@ const terminalBeforePublicationScript = String.raw`
 			const timer = originalSetTimeout(() => { watcher.close(); resolve(); }, 6_000);
 			const watcher = fs.watch(asyncDir, () => { originalClearTimeout(timer); watcher.close(); resolve(); });
 		});
-		writeStatus("complete");
-		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
-		await observed;
-		await new Promise((resolve) => originalSetTimeout(resolve, 50));
+		const proof = exitProof();
+		if (closedFirst && !statusOnlyClosure) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+		const mismatchedPending = path.join(DIRS.results, "result-pending", sessionId, runId + ".json");
+		if (statusOnlyClosure) {
+			fs.mkdirSync(path.dirname(mismatchedPending), { recursive: true });
+			writeAtomicJson(mismatchedPending, { id: "different-run", sessionId });
+		}
+		const originalRead = fsDefault.readFileSync;
+		let indexReadFailed = false;
+		if (indexDenied) {
+			fsDefault.readFileSync = (file, ...args) => {
+				if (String(file).includes(path.sep + "result-index" + path.sep) && new Error().stack.includes("at refreshJob")) {
+					indexReadFailed = true;
+					throw Object.assign(new Error("result index temporarily unreadable"), { code: "EACCES" });
+				}
+				return originalRead(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
+		try {
+			writeStatus("complete", closedFirst ? proof : undefined);
+			events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, closedFirst ? proof : { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
+			await observed;
+			await new Promise((resolve) => originalSetTimeout(resolve, 50));
+			if (indexDenied) {
+				for (let i = 0; i < 120 && !indexReadFailed; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(indexReadFailed, true);
+				assert.deepEqual(holds, [true]);
+			}
+		} finally {
+			if (indexDenied) {
+				fsDefault.readFileSync = originalRead;
+				syncBuiltinESMExports();
+			}
+		}
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
-		assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
+		if (!closedFirst) assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
 
+		if (closedCase) {
+			if (!closedFirst) {
+				assert.deepEqual(holds, [true]);
+				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
+				const stat = fsDefault.statSync;
+				let denied = false;
+				fsDefault.statSync = (file, ...args) => {
+					if (String(file).includes("result-pending")) {
+						denied = true;
+						throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+					}
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				try {
+					writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+					events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+					for (let i = 0; i < 130 && !denied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+					assert.equal(denied, true);
+					assert.deepEqual(holds, [true]);
+				} finally {
+					fsDefault.statSync = stat;
+					syncBuiltinESMExports();
+				}
+				events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+			}
+			for (let i = 0; i < 130 && holds.at(-1) === true; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.deepEqual(holds, [true, false]);
+			assert.equal(reports.some(report => /state=done:/.test(report)), true);
+			assert.equal(provider.isActive(), false);
+			assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+			if (statusOnlyClosure) assert.equal(JSON.parse(fs.readFileSync(mismatchedPending, "utf-8")).id, "different-run");
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+			process.stdout.write("ok");
+			process.exit(0);
+		}
 		send = nextSend();
 		publishResult();
 		assert.equal((await send).rejected, true);
@@ -153,6 +657,37 @@ describe("session liveness through result delivery", () => {
 	for (const [mode, title] of [
 		["status", "stays live from a child's terminal status through a rejected send until its wake starts"],
 		["event", "stays live when a completion event ends the job before its status refresh and the send is rejected"],
+		["pending", "holds detached terminal status while a pending-only result is temporarily inaccessible"],
+		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
+		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
+		["closed-overlay", "settles with validated status-only closure and leaves a mismatched pending result untouched"],
+		["closed-index-alias", "retains a closed writer hold while its indexed public alias is inaccessible"],
+		["closed-event-alias", "retains a completion event hold while its indexed public alias is inaccessible"],
+		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
+		["forget-restored", "settles a restored hold after status disappears with no payload"],
+		["forget-started", "settles a start-event terminal hold after status disappears and writer closes"],
+		["in-place-close-eio", "settles a closed start-event writer with no payload under persistent in-place EIO"],
+		["forget-published-started", "settles a start-event terminal hold after result delivery and status loss"],
+		["forget-completion-first", "settles a statusless writer whose completion event preceded the first terminal refresh"],
+		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
+		["statusless-writer-close-eio", "settles verified writer closure with no payload and persistent status EIO"],
+		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
+		["closed-index-denied", "holds closed writer publication during a denied result index read"],
+		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
+		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
+		["provisional-reload", "second reload preserves a markerless terminal publication through status EIO"],
+		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
+		["inherited-reclaimed", "original session reopening releases its successor's inherited hold"],
+		["inherited-reclaimed-after-reload", "original session reopening releases its successor's inherited placeholder after reload"],
+		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
+		["mismatched-running-marker", "does not restore running status claiming a run ID different from the active marker"],
+		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
+		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
+		["published-reload", "published delivery remains held on reload even when active listing fails"],
+		["published-no-status-reload", "holds an unreadable published result across reload with no status file"],
+		["published-vanished", "clears delivery debt when a previously visible result disappears without delivery"],
+		["published-ack-status-eio", "settles an acknowledged result despite persistent root status EIO"],
+		["published-ack-nested-eio", "preserves nested work after acknowledgement during persistent root status EIO"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {
@@ -198,6 +733,15 @@ describe("session liveness through result delivery", () => {
 			id, runId: id, sessionId, completionOwnerId: currentCompletionOwnerId(), success: false, summary: `${id} needs the parent`,
 		});
 		const activeAt: Record<string, boolean | undefined> = {};
+		const terminalHolds: boolean[] = [];
+		const timeline: string[] = [];
+		const holdsAtSettle: Array<boolean | undefined> = [];
+		const term = process.env.TERM;
+		const programStatus = process.env.PI_PROGRAM_STATUS;
+		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
+		const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 		const faux = fauxProvider({ provider: "session-liveness", models: [{ id: "local" }], tokensPerSecond: 100_000 });
 		faux.setResponses([
 			() => fauxAssistantMessage("First reply."),
@@ -210,7 +754,6 @@ describe("session liveness through result delivery", () => {
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			extensionFactories: [
 				(api) => { api.registerProvider(faux.provider); },
-				registerSubagentExtension,
 				(api) => {
 					api.on("agent_start", () => {
 						if ("duringTurn" in activeAt) return;
@@ -226,6 +769,7 @@ describe("session liveness through result delivery", () => {
 						activeAt.atSettle = provider?.isActive();
 					});
 				},
+				registerSubagentExtension,
 			],
 		});
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -233,13 +777,35 @@ describe("session liveness through result delivery", () => {
 			await resourceLoader.reload();
 			const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json"), allowModelNetwork: false });
 			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
-			await session.bindExtensions({});
+			await session.bindExtensions({ mode: "tui", uiContext: {
+				setWidget() {}, setStatus() {},
+				setBackgroundWork: (_key: string, active: boolean) => {
+					terminalHolds.push(active);
+					timeline.push(`hold:${active}`);
+				},
+			} as unknown as NonNullable<Parameters<typeof session.bindExtensions>[0]["uiContext"]> });
+			session.subscribe((event) => {
+				if (event.type === "agent_start") timeline.push("start");
+				if (event.type === "agent_settled") {
+					holdsAtSettle.push(terminalHolds.at(-1));
+					timeline.push("settle");
+				}
+			});
 			await session.prompt("Start the original turn.");
+			assert.equal(holdsAtSettle[0], true, "the first settle retains the queued completion hold");
+			assert.deepEqual(terminalHolds, [true, false], "terminal hold clears only after the final follow-up");
+			assert.deepEqual(timeline.slice(-3), ["start", "hold:false", "settle"]);
 			assert.deepEqual(activeAt, { duringTurn: true, atSettle: true, finalSettle: false });
 			assert.equal(session.messages.filter((message) => message.role === "custom" && message.customType === "subagent-notify").length, 2, "Pi started both queued wakes");
 			await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 		} finally {
 			session?.dispose();
+			if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (term === undefined) delete process.env.TERM;
+			else process.env.TERM = term;
+			if (programStatus === undefined) delete process.env.PI_PROGRAM_STATUS;
+			else process.env.PI_PROGRAM_STATUS = programStatus;
 			delete (globalThis as Record<PropertyKey, unknown>)[registryKey];
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -258,6 +824,13 @@ describe("session liveness through result delivery", () => {
 		const previousRegistry = globals[registryKey];
 		let provider: { isActive(): boolean } | undefined;
 		let registrations = 0;
+		const terminalHolds: boolean[] = [];
+		const term = process.env.TERM;
+		const programStatus = process.env.PI_PROGRAM_STATUS;
+		const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
+		Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 		globals[registryKey] = {
 			version: 1,
 			register(value: { isActive(): boolean }) {
@@ -300,6 +873,7 @@ describe("session liveness through result delivery", () => {
 						pendingMessageCount: session!.pendingMessageCount,
 						noticeAppended: session!.messages.some((message) => message.role === "custom" && message.customType === "subagent-notify"),
 						activeAfterReload: provider?.isActive(),
+						terminalHoldsAfterReload: [...terminalHolds],
 					};
 				});
 			}],
@@ -308,9 +882,10 @@ describe("session liveness through result delivery", () => {
 			await resourceLoader.reload();
 			const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json"), allowModelNetwork: false });
 			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
-			// With no bindings, SDK reload skips session_start. Bind an error listener
-			// to exercise the real reload lifecycle.
-			await session.bindExtensions({ onError: (error) => { errors.push(error); } });
+			await session.bindExtensions({ mode: "tui", onError: (error) => { errors.push(error); }, uiContext: {
+				setWidget() {}, setStatus() {},
+				setBackgroundWork: (_key: string, active: boolean) => terminalHolds.push(active),
+			} as unknown as NonNullable<Parameters<typeof session.bindExtensions>[0]["uiContext"]> });
 			await session.prompt("Yield with a completion pending.");
 			assert.equal(reloaded, true);
 			assert.deepEqual(errors, []);
@@ -321,12 +896,20 @@ describe("session liveness through result delivery", () => {
 				pendingMessageCount: 0, // Pi's deferred settled action is not counted as a pending message
 				noticeAppended: false, // the notice starts the run Pi deferred past agent_settled, so it is not in the session yet
 				activeAfterReload: true, // the retained wake owns liveness until that deferred run starts
+				terminalHoldsAfterReload: [true, true],
 			});
+			assert.deepEqual(terminalHolds, [true, true, false], "only follow-up settlement releases the replacement hold");
 			assert.equal(provider?.isActive(), false, "the woken run releases the retained wake");
 			assert.equal(session.getLastAssistantText(), "Processed completion after reload.");
 		} finally {
 			if (session) await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 			session?.dispose();
+			if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (term === undefined) delete process.env.TERM;
+			else process.env.TERM = term;
+			if (programStatus === undefined) delete process.env.PI_PROGRAM_STATUS;
+			else process.env.PI_PROGRAM_STATUS = programStatus;
 			if (previousRegistry === undefined) delete globals[registryKey];
 			else globals[registryKey] = previousRegistry;
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

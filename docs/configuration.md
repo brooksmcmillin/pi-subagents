@@ -386,6 +386,8 @@ Sets the layout of the unfolded under-editor async widget. Defaults to `"adaptiv
 
 Reports each background run's state to the terminal with [OSC 7501, the Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status), so a terminal that supports it (Ghostty and Rex, for example) can show which runs are working, waiting on you, finished, or failed. It defaults to `true`; set it to `false` to send nothing. Terminals that don't support OSC 7501 ignore it, so turn it off only if your terminal prints unknown escape sequences.
 
+Finished and failed run records wait until background work and result delivery have drained and the parent is idle. When Pi supports the background-work UI hook, its root status also stays working across the handoff. Requests that need your input are still reported separately.
+
 Reports are sent only from an interactive TUI session whose standard output is a terminal and whose `TERM` is not `dumb`, and only when a record changes. `PI_PROGRAM_STATUS=0`, Pi's own switch for its OSC 7501 reports, turns these off too. Each run gets its own record under `subagents/`: `subagents/<run>` for a run, where `<run>` is the first 12 characters of its run id, and `subagents/<workflow-run>.<key>` for a background workflow child. A key made only of letters, digits, `_`, `+` and `-`, and at most 19 characters long, is used as is; any other key becomes its first 12 characters (other characters replaced by `-`) plus a short hash of the full key, so different keys never share an id. Workflow children are siblings of their workflow's record, not nested under it, so clearing a finished workflow never removes a running child. The root record belongs to Pi itself, so this extension never writes it.
 
 | Run | Reported state |

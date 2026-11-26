@@ -4,6 +4,9 @@ import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { hasLiveSubagentWork } from "../../src/integrations/pi-web-session-liveness.ts";
+import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
+import { createParentWake } from "../../src/shared/parent-wake.ts";
 import type { AsyncStatus, SubagentState } from "../../src/shared/types.ts";
 import { readActiveRunIndex, releaseActiveRunIndex, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
@@ -99,6 +102,32 @@ describe("subagent run id resolver", () => {
 			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("releases the foreground status hold after Esc without restarting the parent", () => {
+		const state = stateWithForeground("detached");
+		const control = state.foregroundControls.get("detached")!;
+		control.schedulingOwners = 1;
+		const holds: boolean[] = [];
+		const triggers: Array<boolean | undefined> = [];
+		const wake = createParentWake({ sendMessage(_notice, options) { triggers.push(options?.triggerTurn); } });
+		wake.bindSession({ isIdle: () => true, sessionManager: { getSessionId: () => "owner" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
+		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
+			hasBackgroundWork: () => hasLiveSubagentWork(state), hasPendingWake: wake.isPending,
+			isTTY: true, env: { TERM: "xterm-256color" }, });
+		reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) });
+		try {
+			wake.userAborted();
+			wake.sendMessage({ customType: "subagent-notify", content: "finished", display: true }, { triggerTurn: true });
+			assert.deepEqual(triggers, [false]);
+			assert.deepEqual(holds, [true]);
+			control.schedulingOwners = 0;
+			assert.equal(removeForegroundControlIfIdle(state, "detached", undefined, reporter.sync), true);
+			assert.deepEqual(holds, [true, false]);
+			assert.equal(state.retainedForegroundNestedRoutes?.size ?? 0, 0);
+		} finally {
+			reporter.dispose();
 		}
 	});
 

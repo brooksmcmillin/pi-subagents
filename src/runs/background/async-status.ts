@@ -5,7 +5,7 @@ import { previewDisplayText } from "../../shared/display-text.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNode, type HostStepState, type LaunchResolvedChildExtensions, type RuntimeAcknowledgedChildExtensions, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflight, type WorkflowGraphSnapshot } from "../../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
-import { isStatusAccessError, readStatus } from "../../shared/utils.ts";
+import { isStatusAccessError, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
@@ -156,6 +156,8 @@ export interface AsyncRunSummary {
 
 interface AsyncRunListOptions {
 	states?: Array<AsyncRunSummary["state"]>;
+	/** Include active-marker runs whose writer may still be publishing a terminal result. */
+	includeTerminalPublication?: boolean;
 	sessionId?: string;
 	limit?: number;
 	/** Limits terminal candidates using the timestamp embedded in index marker names. */
@@ -175,7 +177,9 @@ interface AsyncRunListOptions {
 	/** Receives the warning for a skipped corrupt terminal status, so an open TUI can show it as a notice instead of console output. */
 	onCorruptStatus?: (warning: string) => void;
 	/** Receives an active run kept in the index whose status.json this process may not read. */
-	onUnreadableActiveRun?: (runId: string, asyncDir: string) => void;
+	onUnreadableActiveRun?: (runId: string, asyncDir: string, verifiedSessionId?: string) => void;
+	expectedRetrySessions?: ReadonlyMap<string, string>;
+	trackedRuns?: ReadonlySet<string>;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -542,6 +546,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			const indexed = new Set<string>();
 			if (wantsActive) {
 				for (const entry of readActiveRunIndex(asyncDirRoot) ?? []) {
+					if (options.trackedRuns?.has(entry)) continue;
 					if (resolveTargetedAsyncRun(asyncDirRoot, entry).kind === "exact") {
 						indexed.add(entry);
 						activeEntries.add(entry);
@@ -583,27 +588,44 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	for (const entry of entries) {
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
+		let owned = false;
+		let verifiedSessionId = options.expectedRetrySessions?.get(entry);
+		if (verifiedSessionId && owners && !owners.has(verifiedSessionId)) continue;
+		const verifyMarker = verifiedSessionId !== undefined || (options.includeTerminalPublication && activeEntries.has(entry));
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
-			let owned = false;
-			if (owners) {
+			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
-				if (stored && !owners.has(stored.sessionId)) {
+				if (verifyMarker && owners && !stored) {
+					if (activeEntries.has(entry)) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
+					continue;
+				}
+				if (verifyMarker && stored && (stored.runId !== entry || (verifiedSessionId && stored.sessionId !== verifiedSessionId))) continue;
+				if (stored && owners && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
 				}
-				owned = stored !== null;
+				owned = Boolean(owners && stored);
+				if (owned) verifiedSessionId = stored?.sessionId;
 			}
 			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined }, observeStatus);
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined, expectedRunId: verifyMarker ? entry : undefined, expectedSessionId: verifyMarker ? verifiedSessionId : undefined }, observeStatus);
+			if (verifyMarker && reconciliation && !reconciliation.status && verifiedSessionId) {
+				if (reconciliation.statusMissing) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
+				continue;
+			}
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
 			observeStatus?.(null);
+			if (verifyMarker && owned && !isStatusAccessError(error, asyncDir) && isStorageAccessError(error)) {
+				options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
+				continue;
+			}
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
-			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir);
+			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
 			continue;
 		}
 		if (!status) {
@@ -611,10 +633,18 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
 			continue;
 		}
+		const terminalPublication = options.includeTerminalPublication && activeEntries.has(entry) && status.mode !== "workflow"
+			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
+		if (options.includeTerminalPublication && activeEntries.has(entry) && status.runId !== entry) continue;
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
-			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
-			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
-				updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
+			try {
+				const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
+				if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
+					updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
+				}
+			} catch (error) {
+				// Marker housekeeping must not discard the other restored jobs.
+				if (!verifyMarker || !owned || !isStorageAccessError(error)) throw error;
 			}
 		}
 		if (status.displayDismissedAt !== undefined) continue;
@@ -622,7 +652,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		// the nested-events directory, so deferring it for filtered-out runs keeps
 		// restoration at load from scanning that directory when no active runs
 		// match.
-		if (allowedStates && !allowedStates.has(status.state)) continue;
+		if (allowedStates && !allowedStates.has(status.state) && !terminalPublication) continue;
 		if (owners && !owners.has(status.sessionId)) continue;
 		const nestedWarnings: string[] = [];
 		let nestedRoute: NestedRoute | undefined;

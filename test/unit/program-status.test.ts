@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
 import { registerProgramStatusReporter, type ProgramStatusReporter } from "../../src/integrations/program-status.ts";
+import { createParentWake } from "../../src/shared/parent-wake.ts";
 import type { AsyncJobState } from "../../src/shared/types.ts";
 
 type Job = Pick<AsyncJobState, "asyncId" | "status"> & Partial<AsyncJobState>;
@@ -25,21 +26,27 @@ function decode(report: string): Record<string, string> {
 
 const reporters: ProgramStatusReporter[] = [];
 
-function reporter(input: { jobs?: Job[]; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
+function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWakes?: () => Iterable<string>; session?: { manager: object; id: string }; isParentPreparing?: () => boolean; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
 	const writes: string[] = [];
 	const jobs = new Map<string, AsyncJobState>((input.jobs ?? []).map((entry) => [entry.asyncId, entry as AsyncJobState]));
 	const pending = input.pending ?? [];
+	const holds: boolean[] = [];
 	const instance = registerProgramStatusReporter({
 		enabled: input.enabled ?? true,
 		getJobs: () => jobs.values(),
+		hasBackgroundWork: input.hasBackgroundWork ?? (() => false),
+		hasPendingWake: input.hasPendingWake,
+		getQueuedWakes: input.getQueuedWakes,
+		isParentPreparing: input.isParentPreparing,
+		now: input.now,
 		getPendingRequests: () => pending,
 		write: (data) => writes.push(data),
 		isTTY: input.isTTY ?? true,
 		env: input.env ?? { TERM: "xterm-ghostty" },
 	});
-	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui" });
+	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui", session: input.session, setBackgroundWork: (_key, active) => holds.push(active) });
 	reporters.push(instance);
-	return { instance, writes, jobs, pending, records: () => writes.map(decode) };
+	return { instance, writes, jobs, pending, holds, records: () => writes.map(decode) };
 }
 
 describe("OSC 7501 program status", () => {
@@ -120,6 +127,181 @@ describe("OSC 7501 program status", () => {
 		idle.jobs.set("late", job("late", "failed"));
 		idle.instance.sync();
 		assert.equal(idle.records().at(-1)?.state, "error");
+	});
+
+	it("defers terminal completions until parallel work, delivery, and the parent follow-up drain", () => {
+		let pendingDelivery = false;
+		let liveWork = true;
+		const { instance, jobs, records, holds } = reporter({
+			jobs: [job("first", "running"), job("second", "running")],
+			hasBackgroundWork: () => liveWork || pendingDelivery,
+		});
+		instance.agentStarted();
+		jobs.set("first", job("first", "complete"));
+		instance.agentSettled();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done"));
+
+		jobs.set("second", job("second", "failed"));
+		liveWork = false;
+		pendingDelivery = true;
+		instance.sync();
+		assert.ok(!records().some(({ state }) => state === "done" || state === "error"));
+
+		instance.agentStarted();
+		pendingDelivery = false;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done" || state === "error"));
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.deepEqual(records().filter(({ state }) => state === "done" || state === "error").map(({ state }) => state), ["done", "error"]);
+	});
+
+	it("keeps a queued result across a long busy turn and into its follow-up", () => {
+		let now = 0;
+		let queuedWake: string | undefined;
+		let preparing = false;
+		let running = true;
+		const { instance, jobs, holds, records } = reporter({ jobs: [job("review", "running")],
+			hasBackgroundWork: () => running, getQueuedWakes: () => queuedWake ? [queuedWake] : [], isParentPreparing: () => preparing, now: () => now });
+		instance.agentStarted();
+		queuedWake = "busy-turn-result";
+		running = false;
+		jobs.get("review")!.status = "complete";
+		instance.sync();
+		now += 60_000;
+		instance.agentSettled();
+		preparing = true;
+		now += 60_000;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.ok(!records().some(({ state }) => state === "done"));
+		instance.agentStarted();
+		queuedWake = undefined;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
+	it("holds a busy wait-subscription wake after a non-waking result is delivered", () => {
+		let now = 0;
+		let idle = true;
+		let delivering = true;
+		const wake = createParentWake({ sendMessage() {} }, () => now);
+		wake.bindSession({ isIdle: () => idle, sessionManager: { getSessionId: () => "wait" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
+		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")],
+			hasBackgroundWork: () => delivering, getQueuedWakes: wake.getQueuedWaits, isParentPreparing: () => !idle, now: () => now });
+		instance.agentStarted();
+		idle = false;
+		const notice = { customType: "subagent-wait-subscription", content: "review ready", display: true };
+		wake.sendMessage(notice, { triggerTurn: true });
+		delivering = false;
+		instance.sync();
+		idle = true;
+		instance.agentSettled();
+		idle = false;
+		now += 60_000;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.deepEqual(records(), []);
+		instance.agentStarted();
+		wake.messageStarted({ role: "custom", ...notice });
+		assert.deepEqual([...wake.getQueuedWaits()], []);
+		idle = true;
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
+	it("holds a deferred compaction wake across its transition to a parent wake", () => {
+		let now = 0;
+		let compacting = true;
+		let deferred = true;
+		let pending = false;
+		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")], now: () => now,
+			hasPendingWake: () => (deferred && compacting) || pending,
+			getQueuedWakes: () => deferred ? ["compaction"] : [] });
+		now += 60_000;
+		instance.sync();
+		compacting = false;
+		instance.sync();
+		deferred = false;
+		pending = true;
+		instance.sync();
+		assert.deepEqual(holds, [true]);
+		assert.deepEqual(records(), []);
+		instance.agentStarted();
+		pending = false;
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
+	it("releases a failed wake after its reservation expires, but not while Pi is preparing it", (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		let now = 0;
+		let idle = true;
+		const wake = createParentWake({ sendMessage() {} }, () => now);
+		wake.bindSession({ isIdle: () => idle, sessionManager: { getSessionId: () => "status" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
+		wake.sendMessage({ customType: "review", content: "result", display: false }, { triggerTurn: true });
+		const { holds, records } = reporter({ jobs: [job("review", "complete")], hasPendingWake: wake.isPending });
+		const advance = (ms: number) => { now += ms; t.mock.timers.tick(ms); };
+		advance(9_000);
+		assert.deepEqual(holds, [true]);
+		idle = false;
+		advance(2_000);
+		assert.deepEqual(holds, [true], "preparation keeps the expired reservation live");
+		assert.deepEqual(records(), []);
+		idle = true;
+		advance(1_000);
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(records().at(-1)?.state, "done");
+	});
+
+	it("does not rearm an expired queued wake on an unrelated turn", () => {
+		let now = 0;
+		const queued = ["result:first"];
+		const options = { getQueuedWakes: () => queued, now: () => now, session: { manager: {}, id: "parent" } };
+		const { instance, holds } = reporter(options);
+		now += 60_000;
+		instance.sync();
+		assert.deepEqual(holds, [true, false]);
+		instance.agentStarted();
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		instance.dispose("reload");
+		const replacement = reporter(options);
+		assert.deepEqual(replacement.holds, [], "reload does not rearm the same notice");
+		queued.push("wait:second");
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true], "the older notice cannot mask a fresh wait wake");
+		queued.pop();
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true, false]);
+		replacement.instance.dispose("quit");
+	});
+
+	it("retains a live wake when preparation spans reload and its original deadline", () => {
+		let now = 0;
+		let queued = ["result:preparing"];
+		const options = { getQueuedWakes: () => queued, now: () => now, isParentPreparing: () => true,
+			session: { manager: {}, id: "parent" } };
+		const original = reporter(options);
+		assert.deepEqual(original.holds, [true]);
+		original.instance.dispose("reload");
+		now += 60_000;
+		const replacement = reporter(options);
+		assert.deepEqual(replacement.holds, [true]);
+		replacement.instance.agentStarted();
+		queued = [];
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true]);
+		replacement.instance.agentSettled();
+		assert.deepEqual(replacement.holds, [true, false]);
+		replacement.instance.dispose("quit");
 	});
 
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {

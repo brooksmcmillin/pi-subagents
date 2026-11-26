@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
@@ -316,6 +317,29 @@ describe("inspect-rpc reply content", () => {
 		const reply = buildInspectReply({ requestId: "r-replay-legacy-single", asyncId: "run-replay-legacy-single" }, makeDeps(root, resultsDir));
 		assert.equal(reply.error, undefined);
 		assert.equal(reply.finalOutput, "finished output");
+	});
+	for (const foreign of [false, true]) it(`uses only an owned durable replay on index EIO (${foreign ? "foreign" : "owned"})`, (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-replay-index-eio-"));
+		const runId = "run-index-eio";
+		const { resultsDir } = makeRun(root, { runId });
+		const sessionId = foreign ? "other-session" : SESSION_ID;
+		recordWaitCompletion(makeState(root), runId, { runId, sessionId, results: [{ agent: "worker", output: "saved output" }] },
+			Date.now(), 60_000, { resultsDir, sessionId });
+		const read = fs.readFileSync;
+		let denied = false;
+		fs.readFileSync = ((file, ...args) => {
+			if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				denied = true;
+				throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+			}
+			return read(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		t.after(() => { fs.readFileSync = read; syncBuiltinESMExports(); fs.rmSync(root, { recursive: true, force: true }); });
+		const reply = buildInspectReply({ requestId: "r-index-eio", asyncId: runId }, makeDeps(root, resultsDir));
+		assert.equal(denied, true);
+		assert.equal(reply.error, undefined);
+		assert.equal(reply.finalOutput, foreign ? undefined : "saved output");
 	});
 	it("returns output from a durable replay artifact without exposing its path", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-replay-artifact-"));

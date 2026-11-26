@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -171,11 +172,23 @@ function successResult(asyncId: string): { content: [{ type: "text"; text: strin
 }
 
 describe("acknowledged steering action", () => {
-	it("returns delivered only after the runner records child-session acceptance", async () => {
+	for (const indexEio of [false, true]) it(`returns delivered after runner acceptance${indexEio ? " despite completion index EIO" : ""}`, async () => {
 		const runId = `steer-delivered-${Date.now().toString(36)}`;
 		const asyncDir = path.join(ASYNC_DIR, runId);
 		writeStatus(asyncDir, runningStatus(runId));
+		const read = fs.readFileSync;
+		let denied = false;
 		try {
+			if (indexEio) {
+				fs.readFileSync = ((file, ...args) => {
+					if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === `${runId}.json`) {
+						denied = true;
+						throw Object.assign(new Error("completion index unreadable"), { code: "EIO" });
+					}
+					return read(file, ...args);
+				}) as typeof fs.readFileSync;
+				syncBuiltinESMExports();
+			}
 			const action = steerAsyncRun({ state: createState(), runId, message: "correct course", location: { asyncDir }, ackTimeoutMs: 500, kill: () => true });
 			const request = await readRequest(asyncDir);
 			assert.deepEqual(request.targetIndexes, [0]);
@@ -189,7 +202,10 @@ describe("acknowledged steering action", () => {
 			assert.equal(result.details.steering?.state, "delivered");
 			assert.match(result.content[0]!.text, /Steering delivered/);
 			assert.match(result.content[0]!.text, /Message sent:\n```text\ncorrect course\n```/);
+			assert.equal(denied, indexEio);
 		} finally {
+			fs.readFileSync = read;
+			syncBuiltinESMExports();
 			removeAsyncDir(asyncDir);
 		}
 	});

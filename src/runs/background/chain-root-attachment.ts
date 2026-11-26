@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
+import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun } from "./result-files.ts";
 import type { AcceptanceLedger, ArtifactPaths, AsyncStatus, CostSummary, EffectsProjection, ExecutionProjection, Usage } from "../../shared/types.ts";
-import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, readStatus } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 
 export interface ImportedAsyncRoot {
 	runId: string;
@@ -14,7 +14,7 @@ export interface ImportedAsyncRoot {
 export interface ImportedAsyncRootResult {
 	agent: string;
 	/** `snapshot` is the payload text this result was built from, so cleanup can tell it from a newer one. */
-	importedPublication?: { sessionId?: string; toolCallId?: string; snapshot: string };
+	importedPublication?: { sessionId?: string; toolCallId?: string; snapshot: string; payloadPath?: string };
 	/** Human-readable display name for the child session, when derived at launch. */
 	sessionName?: string;
 	output: string;
@@ -84,7 +84,7 @@ interface AsyncResultFile {
 const TERMINAL_STATES = new Set(["complete", "failed", "partial", "paused", "stopped"]);
 const TERMINAL_STEP_STATUSES = new Set(["complete", "completed", "failed", "partial", "paused", "stopped"]);
 
-function readResultFile(resultPath: string): { data: AsyncResultFile; raw: string } | undefined {
+function readResultFile(resultPath: string): { data: AsyncResultFile; raw: string; payloadPath: string } | undefined {
 	let raw: string;
 	try {
 		raw = fs.readFileSync(resultPath, "utf-8");
@@ -94,14 +94,24 @@ function readResultFile(resultPath: string): { data: AsyncResultFile; raw: strin
 		}
 		throw error;
 	}
-	return { data: JSON.parse(raw) as AsyncResultFile, raw };
+	return { data: JSON.parse(raw) as AsyncResultFile, raw, payloadPath: resultPath };
 }
 
-function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): { data: AsyncResultFile; raw: string } | undefined {
+function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null, requireExactIdentity: boolean): ReturnType<typeof readResultFile> {
+	if (requireExactIdentity && status?.runId !== root.runId) return undefined;
 	const direct = readResultFile(root.resultPath);
-	if (direct || !status?.sessionId) return direct;
-	const indexedPath = resultPayloadPathForSessionRun(path.dirname(root.resultPath), status.sessionId, root.runId);
-	return indexedPath ? readResultFile(indexedPath) : undefined;
+	if (direct && (!requireExactIdentity || (status?.sessionId && resultPayloadMatchesSessionRun(direct.data, status.sessionId, root.runId)))) return direct;
+	if (!status?.sessionId) return undefined;
+	const resultsDir = path.dirname(root.resultPath);
+	let resultPath: string | undefined;
+	try {
+		resultPath = resultPayloadPathForSessionRun(resultsDir, status.sessionId, root.runId, undefined, { promote: false });
+	} catch (error) {
+		if (!isStorageAccessError(error)) throw error;
+		resultPath = fallbackResultPayloadPathForSessionRun(resultsDir, status.sessionId, root.runId);
+	}
+	const recovered = resultPath ? readResultFile(resultPath) : undefined;
+	return recovered && resultPayloadMatchesSessionRun(recovered.data, status.sessionId, root.runId) ? recovered : undefined;
 }
 
 function selectedStatusStep(status: AsyncStatus | null, index: number): NonNullable<AsyncStatus["steps"]>[number] | undefined {
@@ -183,7 +193,7 @@ function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, 
 	};
 }
 
-function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, { data: result, raw }: { data: AsyncResultFile; raw: string }): ImportedAsyncRootResult {
+function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, { data: result, raw, payloadPath }: NonNullable<ReturnType<typeof readResultFile>>): ImportedAsyncRootResult {
 	const child = result.results?.[root.index];
 	const step = selectedStatusStep(status, root.index);
 	const state = resultState(result, child);
@@ -201,6 +211,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 			...(typeof result.sessionId === "string" ? { sessionId: result.sessionId } : {}),
 			...(typeof result.toolCallId === "string" ? { toolCallId: result.toolCallId } : {}),
 			snapshot: raw,
+			...(payloadPath !== root.resultPath ? { payloadPath } : {}),
 		},
 		output: success ? output : (output || error || ""),
 		success,
@@ -232,7 +243,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 
 export async function waitForImportedAsyncRoot(
 	root: ImportedAsyncRoot,
-	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number; shouldAbort?: () => boolean; timeoutMessage?: string; abortedAsStopped?: boolean } = {},
+	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number; shouldAbort?: (status: AsyncStatus | null) => boolean; timeoutMessage?: string; abortedAsStopped?: boolean; requireExactIdentity?: boolean } = {},
 ): Promise<ImportedAsyncRootResult> {
 	const pollIntervalMs = options.pollIntervalMs ?? 500;
 	const terminalResultGraceMs = options.terminalResultGraceMs ?? 1_000;
@@ -240,9 +251,13 @@ export async function waitForImportedAsyncRoot(
 	let terminalSince: number | undefined;
 	for (;;) {
 		const status = readStatus(root.asyncDir);
-		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE, options.abortedAsStopped === true);
-		const result = readImportedResultFile(root, status);
-		if (result) return buildImportedResult(root, status, result);
+		if (options.shouldAbort?.(status)) return outputFromTimeout(root, status, options.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE, options.abortedAsStopped === true);
+		try {
+			const result = readImportedResultFile(root, status, options.requireExactIdentity === true);
+			if (result) return buildImportedResult(root, status, result);
+		} catch (error) {
+			if (!isStorageAccessError(error)) throw error;
+		}
 		if (isTerminalStatus(status, root.index)) {
 			terminalSince ??= now();
 			if (now() - terminalSince >= terminalResultGraceMs) {

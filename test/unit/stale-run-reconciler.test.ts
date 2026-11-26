@@ -890,6 +890,137 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	for (const payloadAlreadyPresent of [false, true]) it(`keeps final status written during the PID probe ${payloadAlreadyPresent ? "with a visible result" : "before result discovery"}`, () => {
+		const root = tempRoot("pi-stale-pid-finalized-");
+		try {
+			const asyncDir = path.join(root, "finished");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "finished.json");
+			const status = { runId: "finished", sessionId: "parent", mode: "single", state: "running", pid: 12345, pidNamespaceScope: "pid:[same]", startedAt: 1000 };
+			const finished = { ...status, state: "complete" };
+			const payload = { id: "finished", sessionId: "parent", success: true };
+			writeStatus(asyncDir, status);
+			if (payloadAlreadyPresent) writeAsyncResultFile(resultPath, payload);
+			let probed = false;
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "finished", expectedSessionId: "parent", resultsDir,
+				now: () => 2000, pidNamespaceScope: () => "pid:[same]",
+				kill: () => { probed = true; if (!payloadAlreadyPresent) writeAsyncResultFile(resultPath, payload); writeStatus(asyncDir, finished); throw errno("ESRCH"); } });
+			assert.equal(probed, true);
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.state, "complete");
+			assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf-8")), payload);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")), finished);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const matchingPayload of [false, true]) it(`reports missing exact status at the ${matchingPayload ? "result" : "failure"} repair pre-write check`, () => {
+		const root = tempRoot("pi-stale-prewrite-missing-");
+		try {
+			const asyncDir = path.join(root, "run");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "run.json");
+			const statusPath = path.join(asyncDir, "status.json");
+			writeStatus(asyncDir, { runId: "run", sessionId: "parent", mode: "single", state: "running", pid: 12345, pidNamespaceScope: "pid:[same]", startedAt: 1000 });
+			if (matchingPayload) writeAsyncResultFile(resultPath, { id: "run", sessionId: "parent", success: true });
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "run", expectedSessionId: "parent", resultsDir,
+				now: () => 2000, pidNamespaceScope: () => "pid:[same]", kill: () => { fs.rmSync(statusPath); throw errno("ESRCH"); } });
+			assert.deepEqual(result, { status: null, repaired: false, statusMissing: true });
+			assert.equal(fs.existsSync(statusPath), false);
+			assert.equal(fs.existsSync(resultPath), matchingPayload);
+			if (matchingPayload) assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf-8")).success, true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not publish failed repair after the PID probe finds a replaced session", () => {
+		const root = tempRoot("pi-stale-pid-session-swap-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const status = { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 };
+			writeStatus(asyncDir, status);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir,
+				kill: () => { writeStatus(asyncDir, { ...status, sessionId: "foreign-session" }); throw errno("ESRCH"); } });
+			assert.equal(result.repaired, false);
+			assert.equal(result.status, null);
+			assert.equal(fs.existsSync(resultsDir), false);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")), { ...status, sessionId: "foreign-session" });
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("settles a dead exact run without consuming or overwriting an unrelated public snapshot", () => {
+		const root = tempRoot("pi-stale-unrelated-result-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "dead.json");
+			const bytes = JSON.stringify({ id: "dead", sessionId: "other-session", success: true });
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 });
+			fs.mkdirSync(resultsDir);
+			fs.writeFileSync(resultPath, bytes);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir, kill: () => { throw errno("ESRCH"); } });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.resultPath, undefined);
+			assert.equal(result.noPublication, true);
+			assert.equal(fs.readFileSync(resultPath, "utf-8"), bytes);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const pendingOnly of [false, true]) it(`uses exact result bytes without promotion (pending: ${pendingOnly})`, () => {
+		const root = tempRoot("pi-stale-foreign-indexed-destination-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const alias = path.join(resultsDir, "indexed-alias.json");
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 });
+			const owned = { id: "dead", sessionId: "parent", success: true };
+			if (pendingOnly) writePendingAsyncResultFile(alias, owned);
+			else writeAsyncResultFile(alias, owned);
+			if (pendingOnly) fs.writeFileSync(alias, JSON.stringify({ id: "unrelated", sessionId: "other-session", success: true }));
+			const original = fs.readFileSync(alias, "utf-8");
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir, kill: () => { throw errno("ESRCH"); } });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "complete");
+			assert.ok(result.resultPath);
+			assert.equal(result.resultPath === alias, !pendingOnly);
+			assert.deepEqual(JSON.parse(fs.readFileSync(result.resultPath, "utf-8")), owned);
+			assert.equal(fs.readFileSync(alias, "utf-8"), original);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs from the canonical result when the indexed alias belongs to another session", () => {
+		const root = tempRoot("pi-stale-canonical-fallback-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const canonical = path.join(resultsDir, "dead.json");
+			const alias = path.join(resultsDir, "indexed-alias.json");
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", startedAt: 1000 });
+			const owned = { id: "dead", sessionId: "parent", success: true };
+			writeAsyncResultFile(alias, owned);
+			fs.renameSync(alias, canonical);
+			const foreign = JSON.stringify({ ...owned, sessionId: "other-session" });
+			fs.writeFileSync(alias, foreign);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "complete");
+			assert.equal(result.resultPath, canonical);
+			assert.equal(fs.readFileSync(alias, "utf-8"), foreign);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves an existing result instead of overwriting it with stale-run failure", () => {
 		const root = tempRoot("pi-stale-existing-result-");
 		try {

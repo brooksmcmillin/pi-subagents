@@ -9,12 +9,12 @@ export const STATUS_ACTION = "Check the run status and details above, then resum
 // A wake whose run never starts emits no agent_start; past this deadline an idle parent's wake counts as abandoned.
 // Pi persists the waking notice only when its run reaches message_end, so a run that never starts loses it;
 // notify.ts records undelivered subagent-notify notices at shutdown and replays them at the next start.
-const WAKE_PENDING_MS = 10_000;
+export const WAKE_PENDING_MS = 10_000;
 
 // Reload replaces extension instances, not Pi's session manager or a wake still starting.
 // The key and shape are shared with pi-intercom's idle wake: a wake prompt it sends is in
 // preflight until agent_start, and a second extension's wake must not start another run then.
-type WakeReservation = { sessionId: string; sentAt?: number };
+type WakeReservation = { sessionId: string; sentAt?: number; queuedWaits?: Set<string> };
 const reservationsSymbol = Symbol.for("pi.idle-wake.v1");
 const wakeGlobal = globalThis as typeof globalThis & { [reservationsSymbol]?: WeakMap<object, WakeReservation> };
 const reservations = wakeGlobal[reservationsSymbol] ?? (wakeGlobal[reservationsSymbol] = new WeakMap<object, WakeReservation>());
@@ -31,6 +31,8 @@ export interface ParentWake {
 	sendMessage(...args: Parameters<ExtensionAPI["sendMessage"]>): boolean;
 	/** True from an idle wake until its run starts or the session shuts down. Past the deadline it holds only while the parent is busy, which may still be the wake's preflight (for example compacting). */
 	isPending(): boolean;
+	getQueuedWaits(): Iterable<string>;
+	messageStarted(message: { role: string; customType?: string; content?: unknown }): void;
 	bindSession(ctx: Pick<ExtensionContext, "isIdle" | "sessionManager">): void;
 	agentStarted(): void;
 	/** The user stopped the parent run: hold wakes until the next run starts. */
@@ -38,6 +40,7 @@ export interface ParentWake {
 	isHeld(): boolean;
 	/** True once if a wake was only appended because a manual compaction was in progress. */
 	takeDeferredWake(): boolean;
+	hasDeferredWake(): boolean;
 	sessionShutdown(reason: string | undefined): void;
 }
 
@@ -78,11 +81,22 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage">, now: () 
 				pi.sendMessage(message, { triggerTurn: false });
 				return true;
 			}
-			if (ctx.isIdle()) reservation().sentAt = now();
+			const idle = ctx.isIdle();
+			const current = reservation();
+			if (idle) current.sentAt = now();
 			pi.sendMessage(message, options);
+			if (!idle && message.customType === "subagent-wait-subscription" && typeof message.content === "string") {
+				(current.queuedWaits ??= new Set()).add(message.content);
+			}
 			return false;
 		},
 		isPending: () => reservation().sentAt !== undefined && (reserved() || !ctx.isIdle()),
+		getQueuedWaits: () => reservation().queuedWaits?.values() ?? [],
+		messageStarted(message) {
+			if (message.role === "custom" && message.customType === "subagent-wait-subscription" && typeof message.content === "string") {
+				reservation().queuedWaits?.delete(message.content);
+			}
+		},
 		bindSession(context) {
 			ctx = context;
 			session = { manager: context.sessionManager, id: context.sessionManager.getSessionId() };
@@ -94,13 +108,18 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage">, now: () 
 		},
 		userAborted: () => { held = true; },
 		isHeld: () => held,
+		hasDeferredWake: () => deferred,
 		takeDeferredWake() {
 			const wasDeferred = deferred;
 			deferred = false;
 			return wasDeferred;
 		},
 		sessionShutdown(reason) {
-			if (reason !== "reload") reservation().sentAt = undefined;
+			if (reason !== "reload") {
+				const current = reservation();
+				current.sentAt = undefined;
+				current.queuedWaits?.clear();
+			}
 		},
 	};
 }

@@ -30,7 +30,7 @@ import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-import { cleanupResultIndexes, missionObserverResultCandidateFiles, resultFilePath } from "../runs/background/result-files.ts";
+import { cleanupResultIndexes, missionObserverResultCandidateFiles, indexedResultPayloadVisibility } from "../runs/background/result-files.ts";
 import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createResultDeliveryOwnership } from "../runs/background/result-delivery-ownership.ts";
@@ -469,8 +469,18 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			agents: merged.agents.map((agent) => agent.maxThinking === discovered.maxThinking ? agent : { ...agent, maxThinking: discovered.maxThinking }),
 		};
 	};
+	const hasOutstandingResults = () => owedResultRunIds.size > 0 || hasLiveSubagentWork(state);
 	const programStatus = registerProgramStatusReporter({
 		enabled: config.programStatus !== false,
+		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend() || resultWatcher.hasQueuedOwnedResults(),
+		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
+			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
+		getQueuedWakes: function* () {
+			for (const wake of completionNotifier.getUnstartedWakes()) yield `result:${wake}`;
+			for (const wake of parentWake.getQueuedWaits()) yield `wait:${wake}`;
+			if (parentWake.hasDeferredWake()) yield "compaction";
+		},
+		isParentPreparing: () => withLastUiContext((ctx) => !ctx.isIdle()) === true,
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
 		getPendingRequests: () => supervisorChannel.pending.values(),
@@ -479,11 +489,21 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		widgetEnabled: asyncWidgetEnabled,
 		widgetCollapsed: asyncWidgetCollapsed,
 		widgetLayout: asyncWidgetLayout,
-		onJobTerminal: (job) => {
-			holdOwedResult(job);
+		onJobTerminal: (job, publicationClosed) => {
+			if (publicationClosed) {
+				owedResultRunIds.delete(job.asyncId);
+			} else {
+				holdOwedResult(job);
+			}
 			refreshResultDelivery();
+			programStatus.sync();
 		},
-		onJobCleanup: (asyncId) => deliveredRunIds.delete(asyncId),
+		getOwedResultRunIds: () => owedResultRunIds,
+		hasDeliveredResult: (runId) => deliveredRunIds.has(runId),
+		onJobCleanup: (asyncId) => {
+			deliveredRunIds.delete(asyncId);
+			if (owedResultRunIds.delete(asyncId)) programStatus.sync();
+		},
 		deliveryOwnerId: resultDeliveryOwnership.deliveryOwnerId,
 		supervisorRequestState: supervisorChannel.getSupervisorRequestState,
 		onJobsChanged: programStatus.sync,
@@ -496,9 +516,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		{
 			notifier: completionNotifier,
 			ownership: resultDeliveryOwnership,
+			onOwnedQueueChanged: programStatus.sync,
 			onResultDelivered: (runId) => {
 				owedResultRunIds.delete(runId);
 				if (state.asyncJobs.has(runId)) deliveredRunIds.add(runId);
+				programStatus.sync();
 			},
 			observeCompletion: (result) => scheduledRunManager.handleAsyncCompletion(result),
 			observedCompletionRunIds: () => scheduledRunManager.observedCompletionRunIds(),
@@ -552,6 +574,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	const executorDeps: SubagentExecutorDeps = {
+		onForegroundControlRemoved: programStatus.sync,
 		pi,
 		parentWake,
 		state,
@@ -888,12 +911,18 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		fleetStatus?.refresh();
 	};
 	const asyncCompleteHandler = (payload: unknown) => {
-		handleComplete(payload);
-		// Detached-workflow reconciliation publishes the result, then ends the job
-		// with this event; the next status refresh sees it already terminal.
-		const job = state.asyncJobs.get((payload as { id?: string } | null)?.id ?? "");
-		if (job && job.status !== "queued" && job.status !== "running"
-			&& fs.existsSync(resultFilePath(DIRS.results, job.asyncId))) holdOwedResult(job);
+		// Detached reconciliation publishes before this event. Hold delivery before
+		// handleComplete publishes the terminal job projection to status listeners.
+		const completion = payload as { id?: string; sessionId?: string; state?: AsyncJobState["status"] } | null;
+		const job = state.asyncJobs.get(completion?.id ?? "");
+		let publicationVisibilityUnknown = false;
+		if (job?.sessionId && completion?.sessionId === state.currentSessionId
+			&& completion?.state !== "queued" && completion?.state !== "running") {
+			const visibility = indexedResultPayloadVisibility(DIRS.results, job.sessionId, job.asyncId);
+			if (visibility !== "absent") holdOwedResult(job);
+			publicationVisibilityUnknown = visibility === "unknown";
+		}
+		handleComplete(payload, publicationVisibilityUnknown);
 		refreshResultDelivery();
 		refreshActiveAsyncCapacity();
 		scheduledRunManager.handleAsyncCompletion(payload);
@@ -1046,6 +1075,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		logSlowPhase(state, "wait-subscriptions", phaseStartedAt);
 		phaseStartedAt = Date.now();
 		startResultWatcher();
+		resultWatcher.restoreReloadHolds(ctx.sessionManager);
 		logSlowPhase(state, "result-watcher-start", phaseStartedAt);
 		phaseStartedAt = Date.now();
 		primeExistingResults({ triggerTurn: !recovering });
@@ -1095,6 +1125,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (modulePreloadTimer) clearTimeout(modulePreloadTimer);
 			modulePreloadTimer = undefined;
 			asyncRetentionAbort.abort();
+			if (shutdownReason === "reload" && runtimeEntry.sessionManager) resultWatcher.captureReloadHolds(runtimeEntry.sessionManager);
 			stopResultWatcher();
 			completionNotifier.dispose();
 			mainWatchdog.dispose();
@@ -1102,10 +1133,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			supervisorChannel.dispose();
 			waitSubscriptionManager.dispose();
 			fleetStatus?.dispose();
-			disposeAsyncJobTracker();
+			disposeAsyncJobTracker(shutdownReason);
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
 			state.asyncJobs.clear();
+			if (shutdownReason === "reload" && runtimeEntry.sessionManager && state.currentSessionId) {
+				retainedNestedRouteTracker?.captureReloadRoutes({ manager: runtimeEntry.sessionManager, id: state.currentSessionId }, state.foregroundControls.values());
+			}
 			retainedNestedRouteTracker?.clear();
 			retainedNestedRouteTracker = undefined;
 			executorDeps.trackRetainedNestedRoute = undefined;
@@ -1190,6 +1224,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		// starts only once that compaction has finished and its status indicator is cleared.
 		resumeWidgetsAfterCompaction();
 		completionNotifier.messageStarted(event.message);
+		parentWake.messageStarted(event.message);
 	});
 
 	pi.on("agent_settled", () => {
@@ -1239,6 +1274,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				},
 				{ triggerTurn: true },
 			);
+			programStatus.sync();
 		};
 		compactionResumeTimer = setTimeout(wakeWhenIdle, COMPACTION_RESUME_POLL_MS);
 	};
@@ -1260,19 +1296,25 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			? registerPiWebSessionLiveness({
 				sessionId,
 				...(sessionFile ? { sessionFile } : {}),
-				isActive: () => owedResultRunIds.size > 0 || hasLiveSubagentWork(state) || completionNotifier.hasPendingDelivery() || parentWake.isPending(),
+				isActive: () => hasOutstandingResults() || completionNotifier.hasPendingDelivery() || parentWake.isPending(),
 			})
 			: { registered: false, release: () => {} };
 		releaseHostSessionLiveness = liveness.release;
-		if (liveness.registered) {
-			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state);
-			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
-		}
 		herdrStatusBridge.sessionStarted({
 			hasUI: ctx.hasUI === true,
 			runs: activeHerdrRuns(),
 		});
-		programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode });
+		const ui = ctx.mode === "tui" && ctx.hasUI
+			? ctx.ui as ExtensionContext["ui"] & Pick<Parameters<typeof programStatus.sessionStarted>[0], "setBackgroundWork">
+			: undefined;
+		const statusSession = state.currentSessionId ? { manager: ctx.sessionManager, id: state.currentSessionId } : undefined;
+		const routeTracker = createRetainedNestedRouteTracker(state, { onRoutesChanged: programStatus.sync });
+		if (statusSession) routeTracker.restoreReloadRoutes(statusSession);
+		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork, session: statusSession });
+		if (liveness.registered || terminalStatusActive) {
+			retainedNestedRouteTracker = routeTracker;
+			executorDeps.trackRetainedNestedRoute = routeTracker.track;
+		} else routeTracker.clear();
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
 		supervisorChannel.activateTransport();

@@ -6,12 +6,14 @@ import * as path from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { getArtifactsDir } from "../../src/shared/artifacts.ts";
-import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_CONTROL_INTERCOM_EVENT, type ControlEvent } from "../../src/shared/types.ts";
-import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_CONTROL_INTERCOM_EVENT, TEMP_ROOT_DIR, type ControlEvent } from "../../src/shared/types.ts";
+import { ACTIVE_RUN_INDEX_DIR, readActiveRunIndex, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-job-bridge.ts";
 import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { currentPidNamespaceScope } from "../../src/runs/background/pid-namespace.ts";
+import { resultFilePath, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { hasLiveSubagentWork } from "../../src/integrations/pi-web-session-liveness.ts";
@@ -28,7 +30,7 @@ interface AsyncJobTrackerModule {
 			resultsDir?: string;
 			widgetEnabled?: boolean;
 			platform?: NodeJS.Platform;
-			onJobTerminal?: () => void;
+			onJobTerminal?: (job: unknown, publicationClosed: boolean) => void;
 			watch?: typeof fs.watch;
 			kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 			now?: () => number;
@@ -37,6 +39,7 @@ interface AsyncJobTrackerModule {
 		},
 	): {
 		ensurePoller(): void;
+		dispose(reason?: string): void;
 		resetJobs(ctx?: unknown): void;
 		restoreActiveJobs(ctx?: unknown): void;
 		handleStarted(data: unknown): void;
@@ -414,29 +417,41 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("reports a tracked run to the terminal as working, then done, and keeps the done record after widget cleanup", async () => {
+	it("reports a tracked run to the terminal as done only after pending delivery clears", async () => {
 		const asyncRoot = createTempDir("pi-async-job-program-status-");
 		try {
 			const state = createState();
 			const ui = createUiContext();
 			const writes: string[] = [];
+			const parentStatus: Array<[string, boolean]> = [];
+			let pendingDelivery = false;
 			const programStatus = registerProgramStatusReporter({
 				enabled: true,
 				getJobs: () => new Map([...state.fleetJobs, ...state.asyncJobs]).values(),
+				hasBackgroundWork: () => pendingDelivery || [...state.asyncJobs.values()].some((job) => job.status === "running" || job.status === "queued"),
 				getPendingRequests: () => [],
 				write: (data) => writes.push(data),
 				isTTY: true,
 				env: { TERM: "xterm-256color" },
 			});
-			programStatus.sessionStarted({ hasUI: true, mode: "tui" });
-			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { completionRetentionMs: 5, onJobsChanged: programStatus.sync });
+			programStatus.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (key, active) => parentStatus.push([key, active]) });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, {
+				completionRetentionMs: 5,
+				onJobsChanged: programStatus.sync,
+			});
 			tracker.resetJobs(ui.ctx as never);
 			tracker.handleStarted({ id: "run-osc", asyncDir: path.join(asyncRoot, "run-osc"), agent: "worker" });
+			pendingDelivery = true;
 			tracker.handleComplete({ id: "run-osc", success: true });
 			await waitForCondition(() => state.asyncJobs.size === 0, "widget cleanup", 1000);
 
-			const states = writes.map((report) => /state=(\w+):id=([^:]+)/.exec(report)?.slice(1).join(" "));
-			assert.deepEqual(states, ["working subagents/runosc", "done subagents/runosc"]);
+			assert.deepEqual(parentStatus, [["pi-subagents", true]]);
+			assert.ok(!writes.some((report) => report.includes("state=done")));
+			pendingDelivery = false;
+			programStatus.sync();
+			assert.deepEqual(parentStatus, [["pi-subagents", true], ["pi-subagents", false]]);
+			assert.equal(writes.at(-1)?.includes("state=done:id=subagents/runosc"), true);
+			programStatus.dispose();
 		} finally {
 			removeTempDir(asyncRoot);
 		}
@@ -489,6 +504,182 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			state.currentSessionId = "foreign";
 			assert.equal(resolveSubagentRunId("async-descendant", { state }), undefined);
 		} finally {
+			removeTempDir(asyncRoot);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a terminal async root's foreground child live until the current runner closes", async () => {
+		const asyncRoot = createTempDir("pi-async-root-instance-");
+		const route = createNestedRoute("tracked-current-runner");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		const state = { ...createState(), currentSessionId: "parent", completionOwnerId: "owner" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10 });
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 100, parentRunId: route.rootRunId,
+				child: { id: "foreground", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" } });
+			const proof = { version: 1, runId: route.rootRunId, runnerProcessInstanceId: "current" };
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", mode: "single", state: "failed", startedAt: 100,
+				processTerminal: { ...proof, state: "pending" } }));
+			const writeClose = (id: string) => fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ ...proof, runnerProcessInstanceId: id, state: "observed", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: id, closeObservedAt: 300, exitCode: 1, signal: null }] }));
+			writeClose("stale");
+			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", agent: "worker", asyncDir, nestedRoute: route });
+			await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "failed", "terminal root projected");
+			assert.equal(hasLiveSubagentWork(state), true);
+			writeClose("current");
+			const statusPath = path.join(asyncDir, "status.json");
+			const ownStatus = fs.readFileSync(statusPath, "utf-8");
+			fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(ownStatus), sessionId: "foreign" }));
+			tracker.handleComplete({ id: route.rootRunId, sessionId: "parent", state: "failed", success: false });
+			assert.equal(hasLiveSubagentWork(state), true, "foreign-session status cannot prune on completion event");
+			fs.writeFileSync(statusPath, ownStatus);
+			await waitForCondition(() => !hasLiveSubagentWork(state), "exact closure drains foreground work");
+		} finally {
+			tracker.dispose();
+			removeTempDir(asyncRoot);
+			removeTempDir(path.dirname(route.eventSink));
+		}
+	});
+
+	for (const unreadable of [false, true]) it(`notifies the terminal reporter of independent work after root status ${unreadable ? "EIO" : "loss"}`, async (t) => {
+		const asyncRoot = createTempDir("pi-statusless-nested-notify-");
+		const route = createNestedRoute("statusless-nested-notify");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		const state = { ...createState(), currentSessionId: "parent" };
+		const holds: boolean[] = [];
+		const writes: string[] = [];
+		let delayFirstCompletion = !unreadable;
+		const reporter = registerProgramStatusReporter({ enabled: true, isTTY: true, env: { TERM: "xterm-256color" },
+			getJobs: () => new Map([...state.fleetJobs, ...state.asyncJobs]).values(), getPendingRequests: () => [],
+			write: (data) => writes.push(data), hasBackgroundWork: () => delayFirstCompletion || hasLiveSubagentWork(state) });
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 400, onJobsChanged: reporter.sync });
+		const child = { id: "independent", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const,
+			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
+		try {
+			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) });
+			tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const statusPath = path.join(asyncDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({ runId: route.rootRunId, sessionId: "parent", state: "complete", mode: "single", startedAt: 100 }));
+			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", asyncDir, agent: "worker", nestedRoute: route });
+			await waitForCondition(() => state.cleanupTimers.has(route.rootRunId) && !hasLiveSubagentWork(state), "terminal root is idle");
+			holds.length = 0;
+			if (unreadable) {
+				const stat = fsDefault.statSync;
+				const cleanup = state.cleanupTimers.get(route.rootRunId);
+				let failedRefresh = false;
+				fsDefault.statSync = ((file, options) => {
+					if (file === statusPath) { failedRefresh = true; throw Object.assign(new Error("status unreadable"), { code: "EIO" }); }
+					return stat(file, options);
+				}) as typeof fs.statSync;
+				syncBuiltinESMExports();
+				t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); });
+				await waitForCondition(() => failedRefresh, "first EIO refresh before nested start");
+				assert.equal(state.cleanupTimers.get(route.rootRunId), cleanup, "EIO leaves original watcher retention armed");
+			} else fs.rmSync(statusPath);
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 200, parentRunId: route.rootRunId, child });
+			await waitForCondition(() => hasLiveSubagentWork(state) && (!unreadable || holds.at(-1) === true), "reporter receives late nested hold");
+			await new Promise(resolve => setTimeout(resolve, 450));
+			assert.equal(state.asyncJobs.has(route.rootRunId), true, "independent child outlasts original cleanup deadline");
+			assert.deepEqual(holds, unreadable ? [true] : []);
+			if (!unreadable) assert.ok(!writes.some((report) => report.includes("state=done:id=subagents/statuslessne")));
+			delayFirstCompletion = false;
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: route.rootRunId, child: { ...child, state: "complete" } });
+			await waitForCondition(() => holds.at(-1) === false, "reporter receives nested drain");
+			assert.deepEqual(holds, unreadable ? [true, false] : [false]);
+			if (!unreadable) {
+				assert.equal(state.asyncJobs.has(route.rootRunId), false);
+				assert.ok(writes.some((report) => report.includes("state=done:id=subagents/statuslessne")));
+			}
+		} finally {
+			tracker.dispose(); reporter.dispose(); removeTempDir(asyncRoot); removeTempDir(path.dirname(route.eventSink));
+		}
+	});
+
+	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable", "after restored status access is denied", "when capture cannot read root status"]) it(`retains late independent work ${phase}`, async (t) => {
+		const rootStillRunning = phase === "before the root's terminal refresh";
+		const statusDisappears = phase === "after the root status disappears";
+		const losesRestoredStatus = phase === "after a restored root loses status";
+		const unreadableRoot = phase === "while root status stays unreadable";
+		const deniedAfterRestore = phase === "after restored status access is denied";
+		const deniedBeforeCapture = phase === "when capture cannot read root status";
+		const asyncRoot = createTempDir("pi-async-job-owner-close-");
+		const route = createNestedRoute("tracked-async-owner-close");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		let state = { ...createState(), currentSessionId: "parent", completionOwnerId: "process-owner" };
+		const ctx = { ...createUiContext().ctx, sessionManager: {} };
+		const retentionMs = 250;
+		const resultsDir = path.join(asyncRoot, "results");
+		const resultPath = path.join(resultsDir, `${route.rootRunId}.json`);
+		let terminalNotices = 0;
+		const options = { platform: "darwin" as const, pollIntervalMs: 10, completionRetentionMs: retentionMs, resultsDir, onJobTerminal: (_job: unknown, closed: boolean) => { if (!closed) terminalNotices++; } };
+		let tracker = createTracker(createEventRecorder().pi, state, asyncRoot, options);
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const foreground = { id: "foreground", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const };
+			const independent = { ...foreground, id: "independent", parentRunId: foreground.id, depth: 2,
+				path: [...foreground.path, { runId: foreground.id }], asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
+			writeNestedEvent(route, { type: statusDisappears || losesRestoredStatus ? "subagent.nested.completed" : "subagent.nested.started", ts: 100,
+				parentRunId: foreground.parentRunId, child: { ...foreground, state: statusDisappears || losesRestoredStatus ? "complete" : "running" } });
+			const proof = { version: 1, state: "observed", runId: route.rootRunId, runnerProcessInstanceId: "runner", observedAt: 200,
+				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 200, exitCode: 1, signal: null }] };
+			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
+			const writeRoot = (state: "running" | "failed") => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", state, mode: "single", startedAt: Date.now(), lastUpdate: Date.now(), ...(state === "failed" ? { processTerminal: proof } : { pid: process.pid, pidNamespaceScope: currentPidNamespaceScope() }) }));
+			writeRoot(rootStillRunning ? "running" : "failed");
+			tracker.restoreActiveJobs(ctx);
+			updateActiveRunIndex(asyncDir, "running");
+			fs.mkdirSync(resultsDir);
+			fs.writeFileSync(resultPath, JSON.stringify({ id: route.rootRunId, sessionId: "parent", success: false }));
+			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", asyncDir, agent: "owner", nestedRoute: route });
+			if (rootStillRunning) {
+				await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "running", "old tracker projects running root");
+				writeRoot("failed");
+			} else {
+				await waitForCondition(() => state.cleanupTimers.has(route.rootRunId), "terminal cleanup armed");
+				assert.equal(hasLiveSubagentWork(state), false, "stranded foreground activity does not hold cleanup");
+			}
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 201, parentRunId: independent.parentRunId, child: independent });
+			if (rootStillRunning) {
+				assert.equal(state.asyncJobs.get(route.rootRunId)?.status, "running");
+			} else if (phase === "before its first refresh") {
+				assert.equal(hasLiveSubagentWork(state), false, "old tracker has not seen the child yet");
+			} else {
+				await waitForCondition(() => hasLiveSubagentWork(state), "late independent work observed");
+				assert.equal(state.cleanupTimers.has(route.rootRunId), false);
+				await new Promise((resolve) => setTimeout(resolve, retentionMs));
+				assert.equal(hasLiveSubagentWork(state), true, "independent work survives the old cleanup deadline");
+			}
+			const noticesBeforeReload = rootStillRunning ? 0 : 1;
+			assert.equal(terminalNotices, noticesBeforeReload);
+			fs.rmSync(resultPath); // Result consumer has delivered and retired the payload.
+			updateActiveRunIndex(asyncDir, "failed");
+			assert.equal(readActiveRunIndex(asyncRoot)?.includes(route.rootRunId) ?? false, false);
+			if (statusDisappears) fs.rmSync(path.join(asyncDir, "status.json"));
+			if (deniedBeforeCapture) denyStat(t).add(path.join(asyncDir, "status.json"));
+			tracker.dispose("reload");
+			if (unreadableRoot) denyStat(t).add(path.join(asyncDir, "status.json"));
+			state = { ...createState(), currentSessionId: "parent", completionOwnerId: "process-owner" };
+			tracker = createTracker(createEventRecorder().pi, state, asyncRoot, options);
+			tracker.restoreActiveJobs(ctx);
+			assert.equal(hasLiveSubagentWork(state), true, "markerless nested work remains held during reload");
+			assert.equal(terminalNotices, noticesBeforeReload, "already delivered result does not get replayed");
+			if (deniedAfterRestore) denyStat(t).add(path.join(asyncDir, "status.json"));
+			if (losesRestoredStatus) {
+				fs.rmSync(path.join(asyncDir, "status.json"));
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				assert.equal(hasLiveSubagentWork(state), true);
+			}
+			if (statusDisappears) {
+				fs.mkdirSync(independent.asyncDir, { recursive: true });
+				fs.writeFileSync(path.join(independent.asyncDir, "status.json"), JSON.stringify({ runId: independent.id, mode: "single", state: "failed", startedAt: 100 }));
+				t.after(() => removeTempDir(independent.asyncDir));
+			} else writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: independent.parentRunId, child: { ...independent, state: "complete" } });
+			await waitForCondition(() => !state.asyncJobs.has(route.rootRunId), "terminal job cleanup");
+			assert.equal(hasLiveSubagentWork(state), false);
+		} finally {
+			tracker.dispose();
 			removeTempDir(asyncRoot);
 			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 		}
@@ -1228,6 +1419,383 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	for (const mode of ["single", "workflow"]) it(`restores active jobs when ${mode} terminal marker maintenance is denied`, (t) => {
+		const asyncRoot = createTempDir("pi-active-marker-write-denied-");
+		const terminalDir = path.join(asyncRoot, "terminal");
+		const runningDir = path.join(asyncRoot, "running");
+		const state = { ...createState(), currentSessionId: "parent", completionOwnerId: "owner" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results") });
+		const originalWrite = fsDefault.writeFileSync;
+		t.after(() => { fsDefault.writeFileSync = originalWrite; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(runningDir, "running", "parent");
+		fs.mkdirSync(terminalDir, { recursive: true });
+		const proof = { version: 1, runId: "terminal", runnerProcessInstanceId: "writer", state: "observed", observedAt: 300,
+			instances: [{ kind: "runner", processInstanceId: "writer", closeObservedAt: 300, exitCode: 0, signal: null }] };
+		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId: "parent", completionOwnerId: "owner",
+			state: "complete", mode, startedAt: 100, processTerminal: proof }));
+		fs.writeFileSync(path.join(terminalDir, "process-terminal.json"), JSON.stringify(proof));
+		updateActiveRunIndex(terminalDir, "running");
+		updateActiveRunIndex(runningDir, "running");
+		let denied = false;
+		fsDefault.writeFileSync = ((file, data, options) => {
+			if (file === path.join(asyncRoot, ACTIVE_RUN_INDEX_DIR, "terminal")) {
+				denied = true;
+				throw Object.assign(new Error("active marker write denied"), { code: "EACCES" });
+			}
+			return originalWrite(file, data, options);
+		}) as typeof fs.writeFileSync;
+		syncBuiltinESMExports();
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(denied, true);
+		assert.equal(state.asyncJobs.get("terminal")?.status, mode === "single" ? "complete" : undefined);
+		assert.equal(state.asyncJobs.get("running")?.status, "running");
+	});
+
+	for (const statFailure of [false, true]) it(`keeps active restore and stale result repair live through ${statFailure ? "public stat EIO" : "storage permission failures"}`, async (t) => {
+		const asyncRoot = createTempDir("pi-async-restore-storage-");
+		const resultsDir = path.join(asyncRoot, "results");
+		const terminalDir = path.join(asyncRoot, "terminal");
+		const runningDir = path.join(asyncRoot, "running");
+		const resultPath = resultFilePath(resultsDir, "running");
+		const sessionId = "parent";
+		const ownerId = "owner";
+		const state = { ...createState(), currentSessionId: sessionId, completionOwnerId: ownerId };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		const originalRead = fsDefault.readFileSync;
+		const originalStat = fsDefault.statSync;
+		let denyIndex = true;
+		let denyPayload = false;
+		let indexDenied = 0;
+		let payloadDenied = 0;
+		let payloadReads = 0;
+		fsDefault.readFileSync = ((file, options) => {
+			if (!statFailure && denyIndex && String(file).includes(path.sep + "result-index" + path.sep) && path.basename(String(file)) === "terminal.json") indexDenied++;
+			else if (denyPayload && file === resultPath) payloadDenied++;
+			else {
+				if (file === resultPath) payloadReads++;
+				return originalRead(file, options);
+			}
+			throw Object.assign(new Error("temporarily inaccessible result storage"), { code: "EACCES" });
+		}) as typeof fs.readFileSync;
+		if (statFailure) fsDefault.statSync = ((file, options) => {
+			if (denyIndex && file === resultFilePath(resultsDir, "terminal")) {
+				indexDenied++;
+				throw Object.assign(new Error("public result stat failed"), { code: "EIO" });
+			}
+			return originalStat(file, options);
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		t.after(() => { fsDefault.readFileSync = originalRead; fsDefault.statSync = originalStat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(runningDir, "running", sessionId);
+		fs.mkdirSync(terminalDir, { recursive: true });
+		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId, completionOwnerId: ownerId, state: "complete", mode: "single", startedAt: Date.now(),
+			processTerminal: { version: 1, runId: "terminal", runnerProcessInstanceId: "writer", state: "pending" } }));
+		updateActiveRunIndex(terminalDir, "running");
+		updateActiveRunIndex(runningDir, "running");
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.ok(indexDenied > 0, "startup cannot read the owned terminal publisher's index");
+		assert.equal(state.asyncJobs.get("terminal")?.status, "running", "publisher restores a placeholder without a handoff");
+		assert.equal(state.asyncJobs.get("running")?.agents?.[0], "worker", "one denied index does not hide other restored jobs");
+		denyIndex = false;
+		await waitForCondition(() => state.asyncJobs.get("terminal")?.status === "complete", "publisher succeeds on retry");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		denyPayload = true;
+		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId: "other-session", success: true }));
+		await waitForCondition(() => payloadDenied > 0, "stale repair attempts an unreadable payload");
+		assert.equal(state.asyncJobs.get("running")?.status, "running");
+		assert.equal(state.cleanupTimers.has("running"), false);
+		denyPayload = false;
+		await waitForCondition(() => payloadReads > 0, "repair examines recovered public payload");
+		assert.equal(state.asyncJobs.get("running")?.status, "running", "retries still reject unrelated results");
+		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId, success: true }));
+		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair accepts only the matching result");
+	});
+
+	for (const phase of ["initially missing", "reconciliation read", "pre-write read"]) it(`never repairs foreign same-ID status at ${phase}`, async (t) => {
+		const asyncRoot = createTempDir("pi-marker-session-swap-");
+		const runDir = path.join(asyncRoot, "swapped");
+		const statusPath = path.join(runDir, "status.json");
+		const resultsDir = path.join(asyncRoot, "results");
+		const payload = resultFilePath(resultsDir, "swapped");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		const stat = fsDefault.statSync;
+		let reads = 0;
+		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(runDir, "swapped", "parent");
+		updateActiveRunIndex(runDir, "running");
+		if (phase === "pre-write read") {
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(payload, JSON.stringify({ id: "swapped", sessionId: "parent", success: true }));
+		} else writePendingAsyncResultFile(payload, { id: "swapped", sessionId: "foreign-session", success: true });
+		fsDefault.statSync = ((file, options) => {
+			if (file === statusPath) {
+				reads++;
+				if (phase === "initially missing" && reads === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+				if (reads === (phase === "pre-write read" ? 3 : 2)) writeRunningAsyncStatus(runDir, "swapped", "foreign-session");
+			}
+			return stat(file, options);
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		if (phase === "initially missing") await waitForCondition(() => reads >= 2 && !state.asyncJobs.has("swapped"), "unverified marker rejected on retry");
+		assert.ok(reads >= (phase === "pre-write read" ? 3 : 2));
+		assert.equal(state.asyncJobs.has("swapped"), false);
+		assert.equal(fs.existsSync(payload), phase === "pre-write read", "foreign pending result was not promoted");
+		assert.ok(readActiveRunIndex(asyncRoot)?.includes("swapped"));
+		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
+	});
+
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload", "inherited replacement after verified restore", "inherited replacement on repeat scan", "index listing EIO on reload", "index listing EIO after local launch"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+		const inherited = phase.startsWith("inherited replacement");
+		const localLaunch = phase === "index listing EIO after local launch";
+		const listingFails = phase === "index listing EIO on reload" || localLaunch;
+		const verifiedRestore = phase === "inherited replacement after verified restore";
+		const reloadBeforeReplacement = phase === "inherited replacement after reload" || listingFails;
+		const reloadAfterReplacement = phase === "inherited replacement before reload" || verifiedRestore;
+		const foreign = phase === "foreign replacement" || inherited;
+		const sessionId = inherited ? "marker-successor" : "parent";
+		const verifiedOwner = inherited ? "marker-predecessor" : "parent";
+		const terminal = phase === "terminal refresh";
+		const missingAtRead = terminal ? 3 : phase === "reconciliation" || (inherited && !verifiedRestore) || (listingFails && !localLaunch) ? 2 : 0;
+		const asyncRoot = createTempDir("pi-missing-startup-status-");
+		const asyncDir = path.join(asyncRoot, "starting");
+		const statusPath = path.join(asyncDir, "status.json");
+		const resultsDir = path.join(asyncRoot, "results");
+		const output = resultFilePath(resultsDir, "starting");
+		let state = { ...createState(), currentSessionId: sessionId };
+		if (inherited) {
+			const { recordSessionReplacement, recordSessionStart } = await import("../../src/shared/session-succession.ts");
+			recordSessionReplacement(sessionId, verifiedOwner);
+			t.after(() => recordSessionStart(sessionId, true));
+		}
+		const ctx = { ...createUiContext().ctx, sessionManager: {} };
+		const makeTracker = () => createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		let tracker = makeTracker();
+		const reload = () => {
+			tracker.dispose("reload");
+			state = { ...createState(), currentSessionId: sessionId };
+			tracker = makeTracker();
+			tracker.restoreActiveJobs(ctx);
+		};
+		const stat = fsDefault.statSync;
+		const readdir = fsDefault.readdirSync;
+		let reads = 0;
+		t.after(() => { fsDefault.statSync = stat; fsDefault.readdirSync = readdir; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const writeOwnedStatus = () => {
+			writeRunningAsyncStatus(asyncDir, "starting", verifiedOwner);
+			if (terminal) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+				fs.writeFileSync(statusPath, JSON.stringify({ ...status, state: "complete",
+					processTerminal: { version: 1, state: "pending", runId: "starting", runnerProcessInstanceId: "writer" } }));
+			}
+		};
+		if (missingAtRead || verifiedRestore) writeOwnedStatus();
+		if (!localLaunch) updateActiveRunIndex(asyncDir, "running");
+		fsDefault.statSync = ((file, options) => {
+			if (file === statusPath && ++reads === missingAtRead) {
+				fs.rmSync(statusPath);
+				if (inherited) throw Object.assign(new Error("status unreadable during reconciliation"), { code: "EIO" });
+			}
+			return stat(file, options);
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		tracker.restoreActiveJobs(ctx);
+		const readsAtRestore = reads;
+		if (verifiedRestore) {
+			assert.equal(state.asyncJobs.get("starting")?.agents?.[0], "worker");
+			fs.rmSync(statusPath);
+		}
+		if (localLaunch) {
+			assert.equal(state.asyncJobs.size, 0);
+			writeOwnedStatus();
+			updateActiveRunIndex(asyncDir, "running");
+			tracker.handleStarted({ id: "starting", asyncDir, sessionId, agent: "worker" });
+		} else await waitForCondition(() => reads > Math.max(missingAtRead, readsAtRestore), "startup and retry read the missing status");
+		if (reloadBeforeReplacement) {
+			if (listingFails) {
+				fsDefault.readdirSync = ((file, options) => {
+					if (file === path.join(asyncRoot, ".active-runs")) throw Object.assign(new Error("active index unreadable"), { code: "EIO" });
+					return Reflect.apply(readdir, fsDefault, [file, options]);
+				}) as typeof readdir;
+				syncBuiltinESMExports();
+			}
+			reload();
+			assert.equal(state.asyncJobs.get("starting")?.sessionId, verifiedOwner);
+			fsDefault.readdirSync = readdir;
+			syncBuiltinESMExports();
+		}
+		assert.equal(state.asyncJobs.get("starting")?.status, "running");
+		assert.equal(hasLiveSubagentWork(state), true);
+		assert.equal(fs.existsSync(statusPath), localLaunch);
+		if (foreign) {
+			const replacementOwner = inherited ? sessionId : "foreign";
+			writePendingAsyncResultFile(output, { id: "starting", sessionId: replacementOwner, success: true });
+			writeRunningAsyncStatus(asyncDir, "starting", replacementOwner);
+			if (reloadAfterReplacement) reload();
+			if (phase === "inherited replacement on repeat scan") {
+				tracker.restoreActiveJobs(ctx);
+				assert.equal(state.asyncJobs.get("starting")?.sessionId, verifiedOwner);
+			}
+			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
+			assert.equal(fs.existsSync(output), false);
+			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
+		} else {
+			writeOwnedStatus();
+			await waitForCondition(() => state.asyncJobs.get("starting")?.agents?.[0] === "worker"
+				&& state.asyncJobs.get("starting")?.status === (terminal ? "complete" : "running"), "owned status recovered");
+		}
+	});
+
+	for (const staleMarker of [false, true]) it(`recovers temporarily missing status and settles after ${staleMarker ? "marker expiry" : "removal"}`, async (t) => {
+		const asyncRoot = createTempDir("pi-restored-live-status-gap-");
+		const asyncDir = path.join(asyncRoot, "restored");
+		const statusPath = path.join(asyncDir, "status.json");
+		const state = { ...createState(), currentSessionId: "parent" };
+		let now = Date.now();
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results"), pollIntervalMs: 10, now: () => now });
+		const stat = fsDefault.statSync;
+		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(asyncDir, "restored", "parent");
+		updateActiveRunIndex(asyncDir, "running");
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(state.asyncJobs.get("restored")?.status, "running");
+		const prior = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		fs.rmSync(statusPath);
+		let observedMissing = false;
+		fsDefault.statSync = ((file, options) => {
+			try { return stat(file, options); } catch (error) {
+				if (file === statusPath && (error as NodeJS.ErrnoException).code === "ENOENT") observedMissing = true;
+				throw error;
+			}
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		await waitForCondition(() => observedMissing, "tracker reads missing status");
+		assert.equal(hasLiveSubagentWork(state), true);
+		assert.equal(fs.existsSync(statusPath), false, "tracking does not synthesize status");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...prior, turnCount: 4 }));
+		await waitForCondition(() => state.asyncJobs.get("restored")?.turnCount === 4, "restored tracking resumes from recovered status");
+		assert.equal(state.asyncJobs.get("restored")?.status, "running");
+		if (staleMarker) {
+			fs.rmSync(statusPath);
+			now += 2 * 24 * 60 * 60 * 1000;
+		} else {
+			updateActiveRunIndex(asyncDir, "failed");
+			fs.rmSync(asyncDir, { recursive: true });
+		}
+		await waitForCondition(() => !state.asyncJobs.has("restored"), "permanent status loss releases tracking");
+		assert.equal(hasLiveSubagentWork(state), false);
+	});
+
+	it("leaves no-publication repair of an already tracked run to its refresh", async (t) => {
+		const root = createTempDir("pi-repeat-no-publication-");
+		const asyncDir = path.join(root, "tracked");
+		const resultsDir = path.join(root, "results");
+		const output = resultFilePath(resultsDir, "tracked");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const notices: boolean[] = [];
+		let dead = false;
+		const tracker = createTracker(createEventRecorder().pi, state, root, { resultsDir, pollIntervalMs: 10, completionRetentionMs: 50,
+			kill: () => { if (dead) throw Object.assign(new Error("runner gone"), { code: "ESRCH" }); return true; },
+			onJobTerminal: (_job, closed) => notices.push(closed),
+		});
+		t.after(() => { tracker.dispose(); removeTempDir(root); });
+		writeRunningAsyncStatus(asyncDir, "tracked", "parent");
+		const statusPath = path.join(asyncDir, "status.json");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 12345 }));
+		updateActiveRunIndex(asyncDir, "running");
+		const ctx = { ...createUiContext().ctx, sessionManager: {} };
+		tracker.restoreActiveJobs(ctx);
+		assert.equal(state.asyncJobs.get("tracked")?.status, "running");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		const foreign = JSON.stringify({ id: "tracked", sessionId: "other", success: true });
+		fs.writeFileSync(output, foreign);
+		dead = true;
+		tracker.restoreActiveJobs(ctx);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "running");
+		await waitForCondition(() => notices.length > 0, "tracker settles the repair without publication");
+		assert.deepEqual(notices, [true]);
+		assert.equal(state.asyncJobs.get("tracked")?.status, "failed");
+		assert.equal(fs.readFileSync(output, "utf-8"), foreign);
+		await waitForCondition(() => !state.asyncJobs.has("tracked"), "settled run expires from tracking");
+		assert.equal(hasLiveSubagentWork(state), false);
+	});
+
+	for (const restored of [false, true]) it(`detaches a ${restored ? "restored" : "locally started"} job without replaying replacement events`, async (t) => {
+		const root = createTempDir("pi-local-replaced-status-");
+		const asyncDir = path.join(root, "started");
+		const statusPath = path.join(asyncDir, "status.json");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const recorder = createEventRecorder();
+		const tracker = createTracker(recorder.pi, state, root, { resultsDir: path.join(root, "results"), pollIntervalMs: 10 });
+		t.after(() => { tracker.dispose(); removeTempDir(root); });
+		writeRunningAsyncStatus(asyncDir, "started", "parent");
+		if (restored) {
+			updateActiveRunIndex(asyncDir, "running");
+			tracker.restoreActiveJobs();
+		} else tracker.handleStarted({ id: "started", asyncDir, sessionId: "parent", agent: "worker" });
+		await waitForCondition(() => state.asyncJobs.get("started")?.status === "running", "local start observed");
+		writeRunningAsyncStatus(asyncDir, "started", "other");
+		writeControlRecord(asyncDir, supervisorControlEvent("started", "replacement-call", "intercom"));
+		const replacement = fs.readFileSync(statusPath, "utf-8");
+		await waitForCondition(() => !state.asyncJobs.has("started"), "replacement rejected by local refresh");
+		assert.equal(hasLiveSubagentWork(state), false);
+		assert.equal(fs.readFileSync(statusPath, "utf-8"), replacement);
+		assert.equal(recorder.events.some(({ channel }) => channel === SUBAGENT_CONTROL_EVENT || channel === SUBAGENT_CONTROL_INTERCOM_EVENT), false);
+	});
+
+	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {
+		const asyncRoot = createTempDir("pi-live-foreign-result-");
+		const asyncDir = path.join(asyncRoot, "live");
+		const resultsDir = path.join(asyncRoot, "results");
+		const result = resultFilePath(resultsDir, "live");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		try {
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(result, JSON.stringify({ id: "live", sessionId: "other", success: true }));
+			tracker.handleStarted({ id: "live", sessionId: "parent", asyncDir, agent: "worker" });
+			await waitForCondition(() => state.asyncJobs.get("live")?.status === "running", "startup without status remains live");
+			writeRunningAsyncStatus(asyncDir, "live", "parent");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(state.asyncJobs.get("live")?.status, "running");
+			fs.writeFileSync(result, JSON.stringify({ id: "live", sessionId: "parent", success: true }));
+			await waitForCondition(() => state.asyncJobs.get("live")?.status === "complete", "exact snapshot repairs live tracked job");
+		} finally {
+			tracker.dispose();
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("defers dead-run repair until its indexed pending result is readable", async (t) => {
+		const asyncRoot = createTempDir("pi-dead-pending-io-");
+		const resultsDir = path.join(asyncRoot, "results");
+		const runDir = path.join(asyncRoot, "dead");
+		const healthyDir = path.join(asyncRoot, "healthy");
+		const result = resultFilePath(resultsDir, "dead");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10,
+			kill: () => { throw Object.assign(new Error("runner exited"), { code: "ESRCH" }); } });
+		const denied = denyStat(t);
+		t.after(() => { denied.clear(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(healthyDir, "healthy", "parent");
+		writeRunningAsyncStatus(runDir, "dead", "parent");
+		const statusPath = path.join(runDir, "status.json");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 12345 }));
+		updateActiveRunIndex(runDir, "running");
+		updateActiveRunIndex(healthyDir, "running");
+		writePendingAsyncResultFile(result, { id: "dead", sessionId: "parent", success: true });
+		denied.add(path.join(resultsDir, "result-pending", "parent", "dead.json"));
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(state.asyncJobs.get("dead")?.status, "running");
+		assert.equal(state.asyncJobs.get("healthy")?.status, "running");
+		assert.equal(fs.existsSync(result), false);
+		assert.ok(readActiveRunIndex(asyncRoot)?.includes("dead"));
+		denied.clear();
+		await waitForCondition(() => state.asyncJobs.get("dead")?.status === "complete", "original success repairs the dead run after recovery");
+	});
+
 	it("restores an unreadable active run as live work until a read shows its owner", async (t) => {
 		const asyncRoot = createTempDir("pi-async-job-restore-unreadable-");
 		const originalError = console.error;
@@ -1236,6 +1804,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const ownedDir = path.join(asyncRoot, "run-owned");
 		const foreignDir = path.join(asyncRoot, "run-foreign");
 		const corruptDir = path.join(asyncRoot, "run-corrupt");
+		const mismatchDir = path.join(asyncRoot, "run-mismatch");
+		const resultsDir = path.join(asyncRoot, "results");
+		const unrelatedPayload = resultFilePath(resultsDir, "other-run");
+		const pendingDir = path.join(resultsDir, "result-pending", "session-owner");
 		const nestedRoute = createNestedRoute("run-owned");
 		const denied = denyStat(t);
 		try {
@@ -1246,22 +1818,27 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			updateActiveRunIndex(ownedDir, "running");
 			updateActiveRunIndex(foreignDir, "running");
 			updateActiveRunIndex(corruptDir, "running");
-			for (const dir of [ownedDir, foreignDir, corruptDir]) denied.add(path.join(dir, "status.json"));
+			writeRunningAsyncStatus(mismatchDir, "other-run", "session-owner");
+			updateActiveRunIndex(mismatchDir, "running");
+			writePendingAsyncResultFile(unrelatedPayload, { id: "other-run", sessionId: "session-owner", state: "complete", success: true, timestamp: Date.now() });
+			for (const dir of [ownedDir, foreignDir, corruptDir, mismatchDir]) denied.add(path.join(dir, "status.json"));
 
 			const state = createState();
 			state.currentSessionId = "session-owner";
 			const ui = createUiContext();
-			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10 });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10, resultsDir });
 			tracker.resetJobs(ui.ctx as never);
 			tracker.restoreActiveJobs(ui.ctx as never);
 
-			assert.deepEqual([...state.asyncJobs.keys()].sort(), ["run-corrupt", "run-foreign", "run-owned"]);
+			assert.deepEqual([...state.asyncJobs.keys()].sort(), ["run-corrupt", "run-foreign", "run-mismatch", "run-owned"]);
 			assert.equal(hasLiveSubagentWork(state as never), true);
 
 			denied.clear();
-			await waitForCondition(() => !state.asyncJobs.has("run-foreign") && !state.asyncJobs.has("run-corrupt") && state.asyncJobs.get("run-owned")?.agents?.[0] === "worker", "the runs to resolve by owner");
+			await waitForCondition(() => !state.asyncJobs.has("run-foreign") && !state.asyncJobs.has("run-corrupt") && !state.asyncJobs.has("run-mismatch") && state.asyncJobs.get("run-owned")?.agents?.[0] === "worker", "the runs to resolve by owner");
 			assert.equal(state.asyncJobs.get("run-owned")?.status, "running");
 			assert.equal(state.asyncJobs.get("run-owned")?.nestedRoute?.eventSink, nestedRoute.eventSink);
+			assert.ok(fs.readdirSync(pendingDir).includes("other-run.json"));
+			assert.equal(fs.existsSync(unrelatedPayload), false);
 			assert.equal(errors.filter((line) => line.includes("Dropping restored async run 'run-corrupt'") && line.includes("Failed to parse")).length, 1);
 		} finally {
 			console.error = originalError;
