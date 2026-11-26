@@ -76,7 +76,8 @@ const terminalBeforePublicationScript = String.raw`
 	const workflowReload = process.argv[1] === "workflow-reload";
 	const publishedReload = process.argv[1] === "published-reload";
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
-	const denyFirstRefresh = process.argv[1] === "restore-retry";
+	const provisionalReload = process.argv[1] === "provisional-reload";
+	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
 	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh;
 	const closedFirst = process.argv[1] === "closed-first";
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
@@ -122,12 +123,16 @@ const terminalBeforePublicationScript = String.raw`
 
 	registerSubagentExtension(pi);
 	let asyncDir;
-	if (restoredCase) asyncDir = writeStatus("complete", undefined, "running");
+	if (restoredCase) {
+		const observed = provisionalReload ? exitProof() : undefined;
+		asyncDir = writeStatus("complete", observed, "running");
+		if (observed) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), observed);
+	}
 	const restoreStat = fsDefault.statSync;
 	let restoredRefreshDenied = false;
 	if (denyFirstRefresh) {
 		fsDefault.statSync = (file, ...args) => {
-			if (!restoredRefreshDenied && String(file) === path.join(asyncDir, "status.json")
+			if ((provisionalReload || !restoredRefreshDenied) && String(file) === path.join(asyncDir, "status.json")
 				&& new Error().stack.includes("at refreshJob")) {
 				restoredRefreshDenied = true;
 				throw Object.assign(new Error("first terminal refresh inaccessible"), { code: "EACCES" });
@@ -139,6 +144,18 @@ const terminalBeforePublicationScript = String.raw`
 	try {
 		for (const handler of handlers.get("session_start")) await handler({ reason: restoredCase ? "reload" : "startup" }, ctx);
 		if (denyFirstRefresh) assert.equal(restoredRefreshDenied, true);
+		if (provisionalReload) {
+			assert.equal(readActiveRunIndex(DIRS.async).includes(runId), false);
+			assert.deepEqual(holds, [true]);
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+			handlers.clear();
+			holds.length = 0;
+			restoredRefreshDenied = false;
+			registerSubagentExtension(pi);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+			assert.equal(restoredRefreshDenied, true, "second runtime probed the exact markerless status");
+			assert.deepEqual(holds, [true]);
+		}
 	} finally {
 		if (denyFirstRefresh) {
 			fsDefault.statSync = restoreStat;
@@ -154,6 +171,14 @@ const terminalBeforePublicationScript = String.raw`
 		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
 	}
 	assert.equal(provider.isActive(), true);
+	if (provisionalReload) {
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
 	if (repeatReload) {
 		const proof = exitProof();
 		const stat = fsDefault.statSync;
@@ -345,6 +370,7 @@ describe("session liveness through result delivery", () => {
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
+		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 		["published-reload", "published delivery remains held on reload even when active listing fails"],

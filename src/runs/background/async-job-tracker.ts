@@ -106,7 +106,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const externalJobBridgeRuns = new Set<string>();
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
-	type PendingPublication = { instanceId?: string; pending: true };
+	type PendingPublication = { instanceId?: string; pending: true; provisional?: true };
 	const terminalPublications = new Map<string, PendingPublication | { pending: false }>();
 	const unverifiedPublications = new Map<string, PendingPublication>();
 	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
@@ -503,7 +503,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// Become the job a normal restore would have made, but keep the placeholder's state so the
 			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
 			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
-			if (pending) {
+			if (pending && !pending.provisional) {
 				const ownerId = options.deliveryOwnerId?.(stored.sessionId, stored.completionOwnerId, stored.completionOwnerProcess, stored.parentWorkflowRunId) ?? stored.completionOwnerId;
 				if (ownerId && (ownerId === state.completionOwnerId || ownerId === OWNING_SESSION_COMPLETION_OWNER)
 					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
@@ -675,6 +675,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						scheduleCleanup(job.asyncId);
 					}
 				}
+				unverifiedPublications.delete(job.asyncId);
 				return nestedLivenessChanged || widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}
 			if (job.status === "queued") {
@@ -1007,7 +1008,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (isTerminalJobStatus(job.status)) {
 				// Active-index discovery does not establish whether publication has settled.
 				job.status = "running";
+				unverifiedRuns.add(job.asyncId);
+				unverifiedPublications.set(job.asyncId, { pending: true, provisional: true });
 				refreshJob(job);
+				if (!state.asyncJobs.has(job.asyncId)) continue;
 			}
 			if (job.status === "running") runningJobIds.add(job.asyncId);
 			rememberFleetJob(state, job);
