@@ -115,7 +115,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const unverifiedPublications = new Map<string, ReloadObligation>();
 	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
 	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
-	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, ReloadObligation> }> };
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, ReloadObligation>; retrySessions?: Map<string, string> }> };
 	const reloadPublications = globals[handoffKey] ??= new WeakMap();
 	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
@@ -520,7 +520,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const pending = unverifiedPublications.get(job.asyncId);
 			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
 			const handoffSession = deliverySession ?? pending?.nested?.sessionId;
-			if (handoffSession && !ownsRun(state.currentSessionId, handoffSession)) {
+			if ((handoffSession && !ownsRun(state.currentSessionId, handoffSession))
+				|| (job.sessionId && !ownsRun(state.currentSessionId, job.sessionId))) {
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -544,7 +545,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				} else console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
-			const expectedSession = handoffSession ?? job.sessionId;
+			const expectedSession = job.sessionId ?? handoffSession;
 			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (expectedSession && stored.sessionId !== expectedSession)) {
 				if (statusMissing && (!pending || (pending.pending && pending.provisional))) {
 					try {
@@ -1053,6 +1054,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const dispose = (shutdownReason?: string) => {
 		if (shutdownReason === "reload" && publicationSession) {
 			const runs = new Map(unverifiedPublications);
+			const retrySessions = new Map<string, string>();
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
 			for (const runId of options.getOwedResultRunIds?.() ?? []) {
 				const publication = runs.get(runId);
@@ -1061,6 +1063,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			for (const job of state.asyncJobs.values()) {
 				if (!job.sessionId || !ownsRun(publicationSession.id, job.sessionId)) continue;
+				if (unverifiedRuns.has(job.asyncId)) retrySessions.set(job.asyncId, job.sessionId);
 				const route = job.nestedRoute;
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
@@ -1082,7 +1085,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					runs.set(job.asyncId, { ...publication, nested: { route, sessionId: job.sessionId, rootExited } });
 				}
 			}
-			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
+			if (runs.size || retrySessions.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs, retrySessions });
 		}
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
@@ -1124,23 +1127,25 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		state.statusProjectionSessionId = null;
 		if (!state.currentSessionId) return;
 		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
-		const handoff = publicationSession && reloadPublications.get(publicationSession.manager);
+		const saved = publicationSession && reloadPublications.get(publicationSession.manager);
+		const handoff = saved?.sessionId === state.currentSessionId ? saved : undefined;
 		let runs: AsyncRunSummary[] = [];
 		const unreadable: Array<{ runId: string; asyncDir: string; verifiedSessionId?: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
 				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
+				expectedRetrySessions: handoff?.retrySessions,
 				onUnreadableActiveRun: (runId, asyncDir, verifiedSessionId) => unreadable.push({ runId, asyncDir, verifiedSessionId }),
 			}, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			// Exact handoff entries do not depend on the active index being readable.
 		}
-		const pending = handoff?.sessionId === state.currentSessionId ? handoff.runs : undefined;
+		const pending = handoff?.runs;
 		if (pending) for (const [runId, publication] of pending) {
 			if (path.basename(runId) !== runId || runId === "." || runId === "..") continue;
-			const job: AsyncJobState = { asyncId: runId, asyncDir: path.join(asyncDirRoot, runId), status: "running", updatedAt: Date.now() };
+			const job: AsyncJobState = { asyncId: runId, asyncDir: path.join(asyncDirRoot, runId), status: "running", sessionId: handoff?.retrySessions?.get(runId), updatedAt: Date.now() };
 			state.asyncJobs.set(runId, job);
 			runningJobIds.add(runId);
 			unverifiedRuns.add(runId);

@@ -1536,8 +1536,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
-	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
-		const inherited = phase === "inherited replacement after EIO";
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+		const inherited = phase.startsWith("inherited replacement");
+		const reloadBeforeReplacement = phase === "inherited replacement after reload";
+		const reloadAfterReplacement = phase === "inherited replacement before reload";
 		const foreign = phase === "foreign replacement" || inherited;
 		const sessionId = inherited ? "marker-successor" : "parent";
 		const verifiedOwner = inherited ? "marker-predecessor" : "parent";
@@ -1548,13 +1550,21 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const statusPath = path.join(asyncDir, "status.json");
 		const resultsDir = path.join(asyncRoot, "results");
 		const output = resultFilePath(resultsDir, "starting");
-		const state = { ...createState(), currentSessionId: sessionId };
+		let state = { ...createState(), currentSessionId: sessionId };
 		if (inherited) {
 			const { recordSessionReplacement, recordSessionStart } = await import("../../src/shared/session-succession.ts");
 			recordSessionReplacement(sessionId, verifiedOwner);
 			t.after(() => recordSessionStart(sessionId, true));
 		}
-		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		const ctx = { ...createUiContext().ctx, sessionManager: {} };
+		const makeTracker = () => createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		let tracker = makeTracker();
+		const reload = () => {
+			tracker.dispose("reload");
+			state = { ...createState(), currentSessionId: sessionId };
+			tracker = makeTracker();
+			tracker.restoreActiveJobs(ctx);
+		};
 		const stat = fsDefault.statSync;
 		let reads = 0;
 		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
@@ -1577,8 +1587,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			return stat(file, options);
 		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
-		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		tracker.restoreActiveJobs(ctx);
 		await waitForCondition(() => reads > Math.max(missingAtRead, 1), "startup and retry read the missing status");
+		if (reloadBeforeReplacement) {
+			reload();
+			assert.equal(state.asyncJobs.get("starting")?.sessionId, verifiedOwner);
+		}
 		assert.equal(state.asyncJobs.get("starting")?.status, "running");
 		assert.equal(hasLiveSubagentWork(state), true);
 		assert.equal(fs.existsSync(statusPath), false);
@@ -1586,6 +1600,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			const replacementOwner = inherited ? sessionId : "foreign";
 			writePendingAsyncResultFile(output, { id: "starting", sessionId: replacementOwner, success: true });
 			writeRunningAsyncStatus(asyncDir, "starting", replacementOwner);
+			if (reloadAfterReplacement) reload();
 			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
 			assert.equal(fs.existsSync(output), false);
 			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");

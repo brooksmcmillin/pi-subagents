@@ -178,6 +178,7 @@ interface AsyncRunListOptions {
 	onCorruptStatus?: (warning: string) => void;
 	/** Receives an active run kept in the index whose status.json this process may not read. */
 	onUnreadableActiveRun?: (runId: string, asyncDir: string, verifiedSessionId?: string) => void;
+	expectedRetrySessions?: ReadonlyMap<string, string>;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -586,17 +587,18 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		let owned = false;
-		let verifiedSessionId: string | undefined;
-		const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
+		let verifiedSessionId = options.expectedRetrySessions?.get(entry);
+		if (verifiedSessionId && owners && !owners.has(verifiedSessionId)) continue;
+		const verifyMarker = verifiedSessionId !== undefined || (options.includeTerminalPublication && activeEntries.has(entry));
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
 			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
 				if (verifyMarker && owners && !stored) {
-					options.onUnreadableActiveRun?.(entry, asyncDir);
+					if (activeEntries.has(entry)) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
 					continue;
 				}
-				if (verifyMarker && stored && stored.runId !== entry) continue;
+				if (verifyMarker && stored && (stored.runId !== entry || (verifiedSessionId && stored.sessionId !== verifiedSessionId))) continue;
 				if (stored && owners && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
