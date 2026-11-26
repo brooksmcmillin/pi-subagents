@@ -542,6 +542,37 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("notifies the terminal reporter of independent work discovered after root status loss", async () => {
+		const asyncRoot = createTempDir("pi-statusless-nested-notify-");
+		const route = createNestedRoute("statusless-nested-notify");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		const state = { ...createState(), currentSessionId: "parent" };
+		const holds: boolean[] = [];
+		const reporter = registerProgramStatusReporter({ enabled: true, isTTY: true, env: { TERM: "xterm-256color" },
+			getJobs: () => [], getPendingRequests: () => [], hasBackgroundWork: () => hasLiveSubagentWork(state) });
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 1000, onJobsChanged: reporter.sync });
+		const child = { id: "independent", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const,
+			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
+		try {
+			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) });
+			tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const statusPath = path.join(asyncDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({ runId: route.rootRunId, sessionId: "parent", state: "complete", mode: "single", startedAt: 100 }));
+			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", asyncDir, agent: "worker", nestedRoute: route });
+			await waitForCondition(() => state.cleanupTimers.has(route.rootRunId) && !hasLiveSubagentWork(state), "terminal root is idle");
+			holds.length = 0;
+			fs.rmSync(statusPath);
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 200, parentRunId: route.rootRunId, child });
+			await waitForCondition(() => holds.at(-1) === true, "reporter receives late nested hold");
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: route.rootRunId, child: { ...child, state: "complete" } });
+			await waitForCondition(() => holds.at(-1) === false, "reporter receives nested drain");
+			assert.deepEqual(holds, [true, false]);
+		} finally {
+			tracker.dispose(); reporter.dispose(); removeTempDir(asyncRoot); removeTempDir(path.dirname(route.eventSink));
+		}
+	});
+
 	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable", "after restored status access is denied", "when capture cannot read root status"]) it(`retains late independent work ${phase}`, async (t) => {
 		const rootStillRunning = phase === "before the root's terminal refresh";
 		const statusDisappears = phase === "after the root status disappears";

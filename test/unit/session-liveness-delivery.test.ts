@@ -79,7 +79,8 @@ const terminalBeforePublicationScript = String.raw`
 	};
 	const workflowReload = process.argv[1] === "workflow-reload";
 	const noStatusReload = process.argv[1] === "published-no-status-reload";
-	const delayedStatusless = process.argv[1] === "statusless-delayed-writer";
+	const closeWithStatusEIO = process.argv[1] === "statusless-writer-close-eio";
+	const delayedStatusless = process.argv[1] === "statusless-delayed-writer" || closeWithStatusEIO;
 	const statuslessWithoutReload = process.argv[1] === "statusless-delayed-no-reload";
 	const ackNestedEIO = process.argv[1] === "published-ack-nested-eio";
 	const ackStatusEIO = process.argv[1] === "published-ack-status-eio" || ackNestedEIO;
@@ -305,6 +306,13 @@ const terminalBeforePublicationScript = String.raw`
 			fsDefault.statSync = stat;
 			syncBuiltinESMExports();
 		}
+		if (closeWithStatusEIO) {
+			fsDefault.statSync = (file, ...args) => {
+				if (file === statusPath) throw Object.assign(new Error("status temporarily unreadable"), { code: "EIO" });
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
 		if (delayedStatusless) {
 			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
 			handlers.clear();
@@ -314,7 +322,7 @@ const terminalBeforePublicationScript = String.raw`
 		}
 		assert.equal(provider.isActive(), true);
 		assert.deepEqual(holds, [true]);
-		publishResult(false, true);
+		if (!closeWithStatusEIO) publishResult(false, true);
 		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
 		for (let i = 0; i < 150 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.equal(provider.isActive(), false);
@@ -643,6 +651,7 @@ describe("session liveness through result delivery", () => {
 		["forget-published-started", "settles a start-event terminal hold after result delivery and status loss"],
 		["forget-completion-first", "settles a statusless writer whose completion event preceded the first terminal refresh"],
 		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
+		["statusless-writer-close-eio", "settles verified writer closure with no payload and persistent status EIO"],
 		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],

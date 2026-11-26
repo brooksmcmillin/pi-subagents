@@ -535,13 +535,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (stored?.runId === job.asyncId) summary = summarizeAsyncStatus(job.asyncDir, stored);
 			} catch (error) {
 				if (isStatusAccessError(error, job.asyncDir)) {
-					if (pending?.pending === false && pending.nested && !hasRestoredNestedWork(job, pending)) {
-						forgetJob(job.asyncId);
-						return true;
-					}
-					return false;
-				}
-				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
+					const verifiedPublication = Boolean(deliverySession && pending?.instanceId);
+					if (!verifiedPublication && !(pending?.pending === false && pending.nested)) return false;
+					// Previously verified obligations can settle from exact delivery and close evidence below.
+				} else console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
@@ -648,10 +645,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					}
 					options.onJobTerminal?.(job, true);
 				}
-				refreshNestedLiveness(job, null);
+				const nestedChanged = refreshNestedLiveness(job, null);
 				if (nestedRefreshFailed || job.nestedWorkActive) {
 					cancelCleanup(job.asyncId);
-					return false;
+					return nestedChanged;
 				}
 				retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
 				forgetJob(job.asyncId);

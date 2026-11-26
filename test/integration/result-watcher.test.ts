@@ -13,7 +13,7 @@ import { createResultWatcher as createRawResultWatcher } from "../../src/runs/ba
 import { collectWaitCompletions } from "../../src/runs/background/wait-completions.ts";
 import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
-import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
+import { recordSessionReplacement, recordSessionStart } from "../../src/shared/session-succession.ts";
 import { missionObserverIndexPath, resultPayloadPathForMissionObserverRun, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { tryLease } from "../../src/shared/file-lease.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
@@ -435,6 +435,44 @@ describe("result watcher", () => {
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
+	});
+
+	it("drops a reclaimed predecessor queue on an index storage retry", async (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-revoked-queue-"));
+		const predecessor = "queue-predecessor";
+		const successor = "queue-successor";
+		const resultPath = path.join(resultsDir, "reclaimed.json");
+		const state = createState();
+		state.currentSessionId = successor;
+		recordSessionReplacement(successor, predecessor);
+		writeIndexedResult(resultPath, { id: "reclaimed", sessionId: predecessor, success: true });
+		const originalRead = fsDefault.readFileSync;
+		let denied = 0;
+		let queueChanges = 0;
+		let delivered = 0;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			ownership: createResultDeliveryOwnership(state),
+			onOwnedQueueChanged: () => queueChanges++,
+			notifier: { deliver: async () => { delivered++; return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); recordSessionStart(successor, true); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.primeExistingResults();
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "reclaimed.json") {
+				denied++;
+				recordSessionStart(predecessor, false);
+				assert.equal(watcher.hasPendingResults(), false, "the successor no longer owes the queued result");
+				throw Object.assign(new Error("index remains unreadable"), { code: "EIO" });
+			}
+			return originalRead(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		assert.equal(await waitForPredicate(() => queueChanges === 2), true, "revoked retry drops its cached queue entry");
+		assert.equal(state.resultFileCoalescer.flush("reclaimed.json"), false, "no retry was scheduled after reclaim");
+		assert.equal(denied, 1);
+		assert.equal(delivered, 0);
+		assert.equal(fs.existsSync(resultPath), true);
 	});
 
 	it("delivers a result once when the Pi process that launched it has exited, and keeps one from a live Pi", async () => {

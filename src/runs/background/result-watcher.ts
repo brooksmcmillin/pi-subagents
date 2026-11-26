@@ -288,6 +288,14 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
+	const stillOwns = (identity: ResultFileIdentity): boolean => Boolean(identity.sessionId
+		&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId)));
+	const hasQueuedOwnedResults = () => [...queuedOwnedResults.values()].some(stillOwns);
+	const canRetryResult = (file: string) => {
+		const identity = queuedOwnedResults.get(file);
+		return !identity || stillOwns(identity);
+	};
+
 	const holdOwnedResult = (file: string, identity: ResultFileIdentity) => {
 		const alreadyHeld = queuedOwnedResults.has(file);
 		queuedOwnedResults.set(file, identity);
@@ -450,6 +458,7 @@ export function createResultWatcher(
 			}
 		} catch (error) {
 			if (!isStorageAccessError(error)) throw error;
+			if (!canRetryResult(file)) return;
 			reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			return;
@@ -753,6 +762,7 @@ export function createResultWatcher(
 			removeDeliveredResult(file, triggerTurn, read);
 		} catch (error) {
 			if (isAccessDenied(error) || ((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) {
+				if (!canRetryResult(file)) return;
 				reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'; will retry`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			} else if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'`, error);
@@ -854,7 +864,7 @@ export function createResultWatcher(
 		}
 	};
 	const hasPendingResults = () => {
-		if (queuedOwnedResults.size) return true;
+		if (hasQueuedOwnedResults()) return true;
 		const inaccessible = new Set<string>();
 		const eligible = eligibleResultFiles((file) => inaccessible.add(file));
 		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => isPendingOwnedResult(file, true));
@@ -1014,5 +1024,5 @@ export function createResultWatcher(
 		incompleteResultRetries.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, captureReloadHolds, restoreReloadHolds, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults: () => queuedOwnedResults.size > 0, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, captureReloadHolds, restoreReloadHolds, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }
