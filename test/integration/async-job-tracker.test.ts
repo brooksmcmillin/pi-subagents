@@ -1536,15 +1536,17 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
-	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload", "inherited replacement after verified restore", "index listing EIO on reload"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
 		const inherited = phase.startsWith("inherited replacement");
-		const reloadBeforeReplacement = phase === "inherited replacement after reload";
-		const reloadAfterReplacement = phase === "inherited replacement before reload";
+		const listingFails = phase === "index listing EIO on reload";
+		const verifiedRestore = phase === "inherited replacement after verified restore";
+		const reloadBeforeReplacement = phase === "inherited replacement after reload" || listingFails;
+		const reloadAfterReplacement = phase === "inherited replacement before reload" || verifiedRestore;
 		const foreign = phase === "foreign replacement" || inherited;
 		const sessionId = inherited ? "marker-successor" : "parent";
 		const verifiedOwner = inherited ? "marker-predecessor" : "parent";
 		const terminal = phase === "terminal refresh";
-		const missingAtRead = terminal ? 3 : phase === "reconciliation" || inherited ? 2 : 0;
+		const missingAtRead = terminal ? 3 : phase === "reconciliation" || (inherited && !verifiedRestore) || listingFails ? 2 : 0;
 		const asyncRoot = createTempDir("pi-missing-startup-status-");
 		const asyncDir = path.join(asyncRoot, "starting");
 		const statusPath = path.join(asyncDir, "status.json");
@@ -1566,8 +1568,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			tracker.restoreActiveJobs(ctx);
 		};
 		const stat = fsDefault.statSync;
+		const readdir = fsDefault.readdirSync;
 		let reads = 0;
-		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		t.after(() => { fsDefault.statSync = stat; fsDefault.readdirSync = readdir; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		fs.mkdirSync(asyncDir, { recursive: true });
 		const writeOwnedStatus = () => {
 			writeRunningAsyncStatus(asyncDir, "starting", verifiedOwner);
@@ -1577,7 +1580,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 					processTerminal: { version: 1, state: "pending", runId: "starting", runnerProcessInstanceId: "writer" } }));
 			}
 		};
-		if (missingAtRead) writeOwnedStatus();
+		if (missingAtRead || verifiedRestore) writeOwnedStatus();
 		updateActiveRunIndex(asyncDir, "running");
 		fsDefault.statSync = ((file, options) => {
 			if (file === statusPath && ++reads === missingAtRead) {
@@ -1588,10 +1591,24 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
 		tracker.restoreActiveJobs(ctx);
-		await waitForCondition(() => reads > Math.max(missingAtRead, 1), "startup and retry read the missing status");
+		const readsAtRestore = reads;
+		if (verifiedRestore) {
+			assert.equal(state.asyncJobs.get("starting")?.agents?.[0], "worker");
+			fs.rmSync(statusPath);
+		}
+		await waitForCondition(() => reads > Math.max(missingAtRead, readsAtRestore), "startup and retry read the missing status");
 		if (reloadBeforeReplacement) {
+			if (listingFails) {
+				fsDefault.readdirSync = ((file, options) => {
+					if (file === path.join(asyncRoot, ".active-runs")) throw Object.assign(new Error("active index unreadable"), { code: "EIO" });
+					return Reflect.apply(readdir, fsDefault, [file, options]);
+				}) as typeof readdir;
+				syncBuiltinESMExports();
+			}
 			reload();
 			assert.equal(state.asyncJobs.get("starting")?.sessionId, verifiedOwner);
+			fsDefault.readdirSync = readdir;
+			syncBuiltinESMExports();
 		}
 		assert.equal(state.asyncJobs.get("starting")?.status, "running");
 		assert.equal(hasLiveSubagentWork(state), true);

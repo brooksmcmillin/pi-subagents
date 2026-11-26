@@ -1063,7 +1063,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			for (const job of state.asyncJobs.values()) {
 				if (!job.sessionId || !ownsRun(publicationSession.id, job.sessionId)) continue;
-				if (unverifiedRuns.has(job.asyncId)) retrySessions.set(job.asyncId, job.sessionId);
+				if (job.asyncDir === path.join(asyncDirRoot, job.asyncId)
+					&& (unverifiedRuns.has(job.asyncId) || (restoredJobs.has(job) && !isTerminalJobStatus(job.status)))) {
+					retrySessions.set(job.asyncId, job.sessionId);
+				}
 				const route = job.nestedRoute;
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
@@ -1141,6 +1144,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			// Exact handoff entries do not depend on the active index being readable.
+			for (const [runId, verifiedSessionId] of handoff?.retrySessions ?? []) {
+				if (path.basename(runId) !== runId || runId === "." || runId === ".." || !ownsRun(state.currentSessionId, verifiedSessionId)) continue;
+				unreadable.push({ runId, asyncDir: path.join(asyncDirRoot, runId), verifiedSessionId });
+			}
 		}
 		const pending = handoff?.runs;
 		if (pending) for (const [runId, publication] of pending) {
