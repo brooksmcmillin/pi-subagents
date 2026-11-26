@@ -1338,6 +1338,38 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("restores a terminal publisher and other active jobs when marker maintenance is denied", (t) => {
+		const asyncRoot = createTempDir("pi-active-marker-write-denied-");
+		const terminalDir = path.join(asyncRoot, "terminal");
+		const runningDir = path.join(asyncRoot, "running");
+		const state = { ...createState(), currentSessionId: "parent", completionOwnerId: "owner" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results") });
+		const originalWrite = fsDefault.writeFileSync;
+		t.after(() => { fsDefault.writeFileSync = originalWrite; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(runningDir, "running", "parent");
+		fs.mkdirSync(terminalDir, { recursive: true });
+		const proof = { version: 1, runId: "terminal", runnerProcessInstanceId: "writer", state: "observed", observedAt: 300,
+			instances: [{ kind: "runner", processInstanceId: "writer", closeObservedAt: 300, exitCode: 0, signal: null }] };
+		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId: "parent", completionOwnerId: "owner",
+			state: "complete", mode: "single", startedAt: 100, processTerminal: proof }));
+		fs.writeFileSync(path.join(terminalDir, "process-terminal.json"), JSON.stringify(proof));
+		updateActiveRunIndex(terminalDir, "running");
+		updateActiveRunIndex(runningDir, "running");
+		let denied = false;
+		fsDefault.writeFileSync = ((file, data, options) => {
+			if (file === path.join(asyncRoot, ACTIVE_RUN_INDEX_DIR, "terminal")) {
+				denied = true;
+				throw Object.assign(new Error("active marker write denied"), { code: "EACCES" });
+			}
+			return originalWrite(file, data, options);
+		}) as typeof fs.writeFileSync;
+		syncBuiltinESMExports();
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(denied, true);
+		assert.equal(state.asyncJobs.get("terminal")?.status, "complete");
+		assert.equal(state.asyncJobs.get("running")?.status, "running");
+	});
+
 	it("keeps active restore and stale result repair live through storage permission failures", async (t) => {
 		const asyncRoot = createTempDir("pi-async-restore-storage-");
 		const resultsDir = path.join(asyncRoot, "results");

@@ -264,7 +264,7 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native payload EIO retry", "native identity EIO", "native stat retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native payload EIO retry", "native identity EIO", "native stat retry", "native stat recovery retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
@@ -273,12 +273,17 @@ describe("result watcher", () => {
 		let watchEvent: fs.WatchListener<string> | undefined;
 		const denyDiscovery = source.endsWith("retry");
 		const reload = source === "native reload retry";
-		const injectStatFailure = reload || source === "native stat retry";
+		const recoverOnProbe = source === "native stat recovery retry";
+		const injectStatFailure = reload || recoverOnProbe || source === "native stat retry";
 		let denyStat = injectStatFailure;
 		let statDenied = false;
 		const originalStat = fsDefault.statSync;
 		const stat = ((file, options) => {
 			if (denyStat && resultReads >= 2 && String(file).endsWith("wake-order.json")) {
+				if (recoverOnProbe && new Error().stack?.includes("resultPayloadVisibility")) {
+					denyStat = false;
+					return originalStat(file, options);
+				}
 				assert.deepEqual(terminalHolds, [true]);
 				statDenied = true;
 				throw Object.assign(new Error("transient stat denial"), { code: "EACCES" });
@@ -356,6 +361,7 @@ describe("result watcher", () => {
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
 			assert.deepEqual(terminalHolds, [true, false]);
 			if (source.startsWith("native payload") || source === "native identity EIO") assert.equal(payloadRetryObserved, true);
+			if (recoverOnProbe) assert.equal(statDenied, true);
 		} finally {
 			if (injectStatFailure) {
 				fsDefault.statSync = originalStat;

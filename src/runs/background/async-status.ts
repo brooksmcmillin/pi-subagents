@@ -625,7 +625,12 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
 			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
-				updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
+				try {
+					updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
+				} catch (error) {
+					// A verified publisher is still trackable without retiring its marker.
+					if (!terminalPublication || !owned || !isStorageAccessError(error)) throw error;
+				}
 			}
 		}
 		if (status.displayDismissedAt !== undefined) continue;

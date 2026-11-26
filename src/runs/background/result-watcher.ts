@@ -388,9 +388,12 @@ export function createResultWatcher(
 		}
 	};
 
-	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false): boolean => {
+	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false, onMissingIdentity?: () => void): boolean => {
 		const inspected = inspectResult(file, knownSignature, observed, holdForDelivery && queuedOwnedResults.has(file));
-		if (!inspected) return false;
+		if (!inspected) {
+			onMissingIdentity?.();
+			return false;
+		}
 		const { identity } = inspected;
 		// Missing identity stays on the normal parser path so malformed or legacy
 		// files keep their existing diagnostics and compatibility behavior.
@@ -426,7 +429,7 @@ export function createResultWatcher(
 		const identity = queuedOwnedResults.get(file);
 		if (identity?.sessionId && identity.runId
 			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))
-			&& resultPayloadVisibility(resultsDir, identity.sessionId, identity.runId) === "unknown") {
+			&& resultPayloadVisibility(resultsDir, identity.sessionId, identity.runId, publicResultPath(file)) !== "absent") {
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
@@ -435,11 +438,13 @@ export function createResultWatcher(
 		if (processing.has(file)) return;
 		let observed: ReadonlySet<string> | undefined;
 		try {
-			if (!shouldProcessResult(file, undefined, undefined, true)) {
+			let identityReadFailed = false;
+			const missingIdentity = () => { identityReadFailed = true; };
+			if (!shouldProcessResult(file, undefined, undefined, true, missingIdentity)) {
 				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
 				observed = observedRunIds();
-				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true)) {
-					retryInaccessibleOwnedResult(file, triggerTurn);
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true, missingIdentity)) {
+					if (identityReadFailed) retryInaccessibleOwnedResult(file, triggerTurn);
 					return;
 				}
 			}
