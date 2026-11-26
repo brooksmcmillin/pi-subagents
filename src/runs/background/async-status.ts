@@ -177,7 +177,7 @@ interface AsyncRunListOptions {
 	/** Receives the warning for a skipped corrupt terminal status, so an open TUI can show it as a notice instead of console output. */
 	onCorruptStatus?: (warning: string) => void;
 	/** Receives an active run kept in the index whose status.json this process may not read. */
-	onUnreadableActiveRun?: (runId: string, asyncDir: string) => void;
+	onUnreadableActiveRun?: (runId: string, asyncDir: string, verifiedSessionId?: string) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -608,13 +608,16 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			const reconciliation = options.reconcile === false
 				? undefined
 				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined, expectedRunId: verifyMarker ? entry : undefined, expectedSessionId: verifyMarker ? verifiedSessionId : undefined }, observeStatus);
-			if (verifyMarker && reconciliation && !reconciliation.status && verifiedSessionId) continue;
+			if (verifyMarker && reconciliation && !reconciliation.status && verifiedSessionId) {
+				if (reconciliation.statusMissing) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
+				continue;
+			}
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
 			observeStatus?.(null);
 			if (verifyMarker && owned && !isStatusAccessError(error, asyncDir) && isStorageAccessError(error)) {
-				options.onUnreadableActiveRun?.(entry, asyncDir);
+				options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
 				continue;
 			}
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;

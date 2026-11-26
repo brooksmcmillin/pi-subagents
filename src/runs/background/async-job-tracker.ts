@@ -544,8 +544,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				} else console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
-			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
-				if (!pending && statusMissing) {
+			const expectedSession = handoffSession ?? job.sessionId;
+			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (expectedSession && stored.sessionId !== expectedSession)) {
+				if (statusMissing && (!pending || (pending.pending && pending.provisional))) {
 					try {
 						const age = activeRunMarkerAgeMs(job.asyncDir, options.now?.());
 						if (age !== undefined && age <= DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) return false;
@@ -1121,12 +1122,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
 		const handoff = publicationSession && reloadPublications.get(publicationSession.manager);
 		let runs: AsyncRunSummary[] = [];
-		const unreadable: Array<{ runId: string; asyncDir: string }> = [];
+		const unreadable: Array<{ runId: string; asyncDir: string; verifiedSessionId?: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
 				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
-				onUnreadableActiveRun: (runId, asyncDir) => unreadable.push({ runId, asyncDir }),
+				onUnreadableActiveRun: (runId, asyncDir, verifiedSessionId) => unreadable.push({ runId, asyncDir, verifiedSessionId }),
 			}, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
@@ -1162,9 +1163,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			watchJob(job);
 		}
 		// An unreadable run may still be working: idle must not be reported until a read settles it.
-		for (const { runId, asyncDir } of unreadable) {
+		for (const { runId, asyncDir, verifiedSessionId } of unreadable) {
 			if (state.asyncJobs.has(runId)) continue;
-			const job: AsyncJobState = { asyncId: runId, asyncDir, status: "running", sessionId: state.currentSessionId, updatedAt: Date.now() };
+			const job: AsyncJobState = { asyncId: runId, asyncDir, status: "running", sessionId: verifiedSessionId, updatedAt: Date.now() };
 			try {
 				job.controlEventCursor = restoredControlEventCursor(asyncDir);
 			} catch {

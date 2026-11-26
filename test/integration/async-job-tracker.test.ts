@@ -1536,7 +1536,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
-	for (const foreign of [false, true]) it(`keeps a missing-marker-status placeholder until ${foreign ? "foreign status is rejected" : "owned status appears"}`, async (t) => {
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+		const foreign = phase === "foreign replacement";
+		const terminal = phase === "terminal refresh";
+		const missingAtRead = terminal ? 3 : phase === "reconciliation" ? 2 : 0;
 		const asyncRoot = createTempDir("pi-missing-startup-status-");
 		const asyncDir = path.join(asyncRoot, "starting");
 		const statusPath = path.join(asyncDir, "status.json");
@@ -1548,21 +1551,37 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		let reads = 0;
 		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		fs.mkdirSync(asyncDir, { recursive: true });
+		const writeOwnedStatus = () => {
+			writeRunningAsyncStatus(asyncDir, "starting", "parent");
+			if (terminal) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+				fs.writeFileSync(statusPath, JSON.stringify({ ...status, state: "complete",
+					processTerminal: { version: 1, state: "pending", runId: "starting", runnerProcessInstanceId: "writer" } }));
+			}
+		};
+		if (missingAtRead) writeOwnedStatus();
 		updateActiveRunIndex(asyncDir, "running");
-		fsDefault.statSync = ((file, options) => { if (file === statusPath) reads++; return stat(file, options); }) as typeof fs.statSync;
+		fsDefault.statSync = ((file, options) => {
+			if (file === statusPath && ++reads === missingAtRead) fs.rmSync(statusPath);
+			return stat(file, options);
+		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
 		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
-		await waitForCondition(() => reads >= 2, "startup and retry read the missing status");
+		await waitForCondition(() => reads > Math.max(missingAtRead, 1), "startup and retry read the missing status");
 		assert.equal(state.asyncJobs.get("starting")?.status, "running");
 		assert.equal(hasLiveSubagentWork(state), true);
 		assert.equal(fs.existsSync(statusPath), false);
-		if (foreign) writePendingAsyncResultFile(output, { id: "starting", sessionId: "foreign", success: true });
-		writeRunningAsyncStatus(asyncDir, "starting", foreign ? "foreign" : "parent");
 		if (foreign) {
+			writePendingAsyncResultFile(output, { id: "starting", sessionId: "foreign", success: true });
+			writeRunningAsyncStatus(asyncDir, "starting", "foreign");
 			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
 			assert.equal(fs.existsSync(output), false);
 			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
-		} else await waitForCondition(() => state.asyncJobs.get("starting")?.agents?.[0] === "worker", "owned status recovered");
+		} else {
+			writeOwnedStatus();
+			await waitForCondition(() => state.asyncJobs.get("starting")?.agents?.[0] === "worker"
+				&& state.asyncJobs.get("starting")?.status === (terminal ? "complete" : "running"), "owned status recovered");
+		}
 	});
 
 	it("keeps a restored running job live until temporarily missing status returns", async (t) => {
