@@ -414,10 +414,10 @@ export function createResultWatcher(
 		if (dequeued) deps.onOwnedQueueChanged?.();
 	};
 
-	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot): void => {
+	const removeDeliveredResult = (file: string, triggerTurn: boolean, read: ResultSnapshot, publicPath: string): void => {
 		identityCache.delete(file);
 		try {
-			if (retireResultSnapshot(publicResultPath(file), read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
+			if (retireResultSnapshot(publicPath, read, undefined, CLEANUP_LEASE_WAIT_MS) === "replaced") scheduleResult(file, triggerTurn);
 		} catch (error) {
 			if (isAbsentResultCandidate(error)) return;
 			if (!(error instanceof FileLeaseBusyError)) reportResultWatcherWarning(state, `Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry`, error);
@@ -463,8 +463,9 @@ export function createResultWatcher(
 		// The public payload is read just before the payload itself, so anything published after the
 		// read differs from both.
 		let publicAtRead: string | undefined;
+		const publicPathFor = (payloadPath: string) => path.dirname(payloadPath) === resultsDir ? payloadPath : publicResultPath(file);
 		const readPayload = (payloadPath: string): string => {
-			publicAtRead = readResultPayload(publicResultPath(file));
+			publicAtRead = readResultPayload(publicPathFor(payloadPath));
 			return fsApi.readFileSync(payloadPath, "utf-8");
 		};
 		try {
@@ -518,7 +519,7 @@ export function createResultWatcher(
 			let read: ResultSnapshot = { runId, sessionId, toolCallId, snapshot: raw, ...(publicAtRead !== undefined && publicAtRead !== raw ? { stalePublic: publicAtRead } : {}) };
 			const markReplacedPayload = (): boolean => {
 				try {
-					if (!resultSnapshotReplaced(publicResultPath(file), read)) return false;
+					if (!resultSnapshotReplaced(publicPathFor(resultPath), read)) return false;
 				} catch (error) {
 					if (isAccessDenied(error)) throw error;
 					reportResultWatcherWarning(state, `Failed to re-read subagent result file '${publicResultPath(file)}'`, error);
@@ -568,7 +569,7 @@ export function createResultWatcher(
 				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
 				deps.onResultDelivered?.(runId);
 				if (!observerSucceeded || !completionPersisted) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-				else removeDeliveredResult(file, triggerTurn, read);
+				else removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
 				return;
 			}
 			const lastSeenAt = state.completionSeen.get(completionKey);
@@ -599,7 +600,7 @@ export function createResultWatcher(
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				removeDeliveredResult(file, triggerTurn, read);
+				removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
 				return;
 			}
 
@@ -753,7 +754,7 @@ export function createResultWatcher(
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
-			removeDeliveredResult(file, triggerTurn, read);
+			removeDeliveredResult(file, triggerTurn, read, publicPathFor(resultPath));
 		} catch (error) {
 			if (isAccessDenied(error) || ((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) {
 				if (!canRetryResult(file)) return;

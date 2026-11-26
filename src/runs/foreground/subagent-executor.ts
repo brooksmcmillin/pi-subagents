@@ -7543,8 +7543,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				if (paramsWithResolvedCwd.dir) {
 					try {
 						const location = resolveAsyncRunLocation(paramsWithResolvedCwd, DIRS.async, DIRS.results);
-						const runId = location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir);
 						const directoryStatus = location.asyncDir ? readStatus(location.asyncDir) : null;
+						const runId = targetRunId ?? directoryStatus?.runId ?? location.resolvedId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir);
 						if (directoryStatus?.mode === "workflow") {
 							return steerWorkflowRun({ state: deps.state, runId, asyncDir: location.asyncDir!, message, mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode), index: paramsWithResolvedCwd.index, signal });
 						}

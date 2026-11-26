@@ -262,7 +262,11 @@ const terminalBeforePublicationScript = String.raw`
 		if (restoreDeadRun) {
 			assert.equal(fs.readFileSync(publicPath, "utf-8"), bytes);
 			assert.ok(reports.some(report => /state=error:/.test(report)));
-		} else assert.equal(fs.existsSync(publicPath), false, "owned acknowledged alias was retired");
+		} else {
+			// Acknowledged results do not hold liveness while their coalesced cleanup runs.
+			for (let i = 0; i < 100 && fs.existsSync(publicPath); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(fs.existsSync(publicPath), false, "owned acknowledged alias was retired");
+		}
 		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
 		process.stdout.write("ok");
 		process.exit(0);
