@@ -348,8 +348,20 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		: undefined;
 	const totalTokens = sanitizeTokenUsage(raw.totalTokens);
 	const totalCost = sanitizeCost(raw.totalCost);
+	const proof = sanitizeProcessTerminal(raw.processTerminal, { runId: raw.id });
+	let processTerminal: NestedRunSummary["processTerminal"];
+	if (proof && proof.runnerProcessInstanceId.length <= 256) {
+		const identity = { version: 1 as const, runId: proof.runId, runnerProcessInstanceId: proof.runnerProcessInstanceId };
+		if (proof.state === "pending") processTerminal = { ...identity, state: "pending" };
+		if (proof.state === "observed") {
+			const runner = proof.instances.find((instance) => instance.kind === "runner")!; // Validated above.
+			const { kind, processInstanceId, closeObservedAt, exitCode, signal } = runner;
+			processTerminal = { ...identity, state: "observed", observedAt: proof.observedAt, instances: [{ kind, processInstanceId, closeObservedAt, exitCode, signal }] };
+		}
+	}
 	return {
 		id: raw.id,
+		...(processTerminal ? { processTerminal } : {}),
 		parentRunId: raw.parentRunId,
 		...(clampNumber(raw.parentStepIndex) !== undefined ? { parentStepIndex: clampNumber(raw.parentStepIndex) } : {}),
 		...(stringValue(raw.parentAgent, 128) ? { parentAgent: stringValue(raw.parentAgent, 128) } : {}),

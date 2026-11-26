@@ -543,7 +543,7 @@ function listIndexFiles(dir: string): string[] {
 	return files;
 }
 
-function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false): string[] {
+function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void): string[] {
 	const candidates = new Set<string>();
 	for (const entryPath of listIndexFiles(dir)) {
 		try {
@@ -555,6 +555,7 @@ function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending
 			const resultFile = indexedResultFile(resultsDir, entry, includePending);
 			if (resultFile) candidates.add(resultFile);
 		} catch (error) {
+			if (isStorageAccessError(error)) onUnreadableEntry?.(path.basename(entryPath));
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid async result index '${entryPath}':`, error);
 		}
 	}
@@ -595,10 +596,10 @@ function pendingResultFilesForSession(resultsDir: string, sessionId: string): st
 	return [...files];
 }
 
-export function resultCandidateFilesForSession(resultsDir: string, sessionId: string): string[] {
+export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void): string[] {
 	const files = new Set<string>();
 	for (const dir of sessionIndexDirs(resultsDir, sessionId)) {
-		for (const file of resultFilesFromIndexDir(resultsDir, dir, true)) files.add(file);
+		for (const file of resultFilesFromIndexDir(resultsDir, dir, true, onUnreadableEntry)) files.add(file);
 	}
 	for (const file of pendingResultFilesForSession(resultsDir, sessionId)) files.add(file);
 	return [...files];

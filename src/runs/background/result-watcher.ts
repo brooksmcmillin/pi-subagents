@@ -787,23 +787,23 @@ export function createResultWatcher(
 		if (resultScanLogging === "activity" && stats.files === 0 && stats.scheduled === 0) return;
 		reportSessionWarning(state, `Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`, "slow-result-scan");
 	};
-	const indexedResultCandidates = (observed: ReadonlySet<string>): string[] => {
+	const indexedResultCandidates = (observed: ReadonlySet<string>, onUnreadableEntry?: (file: string) => void): string[] => {
 		const files = new Set<string>();
 		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
 			if (!sessionId) continue;
-			for (const file of resultCandidateFilesForSession(resultsDir, sessionId)) files.add(file);
+			for (const file of resultCandidateFilesForSession(resultsDir, sessionId, onUnreadableEntry)) files.add(file);
 		}
 		for (const runId of state.asyncJobs.keys()) files.add(`${runId}.json`);
 		for (const file of missionObserverResultCandidateFiles(resultsDir)) files.add(file);
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (onStorageError?: (file: string) => void): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadableEntry?: (file: string) => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
 			const observed = observedRunIds();
-			for (const file of indexedResultCandidates(observed)) {
+			for (const file of indexedResultCandidates(observed, onUnreadableEntry)) {
 				stats.files += 1;
 				try {
 					const signature = resultSignature(file, observed);
@@ -821,7 +821,7 @@ export function createResultWatcher(
 		}
 		return files;
 	};
-	const isPendingOwnedResult = (file: string, canonicalOnly = false): boolean => {
+	const isPendingOwnedResult = (file: string, canonicalOnly = false, requireFilenameMatch = false): boolean => {
 		if (file !== path.basename(file) || !file.endsWith(".json")) return false;
 		let raw: string;
 		try {
@@ -834,6 +834,7 @@ export function createResultWatcher(
 			return !canonicalOnly && !isNotFound(error);
 		}
 		const identity = resultFileIdentity(raw, file);
+		if (requireFilenameMatch && (!identity.runId || `${identity.runId}.json` !== file)) return false;
 		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
 		try {
 			return !hasDeliveredNotification(parseResult(raw));
@@ -844,9 +845,11 @@ export function createResultWatcher(
 	};
 	const hasPendingResults = () => {
 		if (queuedOwnedResults.size) return true;
-		const inaccessible: string[] = [];
-		const eligible = eligibleResultFiles((file) => inaccessible.push(file));
-		return eligible.some((file) => isPendingOwnedResult(file)) || inaccessible.some((file) => isPendingOwnedResult(file, true));
+		const inaccessible = new Set<string>();
+		const unreadableEntries = new Set<string>();
+		const eligible = eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadableEntries.add(file));
+		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => isPendingOwnedResult(file, true))
+			|| [...unreadableEntries].some((file) => isPendingOwnedResult(file, true, true));
 	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;

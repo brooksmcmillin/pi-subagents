@@ -2857,9 +2857,10 @@ describe("result watcher", () => {
 		for (const id of ["a-denied", "z-healthy"]) writeIndexedResult(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-1", success: true, summary: id });
 		let denied = 0;
 		let denyIndex = true;
+		let denyEnumeration = false;
 		fsDefault.readFileSync = ((file, ...args) => {
 			if (denyIndex && String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "a-denied.json"
-				&& new Error().stack?.includes("readResultIndexForSessionRun")) {
+				&& (denyEnumeration || new Error().stack?.includes("readResultIndexForSessionRun"))) {
 				denied++;
 				throw Object.assign(new Error("index read failed"), { code: "EIO" });
 			}
@@ -2879,6 +2880,13 @@ describe("result watcher", () => {
 		assert.equal(watcher.hasQueuedOwnedResults(), false);
 		assert.equal(state.asyncJobs.size, 0);
 		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned public payload despite index EIO");
+		denyEnumeration = true;
+		const denialsBeforeEnumeration = denied;
+		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned payload when enumeration cannot read its entry");
+		assert.ok(denied > denialsBeforeEnumeration);
+		assert.equal(watcher.hasQueuedOwnedResults(), false, "fallback does not schedule delivery");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", success: true }));
+		assert.equal(watcher.hasPendingResults(), false, "enumeration fallback rejects the wrong run");
 		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", success: true }));
 		assert.equal(watcher.hasPendingResults(), false, "canonical fallback still verifies ownership");
 		writeIndexedResult(deniedPath, { id: "a-denied", sessionId: "session-1", success: true, summary: "owned" });
