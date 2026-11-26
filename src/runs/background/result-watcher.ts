@@ -315,20 +315,21 @@ export function createResultWatcher(
 	};
 
 	const publicResultPath = (file: string): string => path.join(resultsDir, file);
-	const publicResultFileExists = (file: string): boolean => {
+	const publicResultFileExists = (file: string, onInaccessible?: () => void): boolean => {
 		try {
 			return fsApi.statSync(publicResultPath(file)).isFile();
 		} catch (error) {
-			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'`, error);
+			if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+			else if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'`, error);
 			return false;
 		}
 	};
-	const resultPayloadPath = (file: string, observed?: ReadonlySet<string>): string | undefined => {
+	const resultPayloadPath = (file: string, observed?: ReadonlySet<string>, onInaccessible?: () => void): string | undefined => {
 		if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
 		const runId = file.replace(/\.json$/i, "");
 		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
 			if (!sessionId) continue;
-			const sessionResult = resultPayloadPathForSessionRun(resultsDir, sessionId, runId);
+			const sessionResult = resultPayloadPathForSessionRun(resultsDir, sessionId, runId, onInaccessible);
 			if (sessionResult) return sessionResult;
 		}
 		const observerResult = resultPayloadPathForMissionObserverRun(resultsDir, runId);
@@ -337,10 +338,10 @@ export function createResultWatcher(
 			const indexedResult = resultPayloadPathForIndexedRun(resultsDir, runId);
 			if (indexedResult) return indexedResult;
 		}
-		return publicResultFileExists(file) ? publicResultPath(file) : undefined;
+		return publicResultFileExists(file, onInaccessible) ? publicResultPath(file) : undefined;
 	};
-	const resultSignature = (file: string, observed?: ReadonlySet<string>): string | undefined => {
-		const resultPath = resultPayloadPath(file, observed);
+	const resultSignature = (file: string, observed?: ReadonlySet<string>, onInaccessible?: () => void): string | undefined => {
+		const resultPath = resultPayloadPath(file, observed, onInaccessible);
 		if (!resultPath) {
 			identityCache.delete(file);
 			return undefined;
@@ -352,15 +353,16 @@ export function createResultWatcher(
 		} catch (error) {
 			identityCache.delete(file);
 			if (isAccessDenied(error)) throw error;
-			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
+			if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+			else if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
 	};
 	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>, processingOwned = false, onUnreadablePayload?: () => void): { identity: ResultFileIdentity; signature: string } | undefined => {
-		const resultPath = resultPayloadPath(file, observed);
+		const resultPath = resultPayloadPath(file, observed, onUnreadablePayload);
 		if (!resultPath) return undefined;
 		try {
-			const signature = knownSignature ?? resultSignature(file, observed);
+			const signature = knownSignature ?? resultSignature(file, observed, onUnreadablePayload);
 			if (!signature) return undefined;
 			const cached = identityCache.get(file);
 			if (cached?.signature === signature) return { identity: cached.identity, signature };
@@ -808,7 +810,7 @@ export function createResultWatcher(
 			for (const file of indexedResultCandidates(observed, onStorageError, onUnreadablePending)) {
 				stats.files += 1;
 				try {
-					const signature = resultSignature(file, observed);
+					const signature = resultSignature(file, observed, () => onUnreadablePayload?.(file));
 					if (!signature || !shouldProcessResult(file, observed, signature, false, undefined, () => onUnreadablePayload?.(file))) continue;
 					stats.scheduled += 1;
 					files.push(file);

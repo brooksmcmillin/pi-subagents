@@ -360,11 +360,12 @@ export function resultPayloadMatchesSessionRun(data: unknown, sessionId: string,
 	return (nonEmptyString(record.runId) ?? nonEmptyString(record.id)) === runId && nonEmptyString(record.sessionId) === sessionId;
 }
 
-function pendingResultPayloadMatches(filePath: string, sessionId: string, runId: string): boolean {
+function pendingResultPayloadMatches(filePath: string, sessionId: string, runId: string, onInaccessible?: () => void): boolean {
 	try {
 		return resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(filePath, "utf-8")), sessionId, runId);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${filePath}':`, error);
+		if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${filePath}':`, error);
 		return false;
 	}
 }
@@ -409,10 +410,10 @@ interface ResultPayloadLocation {
 	state: "public" | "pending";
 }
 
-function pendingResultLocationForSessionRun(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId)): ResultPayloadLocation | undefined {
+function pendingResultLocationForSessionRun(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), onInaccessible?: () => void): ResultPayloadLocation | undefined {
 	if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
-	if (!pendingPath || !pendingResultPayloadMatches(pendingPath, sessionId, runId)) return undefined;
+	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId), onInaccessible);
+	if (!pendingPath || !pendingResultPayloadMatches(pendingPath, sessionId, runId, onInaccessible)) return undefined;
 	return { file, path: pendingPath, state: "pending" };
 }
 
@@ -447,7 +448,7 @@ function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEn
 	if (entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
 	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file, { onInaccessible });
 	if (pendingState === "pending") {
-		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file);
+		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file, onInaccessible);
 	}
 	const resultPath = path.join(resultsDir, entry.file);
 	if (pendingState === "promoted" || existingResultFile(resultPath, onInaccessible)) return { file: entry.file, path: resultPath, state: "public" };
@@ -482,10 +483,10 @@ export function indexedResultPayloadVisibility(resultsDir: string, sessionId: st
 	}
 }
 
-export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
+export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void): string | undefined {
 	const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
-	return (entry ? resultPayloadLocationFromIndex(resultsDir, entry) : undefined)?.path
-		?? pendingResultLocationForSessionRun(resultsDir, sessionId, runId)?.path;
+	return (entry ? resultPayloadLocationFromIndex(resultsDir, entry, onInaccessible) : undefined)?.path
+		?? pendingResultLocationForSessionRun(resultsDir, sessionId, runId, undefined, onInaccessible)?.path;
 }
 
 export function resultPayloadPathForMissionObserverRun(resultsDir: string, runId: string): string | undefined {

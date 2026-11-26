@@ -2942,10 +2942,11 @@ describe("result watcher", () => {
 		assert.equal(denied, previousDenials);
 	});
 
-	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload", "index directory", "pending-only directory", "public stat", "pending-only stat"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
+	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload", "index directory", "pending-only directory", "public stat", "pending-only stat", "public path recheck stat", "public signature stat"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
 		const pendingOnly = failure.startsWith("pending-only");
 		const failListing = failure.endsWith("directory");
 		const failStat = failure.endsWith("stat");
+		const recheckStat = failure === "public path recheck stat" || failure === "public signature stat";
 		const failPayload = failure.endsWith("payload");
 		const hasNestedOwner = failure === "index with nested ownership fields";
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
@@ -2985,8 +2986,13 @@ describe("result watcher", () => {
 		}
 		if (failStat) fsDefault.statSync = ((file, options) => {
 			if (failing && (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output)) {
-				denials++;
-				throw Object.assign(new Error("payload stat unavailable"), { code: "EIO" });
+				const stack = recheckStat ? new Error().stack ?? "" : "";
+				const failHere = !recheckStat || (stack.includes("resultSignature")
+					&& (failure === "public path recheck stat" ? stack.includes("resultPayloadPath") : !stack.includes("resultPayloadPath")));
+				if (failHere) {
+					denials++;
+					throw Object.assign(new Error("payload stat unavailable"), { code: "EIO" });
+				}
 			}
 			return stat(file, options);
 		}) as typeof fs.statSync;
