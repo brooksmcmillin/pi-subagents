@@ -1063,9 +1063,17 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			for (const job of state.asyncJobs.values()) {
 				if (!job.sessionId || !ownsRun(publicationSession.id, job.sessionId)) continue;
-				if (job.asyncDir === path.join(asyncDirRoot, job.asyncId)
-					&& (unverifiedRuns.has(job.asyncId) || (restoredJobs.has(job) && !isTerminalJobStatus(job.status)))) {
-					retrySessions.set(job.asyncId, job.sessionId);
+				if (job.asyncDir === path.join(asyncDirRoot, job.asyncId) && !isTerminalJobStatus(job.status)) {
+					let verified = unverifiedRuns.has(job.asyncId) || restoredJobs.has(job);
+					if (!verified) {
+						try {
+							const stored = readStatus(job.asyncDir);
+							verified = stored?.runId === job.asyncId && stored.sessionId === job.sessionId;
+						} catch {
+							// A launch event alone does not verify the stored run.
+						}
+					}
+					if (verified) retrySessions.set(job.asyncId, job.sessionId);
 				}
 				const route = job.nestedRoute;
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
@@ -1132,13 +1140,17 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
 		const saved = publicationSession && reloadPublications.get(publicationSession.manager);
 		const handoff = saved?.sessionId === state.currentSessionId ? saved : undefined;
+		const expectedSessions = new Map(handoff?.retrySessions);
+		for (const job of state.asyncJobs.values()) {
+			if (job.sessionId && job.asyncDir === path.join(asyncDirRoot, job.asyncId)) expectedSessions.set(job.asyncId, job.sessionId);
+		}
 		let runs: AsyncRunSummary[] = [];
 		const unreadable: Array<{ runId: string; asyncDir: string; verifiedSessionId?: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
 				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
-				expectedRetrySessions: handoff?.retrySessions,
+				expectedRetrySessions: expectedSessions,
 				onUnreadableActiveRun: (runId, asyncDir, verifiedSessionId) => unreadable.push({ runId, asyncDir, verifiedSessionId }),
 			}, observeStatus);
 		} catch (error) {

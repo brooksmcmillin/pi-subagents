@@ -1536,9 +1536,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
-	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload", "inherited replacement after verified restore", "index listing EIO on reload"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO", "inherited replacement before reload", "inherited replacement after reload", "inherited replacement after verified restore", "inherited replacement on repeat scan", "index listing EIO on reload", "index listing EIO after local launch"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
 		const inherited = phase.startsWith("inherited replacement");
-		const listingFails = phase === "index listing EIO on reload";
+		const localLaunch = phase === "index listing EIO after local launch";
+		const listingFails = phase === "index listing EIO on reload" || localLaunch;
 		const verifiedRestore = phase === "inherited replacement after verified restore";
 		const reloadBeforeReplacement = phase === "inherited replacement after reload" || listingFails;
 		const reloadAfterReplacement = phase === "inherited replacement before reload" || verifiedRestore;
@@ -1546,7 +1547,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const sessionId = inherited ? "marker-successor" : "parent";
 		const verifiedOwner = inherited ? "marker-predecessor" : "parent";
 		const terminal = phase === "terminal refresh";
-		const missingAtRead = terminal ? 3 : phase === "reconciliation" || (inherited && !verifiedRestore) || listingFails ? 2 : 0;
+		const missingAtRead = terminal ? 3 : phase === "reconciliation" || (inherited && !verifiedRestore) || (listingFails && !localLaunch) ? 2 : 0;
 		const asyncRoot = createTempDir("pi-missing-startup-status-");
 		const asyncDir = path.join(asyncRoot, "starting");
 		const statusPath = path.join(asyncDir, "status.json");
@@ -1581,7 +1582,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			}
 		};
 		if (missingAtRead || verifiedRestore) writeOwnedStatus();
-		updateActiveRunIndex(asyncDir, "running");
+		if (!localLaunch) updateActiveRunIndex(asyncDir, "running");
 		fsDefault.statSync = ((file, options) => {
 			if (file === statusPath && ++reads === missingAtRead) {
 				fs.rmSync(statusPath);
@@ -1596,7 +1597,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(state.asyncJobs.get("starting")?.agents?.[0], "worker");
 			fs.rmSync(statusPath);
 		}
-		await waitForCondition(() => reads > Math.max(missingAtRead, readsAtRestore), "startup and retry read the missing status");
+		if (localLaunch) {
+			assert.equal(state.asyncJobs.size, 0);
+			writeOwnedStatus();
+			updateActiveRunIndex(asyncDir, "running");
+			tracker.handleStarted({ id: "starting", asyncDir, sessionId, agent: "worker" });
+		} else await waitForCondition(() => reads > Math.max(missingAtRead, readsAtRestore), "startup and retry read the missing status");
 		if (reloadBeforeReplacement) {
 			if (listingFails) {
 				fsDefault.readdirSync = ((file, options) => {
@@ -1612,12 +1618,16 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 		assert.equal(state.asyncJobs.get("starting")?.status, "running");
 		assert.equal(hasLiveSubagentWork(state), true);
-		assert.equal(fs.existsSync(statusPath), false);
+		assert.equal(fs.existsSync(statusPath), localLaunch);
 		if (foreign) {
 			const replacementOwner = inherited ? sessionId : "foreign";
 			writePendingAsyncResultFile(output, { id: "starting", sessionId: replacementOwner, success: true });
 			writeRunningAsyncStatus(asyncDir, "starting", replacementOwner);
 			if (reloadAfterReplacement) reload();
+			if (phase === "inherited replacement on repeat scan") {
+				tracker.restoreActiveJobs(ctx);
+				assert.equal(state.asyncJobs.get("starting")?.sessionId, verifiedOwner);
+			}
 			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
 			assert.equal(fs.existsSync(output), false);
 			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
