@@ -98,7 +98,8 @@ const terminalBeforePublicationScript = String.raw`
 	const inheritedPublication = process.argv[1] === "inherited-publication" || originalReopened;
 	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
 	const forgetRestored = process.argv[1] === "forget-restored";
-	const forgetStarted = process.argv[1] === "forget-started";
+	const forgetPublished = process.argv[1] === "forget-published-started";
+	const forgetStarted = process.argv[1] === "forget-started" || forgetPublished;
 	const startedRoute = forgetStarted ? createNestedRoute(runId) : undefined;
 	if (startedRoute) {
 		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId,
@@ -360,6 +361,13 @@ const terminalBeforePublicationScript = String.raw`
 		assert.ok(reports.some(report => report.includes("state=clear:")), "terminal child was projected while the root still held");
 	}
 	if (forgetRestored || forgetStarted) {
+		if (forgetPublished) {
+			publishResult(false, true);
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			const pathToResult = resultFilePath(DIRS.results, runId);
+			for (let i = 0; i < 100 && fs.existsSync(pathToResult); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(fs.existsSync(pathToResult), false);
+		}
 		assert.deepEqual(holds, [true]);
 		fs.rmSync(path.join(asyncDir, "status.json"));
 		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
@@ -625,6 +633,7 @@ describe("session liveness through result delivery", () => {
 		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
 		["forget-restored", "settles a restored hold after status disappears with no payload"],
 		["forget-started", "settles a start-event terminal hold after status disappears and writer closes"],
+		["forget-published-started", "settles a start-event terminal hold after result delivery and status loss"],
 		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
 		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],

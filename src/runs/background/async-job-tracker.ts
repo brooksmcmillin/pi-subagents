@@ -108,7 +108,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
 	type PendingPublication = { instanceId?: string; pending: true; provisional?: true; deliverySessionId?: string };
-	type PublicationObligation = PendingPublication | { pending: false };
+	type PublicationObligation = PendingPublication | { pending: false; instanceId?: string };
 	const terminalPublications = new Map<string, PublicationObligation>();
 	type ReloadObligation = PublicationObligation & { nested?: { route: NonNullable<AsyncJobState["nestedRoute"]>; sessionId: string; rootExited: boolean } };
 	const unverifiedPublications = new Map<string, ReloadObligation>();
@@ -505,7 +505,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (!nested || nested.route.rootRunId !== job.asyncId || !ownsRun(state.currentSessionId, nested.sessionId)) return false;
 		try {
 			reconcileNestedAsyncDescendants(nested.route, { resultsDir, kill: options.kill, now: options.now });
-			return hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(nested.route).children, nested.rootExited);
+			const rootExited = nested.rootExited || Boolean(handoff.instanceId
+				&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: handoff.instanceId })?.state === "observed");
+			return hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(nested.route).children, rootExited);
 		} catch {
 			return true; // The original owner verified this route; retry after storage recovers.
 		}
@@ -630,11 +632,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			});
 			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
 				const publication = terminalPublications.get(job.asyncId);
-				if (publication?.pending && publication.instanceId) {
+				if (publication?.instanceId) {
 					if (readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed") {
 						verifiedRootClose.add(job);
 					}
-					if (!verifiedRootClose.has(job) && !options.hasDeliveredResult?.(job.asyncId)) {
+					if (publication.pending && !verifiedRootClose.has(job) && !options.hasDeliveredResult?.(job.asyncId)) {
 						cancelCleanup(job.asyncId);
 						return false;
 					}
@@ -733,7 +735,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				const nestedLivenessChanged = refreshNestedLiveness(job, status);
 				if (isTerminalJobStatus(job.status)) {
 					const nestedOnly = unverifiedPublications.get(job.asyncId)?.pending === false;
-					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false });
+					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false, instanceId: unverifiedPublications.get(job.asyncId)?.instanceId });
 					let publication = terminalPublications.get(job.asyncId);
 					if (!publication && status.mode !== "workflow" && status.runId === job.asyncId
 						&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")) {
@@ -758,7 +760,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 							|| (status.processTerminal?.runnerProcessInstanceId === publication.instanceId && rootWriterClosed(job, status))
 							|| readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed");
 						if (published || publicationClosed) {
-							publication = { pending: false };
+							publication = { pending: false, instanceId: publication.instanceId };
 							terminalPublications.set(job.asyncId, publication);
 						} else cancelCleanup(job.asyncId);
 					}
@@ -1018,7 +1020,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			// Delivery can precede the first terminal status refresh. Remember its
 			// settlement even when no pending publication has been observed yet.
-			terminalPublications.set(asyncId, publicationVisibilityUnknown ? { pending: true } : { pending: false });
+			const instanceId = terminalPublications.get(asyncId)?.instanceId;
+			terminalPublications.set(asyncId, publicationVisibilityUnknown ? { pending: true, instanceId } : { pending: false, instanceId });
 			if (publicationVisibilityUnknown) cancelCleanup(asyncId);
 			try {
 				updateAsyncJobNestedProjection(job);
@@ -1063,7 +1066,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					nestedActive = true;
 				}
 				if (nestedActive) {
-					const publication = runs.get(job.asyncId) ?? (isTerminalJobStatus(job.status) ? { pending: false } : { pending: true, provisional: true });
+					const publication = runs.get(job.asyncId) ?? (isTerminalJobStatus(job.status) ? { pending: false, instanceId: terminalPublications.get(job.asyncId)?.instanceId } : { pending: true, provisional: true });
 					runs.set(job.asyncId, { ...publication, nested: { route, sessionId: job.sessionId, rootExited } });
 				}
 			}

@@ -2848,7 +2848,35 @@ describe("result watcher", () => {
 		}
 	});
 
-	it("retries delivery after a transient session index access denial", async () => {
+	it("scans a healthy result after an unreadable indexed sibling", async (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-index-sibling-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const originalRead = fsDefault.readFileSync;
+		const order: string[] = [];
+		for (const id of ["a-denied", "z-healthy"]) writeIndexedResult(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-1", success: true, summary: id });
+		let denied = false;
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "a-denied.json"
+				&& new Error().stack?.includes("readResultIndexForSessionRun")) {
+				denied = true;
+				throw Object.assign(new Error("index read failed"), { code: "EIO" });
+			}
+			return originalRead(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			notifier: { deliver: async (result) => { order.push(String(result.summary)); return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.primeExistingResults();
+		assert.equal(await waitForPredicate(() => order.includes("z-healthy")), true);
+		assert.equal(denied, true);
+		assert.deepEqual(order, ["z-healthy"]);
+		assert.equal(fs.existsSync(path.join(resultsDir, "a-denied.json")), true);
+	});
+
+	for (const indexEIO of [false, true]) it(`retries native delivery after a transient ${indexEIO ? "unowned index EIO" : "session index access denial"}`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-index-retry-"));
 		const originalError = console.error;
 		const originalReadFileSync = fsDefault.readFileSync;
@@ -2870,9 +2898,9 @@ describe("result watcher", () => {
 				if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
 					indexReads += 1;
 				}
-				if (indexReads === 2 && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				if (indexReads === (indexEIO ? 1 : 2) && String(file).includes(`${path.sep}result-index${path.sep}`)) {
 					const error = new Error("permission denied") as NodeJS.ErrnoException;
-					error.code = "EACCES";
+					error.code = indexEIO ? "EIO" : "EACCES";
 					throw error;
 				}
 				return originalReadFileSync(file, ...args);
@@ -2880,11 +2908,18 @@ describe("result watcher", () => {
 			syncBuiltinESMExports();
 
 			const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { emitted.push(event); } } }, state, resultsDir, 60_000, {
-				fs: { ...fs, watch: (_path, callback) => { watchEvent = callback as typeof watchEvent; return fakeWatcher; } },
+				fs: { ...fs,
+					watch: (_path, callback) => { watchEvent = callback as typeof watchEvent; return fakeWatcher; },
+					...(indexEIO ? { readFileSync: ((file, ...args) => {
+						if (file === resultPath && indexReads === 0) throw Object.assign(new Error("initial native discovery unavailable"), { code: "ENOENT" });
+						return originalReadFileSync(file, ...args);
+					}) as typeof fs.readFileSync } : {}),
+				},
 			});
 			try {
 				watcher.startResultWatcher();
 				watchEvent?.("change", "index-retry.json");
+				if (indexEIO) assert.equal(watcher.hasQueuedOwnedResults(), false);
 				assert.equal(await waitForPredicate(() => emitted.includes("subagent:async-complete")), true);
 			} finally {
 				watcher.stopResultWatcher();

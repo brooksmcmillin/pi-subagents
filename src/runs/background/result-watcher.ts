@@ -20,7 +20,7 @@ import {
 	resolveSubagentResultStatus,
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
-import { resolveWatchPath } from "../../shared/utils.ts";
+import { isStorageAccessError, resolveWatchPath } from "../../shared/utils.ts";
 import { FileLeaseBusyError } from "../../shared/file-lease.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
 import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
@@ -449,7 +449,7 @@ export function createResultWatcher(
 				}
 			}
 		} catch (error) {
-			if (!isAccessDenied(error) && !((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) throw error;
+			if (!isStorageAccessError(error)) throw error;
 			reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			return;
@@ -805,11 +805,14 @@ export function createResultWatcher(
 			const observed = observedRunIds();
 			for (const file of indexedResultCandidates(observed)) {
 				stats.files += 1;
-				const signature = resultSignature(file, observed);
-				if (!signature) continue;
-				if (!shouldProcessResult(file, observed, signature)) continue;
-				stats.scheduled += 1;
-				files.push(file);
+				try {
+					const signature = resultSignature(file, observed);
+					if (!signature || !shouldProcessResult(file, observed, signature)) continue;
+					stats.scheduled += 1;
+					files.push(file);
+				} catch (error) {
+					if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to inspect indexed subagent result '${file}'`, error);
+				}
 			}
 			logScanStats(stats);
 		} catch (error) {
@@ -818,10 +821,10 @@ export function createResultWatcher(
 		return files;
 	};
 	const hasPendingResults = () => eligibleResultFiles().some((file) => {
-		const payloadPath = resultPayloadPath(file);
-		if (!payloadPath) return false;
 		let raw: string;
 		try {
+			const payloadPath = resultPayloadPath(file);
+			if (!payloadPath) return false;
 			raw = fsApi.readFileSync(payloadPath, "utf-8");
 		} catch (error) {
 			// Removed since the scan means delivered; an unreadable file is still owed to someone, so the switch asks.
