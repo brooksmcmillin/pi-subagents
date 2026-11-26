@@ -279,13 +279,18 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
+	const holdOwnedResult = (file: string) => {
+		if (queuedOwnedResults.has(file)) return;
+		queuedOwnedResults.add(file);
+		deps.onOwnedQueueChanged?.();
+	};
+
 	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0, identity = identityCache.get(file)?.identity) => {
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
-		if (delayMs === 0 && identity?.sessionId && !queuedOwnedResults.has(file)
+		if (delayMs === 0 && identity?.sessionId
 			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
-			queuedOwnedResults.add(file);
-			deps.onOwnedQueueChanged?.();
+			holdOwnedResult(file);
 		}
 		state.resultFileCoalescer.schedule(file, delayMs);
 	};
@@ -605,6 +610,8 @@ export function createResultWatcher(
 				return;
 			}
 
+			// Discovery may not have been able to read the result. Its owner is now verified.
+			holdOwnedResult(file);
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
 			if (deliverIntercomResults && intercomTarget && triggerTurn) {

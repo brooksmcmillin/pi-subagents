@@ -255,6 +255,7 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			sent.clear();
 			clearTimeout(wakeRefresh);
 			wakeRefresh = undefined;
+			// Pi retires the old runner's keys on replacement. Clearing here could flash done before the new runner reports.
 			setBackgroundWork = undefined;
 			reportedBackgroundWork = false;
 			active = false;

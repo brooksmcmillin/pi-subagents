@@ -132,10 +132,12 @@ const terminalBeforePublicationScript = String.raw`
 		send = nextSend();
 		const stat = fsDefault.statSync;
 		let pendingProbeDenied = false;
+		let trackerRetryDenied = false;
 		if (pendingCase) {
 			fsDefault.statSync = (file, ...args) => {
 				if (String(file).includes("result-pending")) {
 					pendingProbeDenied = true;
+					if ((new Error().stack ?? "").includes("/src/runs/background/async-job-tracker.ts")) trackerRetryDenied = true;
 					throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
 				}
 				return stat(file, ...args);
@@ -146,6 +148,8 @@ const terminalBeforePublicationScript = String.raw`
 			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, summary: "child complete" });
 			if (pendingCase) {
 				assert.equal(pendingProbeDenied, true);
+				for (let i = 0; i < 130 && !trackerRetryDenied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(trackerRetryDenied, true, "terminal tracker retried before storage became readable");
 				assert.deepEqual(holds, [true]);
 				assert.equal(reports.some(report => /state=(done|error):/.test(report)), false);
 			}

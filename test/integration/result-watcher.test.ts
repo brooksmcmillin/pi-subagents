@@ -264,38 +264,48 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
 		const order: string[] = [];
 		const terminalHolds: boolean[] = [];
 		let watchEvent: fs.WatchListener<string> | undefined;
+		let denyFirstRead = source === "native watch retry";
 		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
 			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
 			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) order.push("subscriber wake");
 		} } }, state, resultsDir, 60_000, {
-			notifier: { async deliver() { order.push("non-waking notice"); return true; } },
+			notifier: { async deliver() { assert.deepEqual(terminalHolds, [true]); order.push("non-waking notice"); return true; } },
 			onResultDelivered: () => order.push("release"),
 			onOwnedQueueChanged: reporter.sync,
-			fs: { ...fs, watch(_dir, listener) {
-				watchEvent = listener as typeof watchEvent;
-				const handle = { on: () => handle, close() {}, unref() {} };
-				return handle as unknown as fs.FSWatcher;
-			} },
+			fs: { ...fs,
+				watch(_dir, listener) {
+					watchEvent = listener as typeof watchEvent;
+					const handle = { on: () => handle, close() {}, unref() {} };
+					return handle as unknown as fs.FSWatcher;
+				},
+				readFileSync: ((file, options) => {
+					if (denyFirstRead && String(file).endsWith("wake-order.json")) {
+						denyFirstRead = false;
+						throw Object.assign(new Error("transient read failure"), { code: "EACCES" });
+					}
+					return fs.readFileSync(file, options);
+				}) as typeof fs.readFileSync,
+			},
 		});
 		try {
 			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
-			if (source === "native watch") watcher.startResultWatcher();
+			if (source !== "indexed scan") watcher.startResultWatcher();
 			const resultPath = path.join(resultsDir, "wake-order.json");
 			writeIndexedResult(resultPath, { id: "wake-order", sessionId: "session-current", success: true, summary: "done" });
-			if (source === "native watch") {
+			if (source !== "indexed scan") {
 				assert.ok(watchEvent);
 				watchEvent("rename", "wake-order.json");
 			} else watcher.primeExistingResults();
 			assert.equal(state.asyncJobs.size, 0);
-			assert.deepEqual(terminalHolds, [true], "owned indexed work is held before coalescing");
+			assert.deepEqual(terminalHolds, source === "native watch retry" ? [] : [true], "hold begins when ownership is known");
 			assert.deepEqual(order, []);
 			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
