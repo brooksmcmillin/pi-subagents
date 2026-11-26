@@ -570,7 +570,7 @@ export function resultFilesForSession(resultsDir: string, sessionId: string): st
 	return [...files];
 }
 
-function pendingResultFilesForSession(resultsDir: string, sessionId: string): string[] {
+function pendingResultFilesForSession(resultsDir: string, sessionId: string, onUnreadablePending?: () => void): string[] {
 	const files = new Set<string>();
 	for (const dir of pendingSessionDirs(resultsDir, sessionId)) {
 		let entries: fs.Dirent[];
@@ -589,19 +589,20 @@ function pendingResultFilesForSession(resultsDir: string, sessionId: string): st
 				const runId = nonEmptyString(data.runId) ?? nonEmptyString(data.id);
 				if (runId && nonEmptyString(data.sessionId) === sessionId) files.add(resultFileName(runId));
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${pendingPath}':`, error);
+				if (isStorageAccessError(error) && onUnreadablePending) onUnreadablePending();
+				else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${pendingPath}':`, error);
 			}
 		}
 	}
 	return [...files];
 }
 
-export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void): string[] {
+export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void, onUnreadablePending?: () => void): string[] {
 	const files = new Set<string>();
 	for (const dir of sessionIndexDirs(resultsDir, sessionId)) {
 		for (const file of resultFilesFromIndexDir(resultsDir, dir, true, onUnreadableEntry)) files.add(file);
 	}
-	for (const file of pendingResultFilesForSession(resultsDir, sessionId)) files.add(file);
+	for (const file of pendingResultFilesForSession(resultsDir, sessionId, onUnreadablePending)) files.add(file);
 	return [...files];
 }
 

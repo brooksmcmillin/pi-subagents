@@ -2942,14 +2942,17 @@ describe("result watcher", () => {
 		assert.equal(denied, previousDenials);
 	});
 
-	for (const failure of ["index", "payload", "index with nested ownership fields"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
-		const failPayload = failure === "payload";
+	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
+		const pendingOnly = failure.startsWith("pending-only");
+		const failPayload = failure.endsWith("payload");
 		const hasNestedOwner = failure === "index with nested ownership fields";
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
 		const state = createState();
 		state.currentSessionId = "session-1";
 		const output = path.join(resultsDir, "saved.json");
-		writeIndexedResult(output, { id: "saved", sessionId: "session-1", success: true });
+		if (pendingOnly) writePendingAsyncResultFile(output, { id: "saved", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID, success: true });
+		else writeIndexedResult(output, { id: "saved", sessionId: "session-1", success: true });
+		assert.equal(fs.existsSync(output), !pendingOnly);
 		if (hasNestedOwner) {
 			fs.writeFileSync(output, JSON.stringify({ id: "saved", sessionId: "session-1", success: true,
 				completionOwnerId: "departed-canonical-owner", completionOwnerProcess: { pid: 2147483647 },
@@ -2959,7 +2962,7 @@ describe("result watcher", () => {
 		let failing = true;
 		let denials = 0;
 		fsDefault.readFileSync = ((file, ...args) => {
-			if (failing && (failPayload ? file === output : String(file).includes(`${path.sep}result-index${path.sep}`))) {
+			if (failing && (failPayload ? (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output) : String(file).includes(`${path.sep}result-index${path.sep}`))) {
 				denials++;
 				throw Object.assign(new Error("index unreadable"), { code: "EIO" });
 			}
@@ -2976,14 +2979,14 @@ describe("result watcher", () => {
 		if (hasNestedOwner) assert.equal(watcher.hasPendingResults(), true, "switch uses only top-level ownership fields");
 		watcher.primeExistingResults();
 		assert.equal(state.asyncJobs.size, 0);
-		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload);
+		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload && !pendingOnly);
 		const startupDenials = denials;
 		assert.ok(startupDenials > 0);
-		assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
-		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload);
+		assert.equal(await waitForPredicate(() => denials > startupDenials, 4500), true, "first retry still sees EIO");
+		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload && !pendingOnly);
 		assert.equal(delivered, 0);
 		failing = false;
-		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults()), true);
+		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults(), 4500), true);
 	});
 
 	for (const indexEIO of [false, true]) it(`retries native delivery after a transient ${indexEIO ? "unowned index EIO" : "session index access denial"}`, async () => {

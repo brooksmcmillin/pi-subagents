@@ -7,7 +7,7 @@ import type { AsyncStatus, Details, SteerActionResult, SubagentState, ToolBudget
 import { readStatus } from "../../shared/utils.ts";
 import { deliverInterruptRequest, queueRevivalBrief, requestAsyncSteer, type SteerDeliveryMode, type SteerRequest } from "../background/control-channel.ts";
 import { resolveAsyncResumeTarget } from "../background/async-resume.ts";
-import { reconcileAsyncRunForControl } from "../background/stale-run-reconciler.ts";
+import { reconcileVerifiedAsyncRun } from "../background/stale-run-reconciler.ts";
 import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringReceipt, updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
@@ -81,7 +81,7 @@ export async function steerAsyncRun(input: {
 			details: { mode: "management", results: [] },
 		};
 	}
-	const status = snapshot ? reconcileAsyncRunForControl(asyncDir, snapshot, input.kill) : null;
+	const status = snapshot ? reconcileVerifiedAsyncRun(asyncDir, snapshot, { kill: input.kill }) : null;
 	if (!status) {
 		return {
 			content: [{ type: "text", text: `Async run '${input.runId}' was not found.` }],

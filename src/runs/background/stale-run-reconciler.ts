@@ -494,11 +494,11 @@ export function checkRecordedPidLiveness(recorded: RecordedPid, observation: Rec
 	return liveness === "dead" && scopeMismatch ? "unknown" : liveness;
 }
 
-// A caller must authorize the snapshot before attempting live control.
-export function reconcileAsyncRunForControl(asyncDir: string, verified: AsyncStatus, kill?: ReconcileAsyncRunOptions["kill"]): AsyncStatus | null {
+// Control and inspection may use an exact status when ancillary result storage is unavailable.
+export function reconcileVerifiedAsyncRun(asyncDir: string, verified: AsyncStatus, options: Pick<ReconcileAsyncRunOptions, "kill" | "now" | "resultsDir"> = {}): AsyncStatus | null {
 	const { runId: expectedRunId, sessionId: expectedSessionId } = verified;
 	try {
-		return reconcileAsyncRun(asyncDir, { kill, expectedRunId, expectedSessionId }).status;
+		return reconcileAsyncRun(asyncDir, { ...options, expectedRunId, expectedSessionId }).status;
 	} catch (error) {
 		if (!isStorageAccessError(error) || isStatusAccessError(error, asyncDir)) throw error;
 		const current = readStatus(asyncDir);

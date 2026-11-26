@@ -259,6 +259,7 @@ export function createResultWatcher(
 	let deliveryActive = true;
 	let deliveryEpoch = 0;
 	let resultScanTimer: ReturnType<typeof setInterval> | null = null;
+	let discoveryRetry: ReturnType<typeof setTimeout> | undefined;
 	// The sole in-memory ownership lease. It is acquired for one active session
 	// and revoked before the watcher, queues, or callbacks are torn down.
 	let activeSessionId: string | null = null;
@@ -788,23 +789,23 @@ export function createResultWatcher(
 		if (resultScanLogging === "activity" && stats.files === 0 && stats.scheduled === 0) return;
 		reportSessionWarning(state, `Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`, "slow-result-scan");
 	};
-	const indexedResultCandidates = (observed: ReadonlySet<string>, onUnreadableEntry?: (file: string) => void): string[] => {
+	const indexedResultCandidates = (observed: ReadonlySet<string>, onUnreadableEntry?: (file: string) => void, onUnreadablePending?: () => void): string[] => {
 		const files = new Set<string>();
 		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
 			if (!sessionId) continue;
-			for (const file of resultCandidateFilesForSession(resultsDir, sessionId, onUnreadableEntry)) files.add(file);
+			for (const file of resultCandidateFilesForSession(resultsDir, sessionId, onUnreadableEntry, onUnreadablePending)) files.add(file);
 		}
 		for (const runId of state.asyncJobs.keys()) files.add(`${runId}.json`);
 		for (const file of missionObserverResultCandidateFiles(resultsDir)) files.add(file);
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadablePayload?: (file: string) => void): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadablePayload?: (file: string) => void, onUnreadablePending?: () => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
 			const observed = observedRunIds();
-			for (const file of indexedResultCandidates(observed, onStorageError)) {
+			for (const file of indexedResultCandidates(observed, onStorageError, onUnreadablePending)) {
 				stats.files += 1;
 				try {
 					const signature = resultSignature(file, observed);
@@ -866,13 +867,21 @@ export function createResultWatcher(
 		const triggerTurn = options.triggerTurn !== false;
 		const inaccessible = new Set<string>();
 		const unreadablePayloads = new Set<string>();
-		for (const file of eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadablePayloads.add(file))) scheduleResult(file, triggerTurn);
+		let retryScan = false;
+		for (const file of eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadablePayloads.add(file), () => { retryScan = true; })) scheduleResult(file, triggerTurn);
 		for (const file of inaccessible) {
 			const identity = pendingCanonicalIdentity(file);
 			if (identity) {
 				unreadablePayloads.delete(file);
 				scheduleResult(file, triggerTurn, 0, identity);
-			}
+			} else retryScan = true;
+		}
+		if (retryScan && deliveryActive && !discoveryRetry) {
+			discoveryRetry = timers.setTimeout(() => {
+				discoveryRetry = undefined;
+				primeExistingResults({ triggerTurn });
+			}, POLL_INTERVAL_MS);
+			discoveryRetry.unref?.();
 		}
 		// Retry discovery without claiming ownership until the payload can be read.
 		for (const file of unreadablePayloads) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
@@ -1004,7 +1013,12 @@ export function createResultWatcher(
 		}
 	};
 
+	const clearDiscoveryRetry = () => {
+		if (discoveryRetry) timers.clearTimeout(discoveryRetry);
+		discoveryRetry = undefined;
+	};
 	const transitionResultDelivery = () => {
+		clearDiscoveryRetry();
 		deliveryActive = true;
 		activeSessionId = state.currentSessionId;
 		deliveryEpoch += 1;
@@ -1020,6 +1034,7 @@ export function createResultWatcher(
 		state.watcher = null;
 		clearResultPoller();
 		clearResultScan();
+		clearDiscoveryRetry();
 		state.resultFileCoalescer.clear();
 		pendingTriggerTurn.clear();
 		queuedOwnedResults.clear();

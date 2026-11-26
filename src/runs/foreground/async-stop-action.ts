@@ -7,7 +7,7 @@ import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { deliverStopRequest, stopInboxClosedPath } from "../background/control-channel.ts";
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
-import { reconcileAsyncRunForControl } from "../background/stale-run-reconciler.ts";
+import { reconcileVerifiedAsyncRun } from "../background/stale-run-reconciler.ts";
 import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
@@ -170,7 +170,7 @@ export function stopAsyncRun(
 			details: { mode: "management", results: [] },
 		};
 	}
-	if (status) status = reconcileAsyncRunForControl(target.asyncDir, status, kill);
+	if (status) status = reconcileVerifiedAsyncRun(target.asyncDir, status, { kill });
 	const pausedWholeRun = status?.state === "paused" && childId === undefined;
 	if (!status || (status.state !== "running" && status.state !== "queued" && !pausedWholeRun)) {
 		return {
