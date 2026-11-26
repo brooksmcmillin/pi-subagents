@@ -542,12 +542,13 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable", "after restored status access is denied"]) it(`retains late independent work ${phase}`, async (t) => {
+	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable", "after restored status access is denied", "when capture cannot read root status"]) it(`retains late independent work ${phase}`, async (t) => {
 		const rootStillRunning = phase === "before the root's terminal refresh";
 		const statusDisappears = phase === "after the root status disappears";
 		const losesRestoredStatus = phase === "after a restored root loses status";
 		const unreadableRoot = phase === "while root status stays unreadable";
 		const deniedAfterRestore = phase === "after restored status access is denied";
+		const deniedBeforeCapture = phase === "when capture cannot read root status";
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
 		const route = createNestedRoute("tracked-async-owner-close");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -600,6 +601,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			updateActiveRunIndex(asyncDir, "failed");
 			assert.equal(readActiveRunIndex(asyncRoot)?.includes(route.rootRunId) ?? false, false);
 			if (statusDisappears) fs.rmSync(path.join(asyncDir, "status.json"));
+			if (deniedBeforeCapture) denyStat(t).add(path.join(asyncDir, "status.json"));
 			tracker.dispose("reload");
 			if (unreadableRoot) denyStat(t).add(path.join(asyncDir, "status.json"));
 			state = { ...createState(), currentSessionId: "parent", completionOwnerId: "process-owner" };

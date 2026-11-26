@@ -624,6 +624,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				},
 			});
 			if (restored && !reconciliation.status) {
+				const publication = terminalPublications.get(job.asyncId);
+				if (publication?.pending && publication.instanceId && !options.hasDeliveredResult?.(job.asyncId)
+					&& !verifiedRootClose.has(job)
+					&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state !== "observed") {
+					cancelCleanup(job.asyncId);
+					return false;
+				}
 				if (job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
 					if (indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") {
 						cancelCleanup(job.asyncId);
@@ -1033,7 +1040,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				const route = job.nestedRoute;
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
-				let rootExited = false;
+				let rootExited = verifiedRootClose.has(job);
 				try {
 					const stored = readStatus(job.asyncDir);
 					if (!isTerminalJobStatus(job.status)) {

@@ -890,6 +890,24 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("does not publish failed repair after the PID probe finds a replaced session", () => {
+		const root = tempRoot("pi-stale-pid-session-swap-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const status = { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 };
+			writeStatus(asyncDir, status);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir,
+				kill: () => { writeStatus(asyncDir, { ...status, sessionId: "foreign-session" }); throw errno("ESRCH"); } });
+			assert.equal(result.repaired, false);
+			assert.equal(result.status, null);
+			assert.equal(fs.existsSync(resultsDir), false);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")), { ...status, sessionId: "foreign-session" });
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("settles a dead exact run without consuming or overwriting an unrelated public snapshot", () => {
 		const root = tempRoot("pi-stale-unrelated-result-");
 		try {

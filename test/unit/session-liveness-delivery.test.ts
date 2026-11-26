@@ -80,6 +80,7 @@ const terminalBeforePublicationScript = String.raw`
 	const workflowReload = process.argv[1] === "workflow-reload";
 	const noStatusReload = process.argv[1] === "published-no-status-reload";
 	const delayedStatusless = process.argv[1] === "statusless-delayed-writer";
+	const statuslessWithoutReload = process.argv[1] === "statusless-delayed-no-reload";
 	const ackNestedEIO = process.argv[1] === "published-ack-nested-eio";
 	const ackStatusEIO = process.argv[1] === "published-ack-status-eio" || ackNestedEIO;
 	const ackRoute = ackNestedEIO ? createNestedRoute(runId) : undefined;
@@ -100,7 +101,7 @@ const terminalBeforePublicationScript = String.raw`
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
 	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
-	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun || forgetRestored || delayedStatusless;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun || forgetRestored || delayedStatusless || statuslessWithoutReload;
 	const statusOnlyClosure = process.argv[1] === "closed-overlay";
 	const indexDenied = process.argv[1] === "closed-index-denied";
 	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied || indexedAlias;
@@ -274,14 +275,32 @@ const terminalBeforePublicationScript = String.raw`
 		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir, nestedRoute: ackRoute });
 	}
 	assert.equal(provider.isActive(), true);
-	if (delayedStatusless) {
-		fs.rmSync(path.join(asyncDir, "status.json"));
+	if (delayedStatusless || statuslessWithoutReload) {
+		const statusPath = path.join(asyncDir, "status.json");
+		fs.rmSync(statusPath);
 		updateActiveRunIndex(asyncDir, "failed");
-		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
-		handlers.clear();
-		holds.length = 0;
-		registerSubagentExtension(pi);
-		for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+		const stat = fsDefault.statSync;
+		let refreshed = false;
+		fsDefault.statSync = (file, ...args) => {
+			if (file === statusPath && new Error().stack.includes("at refreshJob")) refreshed = true;
+			return stat(file, ...args);
+		};
+		syncBuiltinESMExports();
+		try {
+			for (let i = 0; i < 130 && !refreshed; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(refreshed, true);
+			assert.deepEqual(holds, [true]);
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		if (delayedStatusless) {
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+			handlers.clear();
+			holds.length = 0;
+			registerSubagentExtension(pi);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+		}
 		assert.equal(provider.isActive(), true);
 		assert.deepEqual(holds, [true]);
 		publishResult(false, true);
@@ -296,6 +315,7 @@ const terminalBeforePublicationScript = String.raw`
 	}
 	if (forgetRestored) {
 		fs.rmSync(path.join(asyncDir, "status.json"));
+		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
 		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.equal(provider.isActive(), false);
 		assert.deepEqual(holds, [true, false]);
@@ -551,7 +571,8 @@ describe("session liveness through result delivery", () => {
 		["closed-event-alias", "retains a completion event hold while its indexed public alias is inaccessible"],
 		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
 		["forget-restored", "settles a restored hold after status disappears with no payload"],
-		["statusless-delayed-writer", "preserves the verified pending writer across a statusless reload before publication"],
+		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
+		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],

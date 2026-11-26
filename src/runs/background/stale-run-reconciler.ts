@@ -502,6 +502,9 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
+	const mayWrite = (current: AsyncStatus | null): boolean => !options.expectedRunId || (current
+		? current.runId === options.expectedRunId && current.sessionId === effectiveStatus.sessionId
+		: !status);
 	assertWorkflowGraphHostSteps(effectiveStatus.workflowGraph, path.join(asyncDir, "status.json"), effectiveStatus.runId);
 	const statusPath = path.join(asyncDir, "status.json");
 	for (const [index, step] of (effectiveStatus.steps ?? []).entries()) {
@@ -536,8 +539,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			: undefined;
 		if (terminalStatus) {
 			const currentStatus = readStatus(asyncDir);
-			if (options.expectedRunId && ((status && !currentStatus) || (currentStatus
-				&& (currentStatus.runId !== options.expectedRunId || currentStatus.sessionId !== effectiveStatus.sessionId)))) {
+			if (!mayWrite(currentStatus)) {
 				return { status: null, repaired: false };
 			}
 			const currentRootError = failureDiagnostic(currentStatus?.error);
@@ -590,8 +592,10 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		if (now - lastUpdate <= staleAfterMs) return { status: status ?? null, repaired: false, resultPath };
 		const probe = liveness === "alive" ? "is still live" : "cannot be probed from this process";
 		const message = `Async runner PID ${effectiveStatus.pid} ${probe}; status has not updated for ${now - lastUpdate}ms, so stale-run reconciliation marked the run failed because PID ownership is unverified.`;
+		if (options.expectedRunId && !mayWrite(readStatus(asyncDir))) return { status: null, repaired: false };
 		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, message, false, undefined, preservePublicResult);
 	}
 
+	if (options.expectedRunId && !mayWrite(readStatus(asyncDir))) return { status: null, repaired: false };
 	return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, undefined, true, options.adoptCompletionOwnerId, preservePublicResult);
 }
