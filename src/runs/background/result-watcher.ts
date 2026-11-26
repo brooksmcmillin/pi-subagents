@@ -237,6 +237,8 @@ export function createResultWatcher(
 	startResultWatcher: () => void;
 	transitionResultDelivery: () => void;
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
+	captureReloadHolds: (manager: object) => void;
+	restoreReloadHolds: (manager: object) => void;
 	deliverPendingResults: () => Promise<void>;
 	hasPendingResults: () => boolean;
 	hasQueuedOwnedResults: () => boolean;
@@ -301,6 +303,19 @@ export function createResultWatcher(
 			holdOwnedResult(file, identity);
 		}
 		state.resultFileCoalescer.schedule(file, delayMs);
+	};
+
+	const reloadKey = Symbol.for("pi-subagents.result-watcher-reload-holds");
+	const globals = globalThis as typeof globalThis & { [reloadKey]?: WeakMap<object, { sessionId: string; results: Map<string, ResultFileIdentity> }> };
+	const reloadHolds = globals[reloadKey] ??= new WeakMap();
+	const captureReloadHolds = (manager: object) => {
+		if (state.currentSessionId && queuedOwnedResults.size) reloadHolds.set(manager, { sessionId: state.currentSessionId, results: new Map(queuedOwnedResults) });
+	};
+	const restoreReloadHolds = (manager: object) => {
+		const handoff = reloadHolds.get(manager);
+		reloadHolds.delete(manager);
+		if (handoff?.sessionId !== state.currentSessionId) return;
+		for (const [file, identity] of handoff?.results ?? []) scheduleResult(file, false, 0, identity);
 	};
 
 	const publicResultPath = (file: string): string => path.join(resultsDir, file);
@@ -977,5 +992,5 @@ export function createResultWatcher(
 		incompleteResultRetries.clear();
 	};
 
-	return { startResultWatcher, transitionResultDelivery, primeExistingResults, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults: () => queuedOwnedResults.size > 0, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, captureReloadHolds, restoreReloadHolds, deliverPendingResults, hasPendingResults, hasQueuedOwnedResults: () => queuedOwnedResults.size > 0, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }

@@ -31,7 +31,7 @@ export interface ParentWake {
 	sendMessage(...args: Parameters<ExtensionAPI["sendMessage"]>): boolean;
 	/** True from an idle wake until its run starts or the session shuts down. Past the deadline it holds only while the parent is busy, which may still be the wake's preflight (for example compacting). */
 	isPending(): boolean;
-	getQueuedWait(): string | undefined;
+	getQueuedWaits(): Iterable<string>;
 	messageStarted(message: { role: string; customType?: string; content?: unknown }): void;
 	bindSession(ctx: Pick<ExtensionContext, "isIdle" | "sessionManager">): void;
 	agentStarted(): void;
@@ -91,7 +91,7 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage">, now: () 
 			return false;
 		},
 		isPending: () => reservation().sentAt !== undefined && (reserved() || !ctx.isIdle()),
-		getQueuedWait: () => reservation().queuedWaits?.values().next().value,
+		getQueuedWaits: () => reservation().queuedWaits?.values() ?? [],
 		messageStarted(message) {
 			if (message.role === "custom" && message.customType === "subagent-wait-subscription" && typeof message.content === "string") {
 				reservation().queuedWaits?.delete(message.content);

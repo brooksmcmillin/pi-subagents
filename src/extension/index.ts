@@ -475,7 +475,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		hasBackgroundWork: () => hasOutstandingResults() || completionNotifier.hasPendingSend() || resultWatcher.hasQueuedOwnedResults(),
 		hasPendingWake: () => parentWake.isPending() || (parentWake.hasDeferredWake()
 			&& withLastUiContext((ctx) => compactionInProgress(ctx.sessionManager)) === true),
-		getQueuedWake: () => completionNotifier.getUnstartedWake() ?? parentWake.getQueuedWait() ?? (parentWake.hasDeferredWake() ? "compaction" : undefined),
+		getQueuedWakes: function* () {
+			for (const wake of completionNotifier.getUnstartedWakes()) yield `result:${wake}`;
+			for (const wake of parentWake.getQueuedWaits()) yield `wait:${wake}`;
+			if (parentWake.hasDeferredWake()) yield "compaction";
+		},
 		isParentPreparing: () => withLastUiContext((ctx) => !ctx.isIdle()) === true,
 		// Fleet history keeps recent finished runs after the widget drops them.
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
@@ -1067,6 +1071,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		logSlowPhase(state, "wait-subscriptions", phaseStartedAt);
 		phaseStartedAt = Date.now();
 		startResultWatcher();
+		resultWatcher.restoreReloadHolds(ctx.sessionManager);
 		logSlowPhase(state, "result-watcher-start", phaseStartedAt);
 		phaseStartedAt = Date.now();
 		primeExistingResults({ triggerTurn: !recovering });
@@ -1116,6 +1121,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (modulePreloadTimer) clearTimeout(modulePreloadTimer);
 			modulePreloadTimer = undefined;
 			asyncRetentionAbort.abort();
+			if (shutdownReason === "reload" && runtimeEntry.sessionManager) resultWatcher.captureReloadHolds(runtimeEntry.sessionManager);
 			stopResultWatcher();
 			completionNotifier.dispose();
 			mainWatchdog.dispose();
@@ -1294,7 +1300,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const ui = ctx.mode === "tui" && ctx.hasUI
 			? ctx.ui as ExtensionContext["ui"] & Pick<Parameters<typeof programStatus.sessionStarted>[0], "setBackgroundWork">
 			: undefined;
-		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork });
+		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork,
+			session: state.currentSessionId ? { manager: ctx.sessionManager, id: state.currentSessionId } : undefined });
 		if (liveness.registered || terminalStatusActive) {
 			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state, { onRoutesChanged: programStatus.sync });
 			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;

@@ -26,7 +26,7 @@ export interface ProgramStatusReporterOptions {
 	hasBackgroundWork: () => boolean;
 	/** Uses the parent wake reservation, which can expire without a lifecycle event. */
 	hasPendingWake?: () => boolean;
-	getQueuedWake?: () => string | undefined;
+	getQueuedWakes?: () => Iterable<string>;
 	isParentPreparing?: () => boolean;
 	now?: () => number;
 	/** Pending native supervisor requests that expect a reply. */
@@ -38,7 +38,7 @@ export interface ProgramStatusReporterOptions {
 
 export interface ProgramStatusReporter {
 	/** Only the interactive TUI session on a real terminal reports. */
-	sessionStarted(input: { hasUI: boolean; mode?: string; setBackgroundWork?: (key: string, active: boolean) => void }): boolean;
+	sessionStarted(input: { hasUI: boolean; mode?: string; session?: { manager: object; id: string }; setBackgroundWork?: (key: string, active: boolean) => void }): boolean;
 	sync(): void;
 	agentStarted(): void;
 	agentSettled(): void;
@@ -146,9 +146,11 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	let reportedBackgroundWork = false;
 	let wakeRefresh: ReturnType<typeof setTimeout> | undefined;
 	const now = options.now ?? Date.now;
-	let lastQueuedWake: string | undefined;
-	let queuedWakeDeadline = 0;
-	let queuedWakeExpired = false;
+	const reloadKey = Symbol.for("pi-subagents.program-status-reload-wakes");
+	const globals = globalThis as typeof globalThis & { [reloadKey]?: WeakMap<object, { id: string; deadlines: Map<string, number | null> }> };
+	const reloadWakes = globals[reloadKey] ??= new WeakMap();
+	let session: { manager: object; id: string } | undefined;
+	let wakeDeadlines = new Map<string, number | null>();
 	// A request counts as waiting on the user only after the parent settled without answering it.
 	let unansweredAtSettle = new Set<string>();
 	// Pi clears every OSC 7501 record when it suspends on Ctrl+Z and re-reports only its own root
@@ -163,18 +165,19 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	// finished ones, each most recently updated first, up to the cap. Only the difference is written.
 	const sync = (): void => {
 		if (!active) return;
-		const queuedWake = options.getQueuedWake?.();
+		const queuedWakes = new Set(options.getQueuedWakes?.());
+		for (const key of wakeDeadlines.keys()) if (!queuedWakes.has(key)) wakeDeadlines.delete(key);
 		const pendingParentWake = options.hasPendingWake?.();
-		const queuedWakePreparing = queuedWake !== undefined && options.isParentPreparing?.();
-		if (queuedWake !== lastQueuedWake) {
-			lastQueuedWake = queuedWake;
-			queuedWakeExpired = false;
-			queuedWakeDeadline = now() + WAKE_PENDING_MS;
-		} else if (!queuedWakeExpired && (!parentIdle || pendingParentWake || queuedWakePreparing)) {
-			queuedWakeDeadline = now() + WAKE_PENDING_MS;
+		const extend = !parentIdle || pendingParentWake || options.isParentPreparing?.();
+		const time = now();
+		let pendingWake = Boolean(pendingParentWake);
+		for (const key of queuedWakes) {
+			const previous = wakeDeadlines.get(key);
+			const deadline = previous === null ? null : extend || previous === undefined ? time + WAKE_PENDING_MS : previous;
+			const live = deadline !== null && time < deadline;
+			wakeDeadlines.set(key, live ? deadline : null);
+			pendingWake ||= live;
 		}
-		if (queuedWake !== undefined && now() >= queuedWakeDeadline) queuedWakeExpired = true;
-		const pendingWake = pendingParentWake || (queuedWake !== undefined && !queuedWakeExpired);
 		if (parentIdle && pendingWake) {
 			if (!wakeRefresh) {
 				wakeRefresh = setTimeout(() => {
@@ -229,7 +232,12 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	};
 
 	return {
-		sessionStarted({ hasUI, mode, setBackgroundWork: reportBackgroundWork }) {
+		sessionStarted({ hasUI, mode, session: current, setBackgroundWork: reportBackgroundWork }) {
+			session = current;
+			const handoff = session && reloadWakes.get(session.manager);
+			if (session) reloadWakes.delete(session.manager);
+			wakeDeadlines = handoff && handoff.id === session?.id ? handoff.deadlines : new Map();
+			for (const [key, deadline] of wakeDeadlines) if (deadline !== null && now() >= deadline) wakeDeadlines.set(key, null);
 			setBackgroundWork = reportBackgroundWork;
 			active = options.enabled && hasUI && mode === "tui" && isTTY && env.TERM !== "dumb" && env.PI_PROGRAM_STATUS !== "0";
 			if (active && !listeningForResume && process.platform !== "win32") {
@@ -246,14 +254,16 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 		},
 		agentSettled() {
 			// A busy turn can queue a wake long before delivering it at the next boundary.
-			if (!parentIdle && !queuedWakeExpired && options.getQueuedWake?.() !== undefined) {
-				queuedWakeDeadline = now() + WAKE_PENDING_MS;
+			if (!parentIdle) {
+				const deadline = now() + WAKE_PENDING_MS;
+				for (const key of options.getQueuedWakes?.() ?? []) if (wakeDeadlines.get(key) !== null) wakeDeadlines.set(key, deadline);
 			}
 			parentIdle = true;
 			unansweredAtSettle = new Set([...options.getPendingRequests()].map((request) => request.id));
 			sync();
 		},
 		dispose(shutdownReason) {
+			if (shutdownReason === "reload" && session) reloadWakes.set(session.manager, { id: session.id, deadlines: wakeDeadlines });
 			if (active && shutdownReason !== "quit") {
 				for (const id of sent.keys()) write(programStatusReport({ state: "clear", id }));
 			}

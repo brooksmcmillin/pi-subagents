@@ -26,7 +26,7 @@ function decode(report: string): Record<string, string> {
 
 const reporters: ProgramStatusReporter[] = [];
 
-function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWake?: () => string | undefined; isParentPreparing?: () => boolean; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
+function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasPendingWake?: () => boolean; getQueuedWakes?: () => Iterable<string>; session?: { manager: object; id: string }; isParentPreparing?: () => boolean; now?: () => number; pending?: Array<{ id: string; runId: string }>; enabled?: boolean; isTTY?: boolean; env?: Record<string, string>; hasUI?: boolean; mode?: string } = {}) {
 	const writes: string[] = [];
 	const jobs = new Map<string, AsyncJobState>((input.jobs ?? []).map((entry) => [entry.asyncId, entry as AsyncJobState]));
 	const pending = input.pending ?? [];
@@ -36,7 +36,7 @@ function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasP
 		getJobs: () => jobs.values(),
 		hasBackgroundWork: input.hasBackgroundWork ?? (() => false),
 		hasPendingWake: input.hasPendingWake,
-		getQueuedWake: input.getQueuedWake,
+		getQueuedWakes: input.getQueuedWakes,
 		isParentPreparing: input.isParentPreparing,
 		now: input.now,
 		getPendingRequests: () => pending,
@@ -44,7 +44,7 @@ function reporter(input: { jobs?: Job[]; hasBackgroundWork?: () => boolean; hasP
 		isTTY: input.isTTY ?? true,
 		env: input.env ?? { TERM: "xterm-ghostty" },
 	});
-	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui", setBackgroundWork: (_key, active) => holds.push(active) });
+	instance.sessionStarted({ hasUI: input.hasUI ?? true, mode: input.mode ?? "tui", session: input.session, setBackgroundWork: (_key, active) => holds.push(active) });
 	reporters.push(instance);
 	return { instance, writes, jobs, pending, holds, records: () => writes.map(decode) };
 }
@@ -164,7 +164,7 @@ describe("OSC 7501 program status", () => {
 		let preparing = false;
 		let running = true;
 		const { instance, jobs, holds, records } = reporter({ jobs: [job("review", "running")],
-			hasBackgroundWork: () => running, getQueuedWake: () => queuedWake, isParentPreparing: () => preparing, now: () => now });
+			hasBackgroundWork: () => running, getQueuedWakes: () => queuedWake ? [queuedWake] : [], isParentPreparing: () => preparing, now: () => now });
 		instance.agentStarted();
 		queuedWake = "busy-turn-result";
 		running = false;
@@ -193,7 +193,7 @@ describe("OSC 7501 program status", () => {
 		const wake = createParentWake({ sendMessage() {} }, () => now);
 		wake.bindSession({ isIdle: () => idle, sessionManager: { getSessionId: () => "wait" } as Parameters<typeof wake.bindSession>[0]["sessionManager"] });
 		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")],
-			hasBackgroundWork: () => delivering, getQueuedWake: wake.getQueuedWait, isParentPreparing: () => !idle, now: () => now });
+			hasBackgroundWork: () => delivering, getQueuedWakes: wake.getQueuedWaits, isParentPreparing: () => !idle, now: () => now });
 		instance.agentStarted();
 		idle = false;
 		const notice = { customType: "subagent-wait-subscription", content: "review ready", display: true };
@@ -209,7 +209,7 @@ describe("OSC 7501 program status", () => {
 		assert.deepEqual(records(), []);
 		instance.agentStarted();
 		wake.messageStarted({ role: "custom", ...notice });
-		assert.equal(wake.getQueuedWait(), undefined);
+		assert.deepEqual([...wake.getQueuedWaits()], []);
 		idle = true;
 		instance.agentSettled();
 		assert.deepEqual(holds, [true, false]);
@@ -223,7 +223,7 @@ describe("OSC 7501 program status", () => {
 		let pending = false;
 		const { instance, holds, records } = reporter({ jobs: [job("review", "complete")], now: () => now,
 			hasPendingWake: () => (deferred && compacting) || pending,
-			getQueuedWake: () => deferred ? "compaction" : undefined });
+			getQueuedWakes: () => deferred ? ["compaction"] : [] });
 		now += 60_000;
 		instance.sync();
 		compacting = false;
@@ -263,18 +263,25 @@ describe("OSC 7501 program status", () => {
 
 	it("does not rearm an expired queued wake on an unrelated turn", () => {
 		let now = 0;
-		let queued = "first";
-		const { instance, holds } = reporter({ getQueuedWake: () => queued, now: () => now });
+		const queued = ["result:first"];
+		const options = { getQueuedWakes: () => queued, now: () => now, session: { manager: {}, id: "parent" } };
+		const { instance, holds } = reporter(options);
 		now += 60_000;
 		instance.sync();
 		assert.deepEqual(holds, [true, false]);
 		instance.agentStarted();
 		instance.agentSettled();
 		assert.deepEqual(holds, [true, false]);
-		queued = "second";
-		instance.sync();
-		assert.deepEqual(holds, [true, false, true]);
-		instance.dispose("quit");
+		instance.dispose("reload");
+		const replacement = reporter(options);
+		assert.deepEqual(replacement.holds, [], "reload does not rearm the same notice");
+		queued.push("wait:second");
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true], "the older notice cannot mask a fresh wait wake");
+		queued.pop();
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true, false]);
+		replacement.instance.dispose("quit");
 	});
 
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {

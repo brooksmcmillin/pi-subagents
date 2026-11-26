@@ -117,7 +117,6 @@ const terminalBeforePublicationScript = String.raw`
 	const publishResult = (pending = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
 		id: runId, runId, agent: "worker", mode: "single", state: "complete", success: true, exitCode: 0,
 		summary: "child complete", timestamp: Date.now(), sessionId, completionOwnerId,
-		...(publishedReload ? { triggerTurn: false } : {}),
 	});
 
 	registerSubagentExtension(pi);
@@ -192,6 +191,8 @@ const terminalBeforePublicationScript = String.raw`
 			publishResult();
 			const accepted = await sent;
 			assert.equal(accepted.rejected, false);
+			assert.equal(provider.isActive(), true);
+			assert.deepEqual(holds, [true]);
 			for (const handler of handlers.get("agent_start")) handler({}, ctx);
 			for (const handler of handlers.get("message_start")) handler({ message: { role: "custom", ...accepted.message } });
 			for (const handler of handlers.get("agent_settled") ?? []) await handler({}, ctx);

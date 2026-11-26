@@ -264,7 +264,7 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native stat retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native stat retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
@@ -272,7 +272,9 @@ describe("result watcher", () => {
 		const terminalHolds: boolean[] = [];
 		let watchEvent: fs.WatchListener<string> | undefined;
 		const denyDiscovery = source.endsWith("retry");
-		let denyStat = source === "native stat retry";
+		const reload = source === "native reload retry";
+		const injectStatFailure = reload || source === "native stat retry";
+		let denyStat = injectStatFailure;
 		let statDenied = false;
 		const originalStat = fsDefault.statSync;
 		const stat = ((file, options) => {
@@ -287,9 +289,9 @@ describe("result watcher", () => {
 		let payloadRetryObserved = false;
 		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
 			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
-		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
+		const createWatcher = (watcherState: typeof state) => createResultWatcher({ events: { on: () => () => {}, emit(event) {
 			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) order.push("subscriber wake");
-		} } }, state, resultsDir, 60_000, {
+		} } }, watcherState, resultsDir, 60_000, {
 			notifier: { async deliver() { assert.deepEqual(terminalHolds, [true]); order.push("non-waking notice"); return true; } },
 			onResultDelivered: () => order.push("release"),
 			onOwnedQueueChanged: reporter.sync,
@@ -314,6 +316,7 @@ describe("result watcher", () => {
 				}) as typeof fs.readFileSync,
 			},
 		});
+		let watcher = createWatcher(state);
 		try {
 			if (denyStat) {
 				fsDefault.statSync = stat;
@@ -333,6 +336,19 @@ describe("result watcher", () => {
 			if (denyStat) {
 				assert.equal(await waitForPredicate(() => statDenied), true);
 				assert.deepEqual(terminalHolds, [true]);
+				if (reload) {
+					const manager = {};
+					watcher.captureReloadHolds(manager);
+					reporter.dispose("reload");
+					watcher.stopResultWatcher();
+					terminalHolds.length = 0;
+					watcher = createWatcher({ ...createState(), currentSessionId: "session-current" });
+					watcher.startResultWatcher();
+					watcher.restoreReloadHolds(manager);
+					reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
+					assert.deepEqual(terminalHolds, [true], "handoff restored before payload access recovered");
+					assert.deepEqual(order, []);
+				}
 				denyStat = false;
 			}
 			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
@@ -340,7 +356,7 @@ describe("result watcher", () => {
 			assert.deepEqual(terminalHolds, [true, false]);
 			if (source === "native payload retry") assert.equal(payloadRetryObserved, true);
 		} finally {
-			if (source === "native stat retry") {
+			if (injectStatFailure) {
 				fsDefault.statSync = originalStat;
 				syncBuiltinESMExports();
 			}
