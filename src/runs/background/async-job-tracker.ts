@@ -464,7 +464,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		return job.nestedWorkActive !== previous;
 	};
 
-	const refreshJob = (job: AsyncJobState): boolean => {
+	const refreshJob = (job: AsyncJobState, firstObservation = false): boolean => {
 		if (unverifiedRuns.has(job.asyncId)) {
 			let stored: ReturnType<typeof readStatus> = null;
 			let summary: AsyncRunSummary | undefined;
@@ -624,6 +624,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
 							|| (typeof status.sessionId === "string"
 								&& options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) === OWNING_SESSION_COMPLETION_OWNER))) {
+						job.completionOwnerId ??= status.completionOwnerId === state.completionOwnerId
+							? status.completionOwnerId : OWNING_SESSION_COMPLETION_OWNER;
 						publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
 						terminalPublications.set(job.asyncId, publication);
 					}
@@ -646,7 +648,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
+					if (firstObservation || !isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
@@ -949,7 +951,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
-				states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
+				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
 				onUnreadableActiveRun: (runId, asyncDir) => unreadable.push({ runId, asyncDir }),
 			}, observeStatus);
 		} catch (error) {
@@ -959,6 +961,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		for (const run of runs) {
 			const job = summaryToJob(run);
 			state.asyncJobs.set(run.id, job);
+			if (isTerminalJobStatus(job.status)) refreshJob(job, true);
 			if (job.status === "running") runningJobIds.add(job.asyncId);
 			rememberFleetJob(state, job);
 			watchJob(job);

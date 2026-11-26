@@ -112,6 +112,7 @@ type ResultFileData = CompletionNotification & {
 };
 
 type ResultFileIdentity = {
+	acknowledged: boolean;
 	sessionId?: string;
 	completionOwnerId?: string;
 	completionOwnerProcess?: unknown;
@@ -143,7 +144,13 @@ function jsonStringProperty(raw: string, property: string): string | undefined {
 }
 
 function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
+	let acknowledged = false;
+	if (raw.includes('"notificationDeliveredAt"')) {
+		try { acknowledged = hasDeliveredNotification(JSON.parse(raw) as ResultFileData); }
+		catch { /* Incomplete results remain on the delivery path. */ }
+	}
 	return {
+		acknowledged,
 		sessionId: jsonStringProperty(raw, "sessionId"),
 		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
 		// Recorded as a flat object, so a brace-free match is the whole value.
@@ -288,7 +295,7 @@ export function createResultWatcher(
 	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0, identity = identityCache.get(file)?.identity) => {
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
-		if (delayMs === 0 && identity?.sessionId
+		if (delayMs === 0 && identity?.sessionId && !identity.acknowledged
 			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
 			holdOwnedResult(file);
 		}
@@ -512,6 +519,10 @@ export function createResultWatcher(
 				resultsDir,
 				sessionId,
 			});
+			const completionKey = buildCompletionKey(data, `result:${file}`);
+			const alreadyDelivered = hasDeliveredNotification(data);
+			const lastSeenAt = state.completionSeen.get(completionKey);
+			if (!alreadyDelivered && (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs)) holdOwnedResult(file);
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(state, data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {
@@ -524,9 +535,6 @@ export function createResultWatcher(
 				}
 			}
 
-			const completionKey = buildCompletionKey(data, `result:${file}`);
-			const alreadyDelivered = hasDeliveredNotification(data);
-			const lastSeenAt = state.completionSeen.get(completionKey);
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
@@ -610,8 +618,6 @@ export function createResultWatcher(
 				return;
 			}
 
-			// Discovery may not have been able to read the result. Its owner is now verified.
-			holdOwnedResult(file);
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
 			if (deliverIntercomResults && intercomTarget && triggerTurn) {

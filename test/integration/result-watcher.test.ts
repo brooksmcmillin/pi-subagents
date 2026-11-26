@@ -965,18 +965,24 @@ describe("result watcher", () => {
 
 			const secondState = createState();
 			secondState.currentSessionId = "session-current";
+			let queueChanges = 0;
 			const secondWatcher = createResultWatcher(pi, secondState, resultsDir, 60_000, {
-				observeCompletion: () => { observerCalls += 1; },
+				observeCompletion: () => { if (++observerCalls === 2) throw new Error("observer still unavailable"); },
 				notifier: { deliver: async () => { deliveries += 1; return true; } },
+				onOwnedQueueChanged: () => queueChanges++,
 			});
 			try {
 				secondWatcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => observerCalls === 2), true);
+				assert.equal(fs.existsSync(resultPath), true);
+				secondWatcher.primeExistingResults();
 				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+				assert.equal(queueChanges, 0, "acknowledged cleanup never reactivates terminal liveness");
 			} finally {
 				secondWatcher.stopResultWatcher();
 			}
 
-			assert.equal(observerCalls, 2);
+			assert.equal(observerCalls, 3);
 			assert.equal(deliveries, 1);
 			assert.equal(emitted, 1);
 		} finally {
@@ -2174,7 +2180,22 @@ describe("result watcher", () => {
 			};
 			const state = createState();
 			state.currentSessionId = "session-1";
-			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			let watchEvent: fs.WatchListener<string> | undefined;
+			let denyDiscovery = true;
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, { fs: { ...fs,
+				watch(_dir, listener) {
+					watchEvent = listener as typeof watchEvent;
+					const handle = { on: () => handle, close() {}, unref() {} };
+					return handle as unknown as fs.FSWatcher;
+				},
+				readFileSync: ((file, options) => {
+					if (denyDiscovery && String(file).endsWith("async-nested-retry.json")) {
+						denyDiscovery = false;
+						throw Object.assign(new Error("transient discovery failure"), { code: "EACCES" });
+					}
+					return fs.readFileSync(file, options);
+				}) as typeof fs.readFileSync,
+			} });
 			const resultPath = path.join(resultsDir, "async-nested-retry.json");
 			const { output: logged, restore } = captureConsole();
 			try {
@@ -2188,9 +2209,11 @@ describe("result watcher", () => {
 					sessionId: "session-1",
 					intercomTarget: "subagent-chat-main",
 				});
-				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
-
+				watcher.startResultWatcher();
+				assert.ok(watchEvent);
+				watchEvent("rename", "async-nested-retry.json");
+				assert.equal(watcher.hasQueuedOwnedResults(), false);
+				assert.equal(await waitForPredicate(() => watcher.hasQueuedOwnedResults()), true);
 				assert.equal(fs.existsSync(resultPath), true);
 				assert.equal(emitted.length, 0);
 				assert.ok(

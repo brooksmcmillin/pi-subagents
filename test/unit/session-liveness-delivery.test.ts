@@ -73,8 +73,9 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
+	const restoredCase = process.argv[1] === "restored";
 	const closedFirst = process.argv[1] === "closed-first";
-	const closedCase = process.argv[1] === "closed" || closedFirst;
+	const closedCase = process.argv[1] === "closed" || restoredCase || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
 	const holds = [];
@@ -98,7 +99,7 @@ const terminalBeforePublicationScript = String.raw`
 	});
 	const exitProof = () => ({ version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "observed", observedAt: Date.now(),
 		instances: [{ kind: "runner", processInstanceId: runId + "-runner", closeObservedAt: Date.now(), exitCode: 0, signal: null }] });
-	const writeStatus = (state, proof) => {
+	const writeStatus = (state, proof, markerState = state) => {
 		const asyncDir = path.join(DIRS.async, runId);
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeAtomicJson(path.join(asyncDir, "status.json"), {
@@ -107,7 +108,7 @@ const terminalBeforePublicationScript = String.raw`
 			steps: [{ agent: "worker", status: state, index: 0 }],
 			...(state === "running" ? {} : { processTerminal: proof ?? { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
 		});
-		updateActiveRunIndex(asyncDir, state);
+		updateActiveRunIndex(asyncDir, markerState);
 		return asyncDir;
 	};
 	const publishResult = (pending = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
@@ -116,10 +117,17 @@ const terminalBeforePublicationScript = String.raw`
 	});
 
 	registerSubagentExtension(pi);
-	for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
-	assert.equal(provider.isActive(), false);
-	const asyncDir = writeStatus("running");
-	events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+	let asyncDir;
+	if (restoredCase) asyncDir = writeStatus("complete", undefined, "running");
+	for (const handler of handlers.get("session_start")) await handler({ reason: restoredCase ? "reload" : "startup" }, ctx);
+	if (restoredCase) {
+		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+		assert.deepEqual(holds, [true]);
+	} else {
+		assert.equal(provider.isActive(), false);
+		asyncDir = writeStatus("running");
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+	}
 	assert.equal(provider.isActive(), true);
 
 	let send;
@@ -238,6 +246,7 @@ describe("session liveness through result delivery", () => {
 		["pending", "holds detached terminal status while a pending-only result is temporarily inaccessible"],
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
+		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

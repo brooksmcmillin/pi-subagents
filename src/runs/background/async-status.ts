@@ -156,6 +156,8 @@ export interface AsyncRunSummary {
 
 interface AsyncRunListOptions {
 	states?: Array<AsyncRunSummary["state"]>;
+	/** Include active-marker runs whose writer may still be publishing a terminal result. */
+	includeTerminalPublication?: boolean;
 	sessionId?: string;
 	limit?: number;
 	/** Limits terminal candidates using the timestamp embedded in index marker names. */
@@ -622,7 +624,9 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		// the nested-events directory, so deferring it for filtered-out runs keeps
 		// restoration at load from scanning that directory when no active runs
 		// match.
-		if (allowedStates && !allowedStates.has(status.state)) continue;
+		const terminalPublication = options.includeTerminalPublication && activeEntries.has(entry) && status.mode !== "workflow"
+			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
+		if (allowedStates && !allowedStates.has(status.state) && !terminalPublication) continue;
 		if (owners && !owners.has(status.sessionId)) continue;
 		const nestedWarnings: string[] = [];
 		let nestedRoute: NestedRoute | undefined;
