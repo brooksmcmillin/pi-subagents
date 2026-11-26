@@ -737,19 +737,20 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					const nestedOnly = unverifiedPublications.get(job.asyncId)?.pending === false;
 					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false, instanceId: unverifiedPublications.get(job.asyncId)?.instanceId });
 					let publication = terminalPublications.get(job.asyncId);
-					if (!publication && status.mode !== "workflow" && status.runId === job.asyncId
+					if (!publication?.instanceId && status.mode !== "workflow" && status.runId === job.asyncId
 						&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")) {
 						const owner = publicationOwner(status);
 						if (owner) {
 							job.completionOwnerId = owner;
-							publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
+							const instanceId = status.processTerminal.runnerProcessInstanceId;
+							publication = publication ? { ...publication, instanceId } : { instanceId, pending: true };
 							terminalPublications.set(job.asyncId, publication);
 						}
 					}
 					const wasPending = publication?.pending;
 					let publicationClosed = reconciliation.noPublication === true;
 					if (publicationClosed) {
-						publication = { pending: false };
+						publication = { pending: false, instanceId: publication?.instanceId };
 						terminalPublications.set(job.asyncId, publication);
 					} else if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The

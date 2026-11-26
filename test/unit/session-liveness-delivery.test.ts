@@ -98,7 +98,8 @@ const terminalBeforePublicationScript = String.raw`
 	const inheritedPublication = process.argv[1] === "inherited-publication" || originalReopened;
 	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
 	const forgetRestored = process.argv[1] === "forget-restored";
-	const forgetPublished = process.argv[1] === "forget-published-started";
+	const completeBeforeRefresh = process.argv[1] === "forget-completion-first";
+	const forgetPublished = process.argv[1] === "forget-published-started" || completeBeforeRefresh;
 	const forgetStarted = process.argv[1] === "forget-started" || forgetPublished;
 	const startedRoute = forgetStarted ? createNestedRoute(runId) : undefined;
 	if (startedRoute) {
@@ -356,14 +357,20 @@ const terminalBeforePublicationScript = String.raw`
 	}
 	if (forgetStarted) {
 		writeStatus("complete");
+		if (completeBeforeRefresh) {
+			publishResult(false, true);
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+		}
 		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
 		for (let i = 0; i < 130 && !reports.some(report => report.includes("state=clear:")); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.ok(reports.some(report => report.includes("state=clear:")), "terminal child was projected while the root still held");
 	}
 	if (forgetRestored || forgetStarted) {
 		if (forgetPublished) {
-			publishResult(false, true);
-			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			if (!completeBeforeRefresh) {
+				publishResult(false, true);
+				events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			}
 			const pathToResult = resultFilePath(DIRS.results, runId);
 			for (let i = 0; i < 100 && fs.existsSync(pathToResult); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 			assert.equal(fs.existsSync(pathToResult), false);
@@ -634,6 +641,7 @@ describe("session liveness through result delivery", () => {
 		["forget-restored", "settles a restored hold after status disappears with no payload"],
 		["forget-started", "settles a start-event terminal hold after status disappears and writer closes"],
 		["forget-published-started", "settles a start-event terminal hold after result delivery and status loss"],
+		["forget-completion-first", "settles a statusless writer whose completion event preceded the first terminal refresh"],
 		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
 		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
