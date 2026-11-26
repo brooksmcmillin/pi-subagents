@@ -88,7 +88,7 @@ describe("retained foreground nested route tracker", () => {
 		}
 	});
 
-	it("drains a retained route when the descendant never emits its terminal event", async () => {
+	it("retains a repaired terminal child until its exact writer closes", async () => {
 		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("missing-terminal-event-root");
 		const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId, "nested-child");
@@ -99,15 +99,19 @@ describe("retained foreground nested route tracker", () => {
 				path: [{ runId: nestedRoute.rootRunId }], state: "running", agent: "worker", asyncDir },
 		});
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
+		const proof = { version: 1, runId: "nested-child", runnerProcessInstanceId: "runner" };
 		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 			runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
-			steps: [{ agent: "worker", status: "failed" }],
+			steps: [{ agent: "worker", status: "failed" }], processTerminal: { ...proof, state: "pending" },
 		}));
 		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
 		try {
 			tracker.track(nestedRoute.rootRunId);
+			await waitFor(() => projectNestedEvents(nestedRoute).children[0]?.state === "failed");
+			assert.equal(state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId), true);
+			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ ...proof, state: "observed", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 300, exitCode: 1, signal: null }] }));
 			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
-			assert.equal(projectNestedEvents(nestedRoute).children[0]?.state, "failed");
 		} finally {
 			tracker.clear();
 			fs.rmSync(asyncDir, { recursive: true, force: true });

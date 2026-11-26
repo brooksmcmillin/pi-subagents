@@ -591,7 +591,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
 			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
-				if (verifyMarker && stored && !isActiveAsyncState(stored.state) && stored.runId !== entry) continue;
+				if (verifyMarker && stored && stored.runId !== entry) continue;
 				if (stored && owners && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
@@ -601,7 +601,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined }, observeStatus);
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined, expectedRunId: verifyMarker ? entry : undefined }, observeStatus);
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
@@ -617,7 +617,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		}
 		const terminalPublication = options.includeTerminalPublication && activeEntries.has(entry) && status.mode !== "workflow"
 			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
-		if (terminalPublication && !isActiveAsyncState(status.state) && status.runId !== entry) continue;
+		if (options.includeTerminalPublication && activeEntries.has(entry) && status.runId !== entry) continue;
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
 			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {

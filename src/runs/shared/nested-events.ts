@@ -19,6 +19,8 @@ import {
 import { isSafeNestedPathId, sanitizeNestedPath, type NestedPathEntry } from "./nested-path.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { readProcessTerminal, sanitizeProcessTerminal } from "../background/process-terminal.ts";
+import { isStatusAccessError, readStatus } from "../../shared/utils.ts";
+import { resultPayloadVisibility } from "../background/result-files.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 
 export const NESTED_EVENTS_DIR = path.join(TEMP_ROOT_DIR, "nested-subagent-events");
@@ -1009,8 +1011,20 @@ export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefine
 export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSummary[] | undefined, ownerExited = false): boolean {
 	for (const child of children ?? []) {
 		if (!terminal(child.state) && (child.asyncDir || !ownerExited)) return true;
-		if (!child.children?.length && !child.steps?.some((step) => step.children?.length)) continue;
 		const asyncDir = resolveNestedAsyncDir(rootRunId, child);
+		if (asyncDir && terminal(child.state)) {
+			try {
+				const status = readStatus(asyncDir);
+				if (status?.runId === child.id && status.processTerminal?.state === "pending") {
+					const proof = readProcessTerminal(asyncDir, { runId: child.id, runnerProcessInstanceId: status.processTerminal.runnerProcessInstanceId });
+					const visibility = status.sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), status.sessionId, child.id) : "absent";
+					if (visibility !== "present" && (visibility === "unknown" || proof?.state !== "observed")) return true;
+				}
+			} catch (error) {
+				if (isStatusAccessError(error, asyncDir)) return true;
+			}
+		}
+		if (!child.children?.length && !child.steps?.some((step) => step.children?.length)) continue;
 		const childOwnerExited = asyncDir
 			? readProcessTerminal(asyncDir, { runId: child.id })?.state === "observed"
 			: !child.asyncDir && ownerExited;

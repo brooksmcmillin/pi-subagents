@@ -1,4 +1,4 @@
-import { hasLiveNestedDescendants, projectNestedEvents } from "../runs/shared/nested-events.ts";
+import { hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents } from "../runs/shared/nested-events.ts";
 import type { NestedRouteInfo, SubagentState } from "../shared/types.ts";
 
 export const PI_WEB_SESSION_LIVENESS_REGISTRY_KEY = "@agegr/pi-web/session-liveness/v1";
@@ -36,7 +36,7 @@ function resolveRegistry(): PiWebSessionLivenessRegistry | null {
 
 export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "retainedForegroundNestedRoutes">, route: NestedRouteInfo): boolean {
 	const nested = projectNestedEvents(route);
-	if (!hasLiveNestedDescendants(nested.children)) return false;
+	if (!hasLiveOwnedNestedWork(route.rootRunId, nested.children)) return false;
 	state.retainedForegroundNestedRoutes ??= new Map();
 	state.retainedForegroundNestedRoutes.set(route.rootRunId, route);
 	return true;

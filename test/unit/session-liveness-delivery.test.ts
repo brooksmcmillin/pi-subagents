@@ -81,7 +81,8 @@ const terminalBeforePublicationScript = String.raw`
 	const publishedReload = process.argv[1] === "published-reload";
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
 	const provisionalReload = process.argv[1] === "provisional-reload";
-	const mismatchedMarker = process.argv[1] === "mismatched-marker";
+	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
+	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
 	const inheritedPublication = process.argv[1] === "inherited-publication";
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
 	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
@@ -133,7 +134,7 @@ const terminalBeforePublicationScript = String.raw`
 	let asyncDir;
 	if (restoredCase) {
 		const observed = provisionalReload ? exitProof() : undefined;
-		asyncDir = writeStatus("complete", observed, "running");
+		asyncDir = writeStatus(mismatchedRunningMarker ? "running" : "complete", observed, "running");
 		if (observed) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), observed);
 	}
 	const unrelatedRoute = mismatchedMarker ? createNestedRoute("different-run") : undefined;
@@ -410,6 +411,7 @@ describe("session liveness through result delivery", () => {
 		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],
 		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
 		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
+		["mismatched-running-marker", "does not restore running status claiming a run ID different from the active marker"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 		["published-reload", "published delivery remains held on reload even when active listing fails"],
