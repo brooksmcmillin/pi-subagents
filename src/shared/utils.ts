@@ -134,6 +134,11 @@ function isNotFoundError(error: unknown): boolean {
 		&& (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
+export function isStorageAccessError(error: unknown): boolean {
+	const errno = error as (NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) | null | undefined;
+	return [errno?.code, errno?.cause?.code].some((code) => code === "EACCES" || code === "EPERM");
+}
+
 /** A `readStatus(asyncDir)` error caused by permissions on that run's own status file, which says nothing about whether its runner is alive. */
 export function isStatusAccessError(error: unknown, asyncDir: string): boolean {
 	const code = ((error as Error | undefined)?.cause as NodeJS.ErrnoException | undefined)?.code;

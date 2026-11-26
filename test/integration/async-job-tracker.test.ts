@@ -1338,6 +1338,51 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("keeps active restore and stale result repair live through storage permission failures", async (t) => {
+		const asyncRoot = createTempDir("pi-async-restore-storage-");
+		const resultsDir = path.join(asyncRoot, "results");
+		const terminalDir = path.join(asyncRoot, "terminal");
+		const runningDir = path.join(asyncRoot, "running");
+		const resultPath = resultFilePath(resultsDir, "running");
+		const sessionId = "parent";
+		const ownerId = "owner";
+		const state = { ...createState(), currentSessionId: sessionId, completionOwnerId: ownerId };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		const originalRead = fsDefault.readFileSync;
+		let denyIndex = true;
+		let denyPayload = false;
+		let indexDenied = 0;
+		let payloadDenied = 0;
+		fsDefault.readFileSync = ((file, options) => {
+			if (denyIndex && String(file).includes(path.sep + "result-index" + path.sep) && path.basename(String(file)) === "terminal.json") indexDenied++;
+			else if (denyPayload && file === resultPath) payloadDenied++;
+			else return originalRead(file, options);
+			throw Object.assign(new Error("temporarily inaccessible result storage"), { code: "EACCES" });
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		t.after(() => { fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(runningDir, "running", sessionId);
+		fs.mkdirSync(terminalDir, { recursive: true });
+		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId, completionOwnerId: ownerId, state: "complete", mode: "single", startedAt: Date.now(),
+			processTerminal: { version: 1, runId: "terminal", runnerProcessInstanceId: "writer", state: "pending" } }));
+		updateActiveRunIndex(terminalDir, "running");
+		updateActiveRunIndex(runningDir, "running");
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.ok(indexDenied > 0, "startup cannot read the owned terminal publisher's index");
+		assert.equal(state.asyncJobs.get("terminal")?.status, "running", "publisher restores a placeholder without a handoff");
+		assert.equal(state.asyncJobs.get("running")?.agents?.[0], "worker", "one denied index does not hide other restored jobs");
+		denyIndex = false;
+		await waitForCondition(() => state.asyncJobs.get("terminal")?.status === "complete", "publisher succeeds on retry");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		denyPayload = true;
+		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId, success: true }));
+		await waitForCondition(() => payloadDenied > 0, "stale repair attempts an unreadable payload");
+		assert.equal(state.asyncJobs.get("running")?.status, "running");
+		assert.equal(state.cleanupTimers.has("running"), false);
+		denyPayload = false;
+		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair retries after recovery");
+	});
+
 	it("restores an unreadable active run as live work until a read shows its owner", async (t) => {
 		const asyncRoot = createTempDir("pi-async-job-restore-unreadable-");
 		const originalError = console.error;

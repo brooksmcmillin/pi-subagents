@@ -360,7 +360,7 @@ export function createResultWatcher(
 			return undefined;
 		}
 	};
-	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>): { identity: ResultFileIdentity; signature: string } | undefined => {
+	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>, processingOwned = false): { identity: ResultFileIdentity; signature: string } | undefined => {
 		const resultPath = resultPayloadPath(file, observed);
 		if (!resultPath) return undefined;
 		try {
@@ -373,7 +373,7 @@ export function createResultWatcher(
 			return { identity, signature };
 		} catch (error) {
 			identityCache.delete(file);
-			if (isAccessDenied(error)) throw error;
+			if (isAccessDenied(error) || (processingOwned && (error as NodeJS.ErrnoException)?.code === "EIO")) throw error;
 			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
 		}
@@ -389,7 +389,7 @@ export function createResultWatcher(
 	};
 
 	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false): boolean => {
-		const inspected = inspectResult(file, knownSignature, observed);
+		const inspected = inspectResult(file, knownSignature, observed, holdForDelivery && queuedOwnedResults.has(file));
 		if (!inspected) return false;
 		const { identity } = inspected;
 		// Missing identity stays on the normal parser path so malformed or legacy
@@ -444,7 +444,7 @@ export function createResultWatcher(
 				}
 			}
 		} catch (error) {
-			if (!isAccessDenied(error)) throw error;
+			if (!isAccessDenied(error) && !((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) throw error;
 			reportResultWatcherWarning(state, `Failed to inspect subagent result file '${publicResultPath(file)}'; will retry`, error);
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			return;

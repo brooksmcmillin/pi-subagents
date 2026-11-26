@@ -5,7 +5,7 @@ import { previewDisplayText } from "../../shared/display-text.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNode, type HostStepState, type LaunchResolvedChildExtensions, type RuntimeAcknowledgedChildExtensions, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflight, type WorkflowGraphSnapshot } from "../../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
-import { isStatusAccessError, readStatus } from "../../shared/utils.ts";
+import { isStatusAccessError, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
@@ -585,10 +585,10 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	for (const entry of entries) {
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
+		let owned = false;
+		const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
-			let owned = false;
-			const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
 			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
 				if (verifyMarker && stored && stored.runId !== entry) continue;
@@ -606,6 +606,10 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
 			observeStatus?.(null);
+			if (verifyMarker && owned && !isStatusAccessError(error, asyncDir) && isStorageAccessError(error)) {
+				options.onUnreadableActiveRun?.(entry, asyncDir);
+				continue;
+			}
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
 			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir);
 			continue;

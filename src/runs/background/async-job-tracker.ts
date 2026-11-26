@@ -19,7 +19,7 @@ import {
 	SUBAGENT_STEERING_NOTICE_EVENT,
 	WIDGET_ANIMATION_INTERVAL_MS,
 } from "../../shared/types.ts";
-import { isStatusAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
+import { isStatusAccessError, isStorageAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
@@ -710,8 +710,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
 			}
-			const code = (error as NodeJS.ErrnoException)?.code;
-			if (isStatusAccessError(error, job.asyncDir) || code === "EACCES" || code === "EPERM") {
+			if (isStorageAccessError(error)) {
 				if (!unreadableStatusRuns.has(job.asyncId)) {
 					unreadableStatusRuns.add(job.asyncId);
 					console.error(`Cannot read async status or result storage for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);

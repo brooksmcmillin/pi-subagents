@@ -264,7 +264,7 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native payload EIO retry", "native stat retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native payload EIO retry", "native identity EIO", "native stat retry", "native reload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
@@ -305,7 +305,7 @@ describe("result watcher", () => {
 				readFileSync: ((file, options) => {
 					if (String(file).endsWith("wake-order.json")) {
 						resultReads++;
-						if (source.startsWith("native payload") && resultReads === 3) {
+						if ((source.startsWith("native payload") && resultReads === 3) || (source === "native identity EIO" && resultReads === 2)) {
 							payloadRetryObserved = true;
 							assert.deepEqual(terminalHolds, [true]);
 							throw Object.assign(new Error("transient payload failure"), { code: source.includes("EIO") ? "EIO" : "EACCES" });
@@ -329,6 +329,7 @@ describe("result watcher", () => {
 			if (source !== "indexed scan") {
 				assert.ok(watchEvent);
 				watchEvent("rename", "wake-order.json");
+				if (source === "native identity EIO") fs.appendFileSync(resultPath, " "); // Force a fresh identity read after native discovery.
 			} else watcher.primeExistingResults();
 			assert.equal(state.asyncJobs.size, 0);
 			assert.deepEqual(terminalHolds, denyDiscovery ? [] : [true], "hold begins when ownership is known");
@@ -354,7 +355,7 @@ describe("result watcher", () => {
 			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
 			assert.deepEqual(terminalHolds, [true, false]);
-			if (source.startsWith("native payload")) assert.equal(payloadRetryObserved, true);
+			if (source.startsWith("native payload") || source === "native identity EIO") assert.equal(payloadRetryObserved, true);
 		} finally {
 			if (injectStatFailure) {
 				fsDefault.statSync = originalStat;
