@@ -368,7 +368,7 @@ export function createResultWatcher(
 			return undefined;
 		}
 	};
-	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>, processingOwned = false): { identity: ResultFileIdentity; signature: string } | undefined => {
+	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>, processingOwned = false, onUnreadablePayload?: () => void): { identity: ResultFileIdentity; signature: string } | undefined => {
 		const resultPath = resultPayloadPath(file, observed);
 		if (!resultPath) return undefined;
 		try {
@@ -381,6 +381,7 @@ export function createResultWatcher(
 			return { identity, signature };
 		} catch (error) {
 			identityCache.delete(file);
+			if (isStorageAccessError(error)) onUnreadablePayload?.();
 			if (isAccessDenied(error) || (processingOwned && (error as NodeJS.ErrnoException)?.code === "EIO")) throw error;
 			if (!isAbsentResultCandidate(error)) reportResultWatcherWarning(state, `Failed to inspect subagent result file '${resultPath}'`, error);
 			return undefined;
@@ -396,8 +397,8 @@ export function createResultWatcher(
 		}
 	};
 
-	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false, onMissingIdentity?: () => void): boolean => {
-		const inspected = inspectResult(file, knownSignature, observed, holdForDelivery && queuedOwnedResults.has(file));
+	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false, onMissingIdentity?: () => void, onUnreadablePayload?: () => void): boolean => {
+		const inspected = inspectResult(file, knownSignature, observed, holdForDelivery && queuedOwnedResults.has(file), onUnreadablePayload);
 		if (!inspected) {
 			onMissingIdentity?.();
 			return false;
@@ -808,7 +809,7 @@ export function createResultWatcher(
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (onStorageError?: (file: string) => void): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadablePayload?: (file: string) => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
@@ -817,7 +818,7 @@ export function createResultWatcher(
 				stats.files += 1;
 				try {
 					const signature = resultSignature(file, observed);
-					if (!signature || !shouldProcessResult(file, observed, signature)) continue;
+					if (!signature || !shouldProcessResult(file, observed, signature, false, undefined, () => onUnreadablePayload?.(file))) continue;
 					stats.scheduled += 1;
 					files.push(file);
 				} catch (error) {
@@ -838,7 +839,14 @@ export function createResultWatcher(
 			const data = parseResult(raw);
 			const runId = data.runId || data.id;
 			if (typeof runId !== "string" || `${runId}.json` !== file || typeof data.sessionId !== "string" || hasDeliveredNotification(data)) return;
-			const identity = resultFileIdentity(raw, file);
+			const identity: ResultFileIdentity = {
+				acknowledged: false,
+				runId,
+				sessionId: data.sessionId,
+				completionOwnerId: typeof data.completionOwnerId === "string" ? data.completionOwnerId : undefined,
+				completionOwnerProcess: data.completionOwnerProcess,
+				parentWorkflowRunId: typeof data.parentWorkflowRunId === "string" ? data.parentWorkflowRunId : undefined,
+			};
 			if (stillOwns(identity)) return identity;
 		} catch {
 			// An unreadable index does not authorize guessing a payload's identity.
@@ -874,11 +882,17 @@ export function createResultWatcher(
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;
 		const inaccessible = new Set<string>();
-		for (const file of eligibleResultFiles((file) => inaccessible.add(file))) scheduleResult(file, triggerTurn);
+		const unreadablePayloads = new Set<string>();
+		for (const file of eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadablePayloads.add(file))) scheduleResult(file, triggerTurn);
 		for (const file of inaccessible) {
 			const identity = pendingCanonicalIdentity(file);
-			if (identity) scheduleResult(file, triggerTurn, 0, identity);
+			if (identity) {
+				unreadablePayloads.delete(file);
+				scheduleResult(file, triggerTurn, 0, identity);
+			}
 		}
+		// Retry discovery without claiming ownership until the payload can be read.
+		for (const file of unreadablePayloads) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 	};
 	/** Hand every result that is already on disk to the notifier now, without coalescing or batch delays. */
 	const deliverPendingResults = async (): Promise<void> => {

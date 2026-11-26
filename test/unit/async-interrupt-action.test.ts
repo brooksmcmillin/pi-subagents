@@ -14,6 +14,7 @@ import { listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
 import { reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { stopAsyncRun } from "../../src/runs/foreground/async-stop-action.ts";
 import { createSubagentExecutor, steerWorkflowChildByKey } from "../../src/runs/foreground/subagent-executor.ts";
 import { resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import { steerWorkflowForegroundTarget } from "../../src/runs/foreground/workflow-foreground-steering.ts";
@@ -1181,6 +1182,33 @@ describe("async interrupt action", () => {
 			assert.equal(consumeStopRequestPayload(asyncDir)?.type, "stop");
 			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
 		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("writes a live stop request even when its completion index is unreadable", () => {
+		const state = createState();
+		state.currentSessionId = "session";
+		const runId = `stop-result-eio-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: true, sessionId: "session" });
+		const read = fs.readFileSync;
+		let denied = false;
+		try {
+			fs.readFileSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === `${runId}.json`) {
+					denied = true;
+					throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+				}
+				return read(file, ...args);
+			}) as typeof fs.readFileSync;
+			syncBuiltinESMExports();
+			const result = stopAsyncRun(state, runId, () => true);
+			assert.equal(denied, true);
+			assert.equal(result?.isError, undefined);
+			assert.equal(consumeStopRequestPayload(asyncDir)?.source, "stop-action");
+		} finally {
+			fs.readFileSync = read;
+			syncBuiltinESMExports();
 			cleanup(runId, asyncDir);
 		}
 	});

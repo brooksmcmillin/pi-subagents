@@ -2942,17 +2942,24 @@ describe("result watcher", () => {
 		assert.equal(denied, previousDenials);
 	});
 
-	it("holds and retries the sole owned result when the macOS startup index is unreadable", async (t) => {
+	for (const failure of ["index", "payload", "index with nested ownership fields"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
+		const failPayload = failure === "payload";
+		const hasNestedOwner = failure === "index with nested ownership fields";
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
 		const state = createState();
 		state.currentSessionId = "session-1";
 		const output = path.join(resultsDir, "saved.json");
 		writeIndexedResult(output, { id: "saved", sessionId: "session-1", success: true });
+		if (hasNestedOwner) {
+			fs.writeFileSync(output, JSON.stringify({ id: "saved", sessionId: "session-1", success: true,
+				completionOwnerId: "departed-canonical-owner", completionOwnerProcess: { pid: 2147483647 },
+				structuredOutput: { parentWorkflowRunId: "not-the-parent" } }));
+		}
 		const read = fsDefault.readFileSync;
 		let failing = true;
 		let denials = 0;
 		fsDefault.readFileSync = ((file, ...args) => {
-			if (failing && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+			if (failing && (failPayload ? file === output : String(file).includes(`${path.sep}result-index${path.sep}`))) {
 				denials++;
 				throw Object.assign(new Error("index unreadable"), { code: "EIO" });
 			}
@@ -2961,17 +2968,22 @@ describe("result watcher", () => {
 		syncBuiltinESMExports();
 		let delivered = 0;
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
-			platform: "darwin", notifier: { deliver: async () => { delivered++; return true; } },
+			platform: "darwin", ...(hasNestedOwner ? { ownership: createResultDeliveryOwnership(state) } : {}),
+			notifier: { deliver: async () => { delivered++; return true; } },
 		});
 		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
 		watcher.startResultWatcher();
+		if (hasNestedOwner) assert.equal(watcher.hasPendingResults(), true, "switch uses only top-level ownership fields");
 		watcher.primeExistingResults();
 		assert.equal(state.asyncJobs.size, 0);
-		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload);
+		if (hasNestedOwner) return; // The assertion covers the unreadable-index ownership fallback.
 		const startupDenials = denials;
 		assert.ok(startupDenials > 0);
-		assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
-		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		if (!failPayload) {
+			assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
+			assert.equal(watcher.hasQueuedOwnedResults(), true);
+		}
 		failing = false;
 		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults()), true);
 	});

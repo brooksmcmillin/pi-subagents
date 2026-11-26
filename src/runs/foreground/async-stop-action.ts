@@ -8,7 +8,7 @@ import { deliverStopRequest, stopInboxClosedPath } from "../background/control-c
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, isStatusAccessError, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
@@ -160,14 +160,26 @@ export function stopAsyncRun(
 		return { content: [{ type: "text", text: `Stop requested for async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
 	}
 	if (!target) return null;
-	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
+	let status = readStatus(target.asyncDir);
 	// A relaunched workflow stops the exact child run it re-attached from its relaunch chain, whichever session launched it.
-	if (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId) {
+	if ((status && status.runId !== target.asyncId)
+		|| (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId)) {
 		return {
 			content: [{ type: "text", text: `Async run '${target.asyncId}' was not found in the active session.` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
+	}
+	if (status) {
+		const { runId: expectedRunId, sessionId: expectedSessionId } = status;
+		try {
+			status = reconcileAsyncRun(target.asyncDir, { kill, expectedRunId, expectedSessionId }).status;
+		} catch (error) {
+			if (!isStorageAccessError(error) || isStatusAccessError(error, target.asyncDir)) throw error;
+			// Completion storage is not required to send stop to a verified live runner.
+			const current = readStatus(target.asyncDir);
+			status = current?.runId === expectedRunId && current.sessionId === expectedSessionId ? current : null;
+		}
 	}
 	const pausedWholeRun = status?.state === "paused" && childId === undefined;
 	if (!status || (status.state !== "running" && status.state !== "queued" && !pausedWholeRun)) {
