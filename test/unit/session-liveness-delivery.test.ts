@@ -79,8 +79,14 @@ const terminalBeforePublicationScript = String.raw`
 	};
 	const workflowReload = process.argv[1] === "workflow-reload";
 	const noStatusReload = process.argv[1] === "published-no-status-reload";
+	const ackNestedEIO = process.argv[1] === "published-ack-nested-eio";
+	const ackStatusEIO = process.argv[1] === "published-ack-status-eio" || ackNestedEIO;
+	const ackRoute = ackNestedEIO ? createNestedRoute(runId) : undefined;
+	const ackChild = { id: "independent", parentRunId: runId, depth: 1, path: [{ runId }], agent: "worker",
+		asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", runId, "independent"), state: "running" };
+	if (ackRoute) writeNestedEvent(ackRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId, child: ackChild });
 	const vanishedResult = process.argv[1] === "published-vanished";
-	const publishedReload = process.argv[1] === "published-reload" || noStatusReload || vanishedResult;
+	const publishedReload = process.argv[1] === "published-reload" || noStatusReload || vanishedResult || ackStatusEIO;
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
 	const provisionalReload = process.argv[1] === "provisional-reload";
 	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
@@ -133,9 +139,10 @@ const terminalBeforePublicationScript = String.raw`
 		updateActiveRunIndex(asyncDir, markerState);
 		return asyncDir;
 	};
-	const publishResult = (pending = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
+	const publishResult = (pending = false, acknowledged = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
 		id: runId, runId, agent: "worker", mode: "single", state: "complete", success: true, exitCode: 0,
 		summary: "child complete", timestamp: Date.now(), sessionId, completionOwnerId,
+		...(acknowledged ? { notificationDeliveredAt: Date.now() } : {}),
 	});
 
 	registerSubagentExtension(pi);
@@ -263,7 +270,7 @@ const terminalBeforePublicationScript = String.raw`
 	} else {
 		assert.equal(provider.isActive(), false);
 		asyncDir = writeStatus("running");
-		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir, nestedRoute: ackRoute });
 	}
 	assert.equal(provider.isActive(), true);
 	if (forgetRestored) {
@@ -302,7 +309,7 @@ const terminalBeforePublicationScript = String.raw`
 		fsDefault.statSync = (file, ...args) => {
 			if (denyStatus && String(file) === path.join(asyncDir, "status.json")) {
 				statusDenied = true;
-				throw Object.assign(new Error("temporarily inaccessible status"), { code: "EACCES" });
+				throw Object.assign(new Error("temporarily inaccessible status"), { code: ackStatusEIO ? "EIO" : "EACCES" });
 			}
 			if (denyResult && (String(file).includes("result-pending") || (publishedReload && String(file) === resultFilePath(DIRS.results, runId)))) {
 				throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
@@ -315,6 +322,7 @@ const terminalBeforePublicationScript = String.raw`
 			writeStatus("complete", proof);
 			if (publishedReload) publishResult();
 			if (workflowReload || publishedReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			if (ackStatusEIO) publishResult(false, true);
 			denyResult = true;
 			if (noStatusReload) fs.rmSync(path.join(asyncDir, "status.json"));
 			if (vanishedResult) fs.rmSync(resultFilePath(DIRS.results, runId));
@@ -323,7 +331,7 @@ const terminalBeforePublicationScript = String.raw`
 				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
 				handlers.clear();
 				holds.length = 0;
-				denyStatus = i === 0 && !workflowReload && !publishedReload;
+				denyStatus = ackStatusEIO || (i === 0 && !workflowReload && !publishedReload);
 				denyListing = i === 0 && publishedReload;
 				registerSubagentExtension(pi);
 				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
@@ -332,12 +340,25 @@ const terminalBeforePublicationScript = String.raw`
 				assert.deepEqual(holds, [true]);
 				assert.equal(provider.isActive(), true);
 			}
+			if (ackStatusEIO) {
+				denyResult = false;
+				if (ackRoute) {
+					for (let i = 0; i < 120 && fs.existsSync(resultFilePath(DIRS.results, runId)); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+					assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+					assert.equal(provider.isActive(), true, "acknowledgement must not clear independent nested work");
+					assert.deepEqual(holds, [true]);
+					writeNestedEvent(ackRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: runId, child: { ...ackChild, state: "complete" } });
+				}
+				for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(provider.isActive(), false, "acknowledgement settles without status recovery");
+				assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+			}
 		} finally {
 			fsDefault.statSync = stat;
 			fsDefault.readdirSync = readdir;
 			syncBuiltinESMExports();
 		}
-		if (publishedReload && !vanishedResult) {
+		if (publishedReload && !vanishedResult && !ackStatusEIO) {
 			ctx.isIdle = () => true;
 			rejectNextSend = false;
 			const sent = nextSend();
@@ -521,6 +542,8 @@ describe("session liveness through result delivery", () => {
 		["published-reload", "published delivery remains held on reload even when active listing fails"],
 		["published-no-status-reload", "holds an unreadable published result across reload with no status file"],
 		["published-vanished", "clears delivery debt when a previously visible result disappears without delivery"],
+		["published-ack-status-eio", "settles an acknowledged result despite persistent root status EIO"],
+		["published-ack-nested-eio", "preserves nested work after acknowledgement during persistent root status EIO"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

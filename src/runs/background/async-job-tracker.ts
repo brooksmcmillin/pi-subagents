@@ -110,10 +110,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	type PendingPublication = { instanceId?: string; pending: true; provisional?: true; deliverySessionId?: string };
 	type PublicationObligation = PendingPublication | { pending: false };
 	const terminalPublications = new Map<string, PublicationObligation>();
-	const unverifiedPublications = new Map<string, PublicationObligation>();
+	type ReloadObligation = PublicationObligation & { nested?: { route: NonNullable<AsyncJobState["nestedRoute"]>; sessionId: string; rootExited: boolean } };
+	const unverifiedPublications = new Map<string, ReloadObligation>();
 	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
 	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
-	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, PublicationObligation> }> };
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, ReloadObligation> }> };
 	const reloadPublications = globals[handoffKey] ??= new WeakMap();
 	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
@@ -471,7 +472,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const rootWriterClosed = (job: AsyncJobState, status: ReturnType<typeof readStatus>) =>
-		(!status || status.runId === job.asyncId) && hasObservedRunnerClose(job.asyncDir, job.asyncId, status?.processTerminal);
+		(status ? status.runId === job.asyncId && (!job.sessionId || status.sessionId === job.sessionId) : !job.sessionId)
+		&& hasObservedRunnerClose(job.asyncDir, job.asyncId, status?.processTerminal);
 
 	const refreshNestedLiveness = (job: AsyncJobState, status?: ReturnType<typeof readStatus>) => {
 		const previous = job.nestedWorkActive;
@@ -492,9 +494,26 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (owner === state.completionOwnerId || owner === OWNING_SESSION_COMPLETION_OWNER) return owner;
 	};
 
+	const hasRestoredNestedWork = (job: AsyncJobState, handoff: ReloadObligation | undefined): boolean => {
+		const nested = handoff?.nested;
+		if (!nested || nested.route.rootRunId !== job.asyncId || !ownsRun(state.currentSessionId, nested.sessionId)) return false;
+		try {
+			return hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(nested.route).children, nested.rootExited);
+		} catch {
+			return true; // The original owner verified this route; retry after storage recovers.
+		}
+	};
+
 	const refreshJob = (job: AsyncJobState): boolean => {
 		const verifyingIdentity = unverifiedRuns.has(job.asyncId);
 		if (verifyingIdentity) {
+			const pending = unverifiedPublications.get(job.asyncId);
+			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
+			if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && options.hasDeliveredResult?.(job.asyncId)
+				&& !hasRestoredNestedWork(job, pending)) {
+				forgetJob(job.asyncId);
+				return true;
+			}
 			let stored: ReturnType<typeof readStatus> = null;
 			let summary: AsyncRunSummary | undefined;
 			try {
@@ -505,9 +524,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
-			const pending = unverifiedPublications.get(job.asyncId);
-			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
 			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
+				if (hasRestoredNestedWork(job, pending)) return false;
 				// Only a previously verified delivery obligation can survive without status.
 				if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && !options.hasDeliveredResult?.(job.asyncId)
 					&& indexedResultPayloadVisibility(resultsDir, deliverySession, job.asyncId) !== "absent") return false;
@@ -979,26 +997,30 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			for (const runId of options.getOwedResultRunIds?.() ?? []) {
 				const publication = runs.get(runId);
 				const job = state.asyncJobs.get(runId);
-				runs.set(runId, { ...(publication?.pending ? publication : {}), pending: true, deliverySessionId: job?.sessionId });
+				runs.set(runId, { ...publication, pending: true, deliverySessionId: job?.sessionId });
 			}
 			for (const job of state.asyncJobs.values()) {
-				if (runs.has(job.asyncId) || !ownsRun(publicationSession.id, job.sessionId)) continue;
+				if (!job.sessionId || !ownsRun(publicationSession.id, job.sessionId)) continue;
 				const route = job.nestedRoute;
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
+				let rootExited = false;
 				try {
 					const stored = readStatus(job.asyncDir);
 					if (!isTerminalJobStatus(job.status)) {
 						if (!stored || stored.runId !== job.asyncId || !ownsRun(publicationSession.id, stored.sessionId)
 							|| !isTerminalJobStatus(stored.state)) continue;
 					}
-					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children,
-						rootWriterClosed(job, stored));
+					rootExited = Boolean(stored && rootWriterClosed(job, stored));
+					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children, rootExited);
 				} catch {
 					// The replacement can retry the exact owned route if it is temporarily unreadable.
 					nestedActive = true;
 				}
-				if (nestedActive) runs.set(job.asyncId, isTerminalJobStatus(job.status) ? { pending: false } : { pending: true, provisional: true });
+				if (nestedActive) {
+					const publication = runs.get(job.asyncId) ?? (isTerminalJobStatus(job.status) ? { pending: false } : { pending: true, provisional: true });
+					runs.set(job.asyncId, { ...publication, nested: { route, sessionId: job.sessionId, rootExited } });
+				}
 			}
 			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}

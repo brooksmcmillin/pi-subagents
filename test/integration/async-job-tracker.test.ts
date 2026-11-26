@@ -528,6 +528,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "failed", "terminal root projected");
 			assert.equal(hasLiveSubagentWork(state), true);
 			writeClose("current");
+			const statusPath = path.join(asyncDir, "status.json");
+			const ownStatus = fs.readFileSync(statusPath, "utf-8");
+			fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(ownStatus), sessionId: "foreign" }));
+			tracker.handleComplete({ id: route.rootRunId, sessionId: "parent", state: "failed", success: false });
+			assert.equal(hasLiveSubagentWork(state), true, "foreign-session status cannot prune on completion event");
+			fs.writeFileSync(statusPath, ownStatus);
 			await waitForCondition(() => !hasLiveSubagentWork(state), "exact closure drains foreground work");
 		} finally {
 			tracker.dispose();
@@ -536,8 +542,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh"]) it(`retains late independent work ${phase}`, async () => {
+	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears"]) it(`retains late independent work ${phase}`, async () => {
 		const rootStillRunning = phase === "before the root's terminal refresh";
+		const statusDisappears = phase === "after the root status disappears";
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
 		const route = createNestedRoute("tracked-async-owner-close");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -554,7 +561,8 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			const foreground = { id: "foreground", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const };
 			const independent = { ...foreground, id: "independent", parentRunId: foreground.id, depth: 2,
 				path: [...foreground.path, { runId: foreground.id }], asyncDir: path.join(asyncRoot, "independent") };
-			writeNestedEvent(route, { type: "subagent.nested.started", ts: 100, parentRunId: foreground.parentRunId, child: foreground });
+			writeNestedEvent(route, { type: statusDisappears ? "subagent.nested.completed" : "subagent.nested.started", ts: 100,
+				parentRunId: foreground.parentRunId, child: { ...foreground, state: statusDisappears ? "complete" : "running" } });
 			const proof = { version: 1, state: "observed", runId: route.rootRunId, runnerProcessInstanceId: "runner", observedAt: 200,
 				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 200, exitCode: 1, signal: null }] };
 			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
@@ -588,6 +596,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			fs.rmSync(resultPath); // Result consumer has delivered and retired the payload.
 			updateActiveRunIndex(asyncDir, "failed");
 			assert.equal(readActiveRunIndex(asyncRoot)?.includes(route.rootRunId) ?? false, false);
+			if (statusDisappears) fs.rmSync(path.join(asyncDir, "status.json"));
 			tracker.dispose("reload");
 			state = { ...createState(), currentSessionId: "parent", completionOwnerId: "process-owner" };
 			tracker = createTracker(createEventRecorder().pi, state, asyncRoot, options);
