@@ -54,6 +54,7 @@ interface ReconcileAsyncRunOptions {
 }
 
 interface ReconcileAsyncRunResult {
+	noPublication?: true;
 	status: AsyncStatus | null;
 	repaired: boolean;
 	resultPath?: string;
@@ -379,7 +380,7 @@ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: st
 		...(published ? { resultPath } : {}),
 		message: repair.message,
 	});
-	return { status: repair.status, repaired: true, ...(published ? { resultPath } : {}), message: repair.message };
+	return { status: repair.status, repaired: true, ...(published ? { resultPath } : { noPublication: true }), message: repair.message };
 }
 
 function terminal(state: AsyncStatus["state"]): boolean {

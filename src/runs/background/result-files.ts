@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isStorageAccessError } from "../../shared/utils.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { withFileLease } from "../../shared/file-lease.ts";
 import { MISSION_BINDING_FILE } from "../../missions/lifecycle.ts";
@@ -470,9 +471,14 @@ function readResultIndexForSessionRun(resultsDir: string, sessionId: string, run
 }
 
 export function indexedResultPayloadVisibility(resultsDir: string, sessionId: string, runId: string): ReturnType<typeof resultPayloadVisibility> {
-	const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
-	const indexedPath = entry && entry.file === path.basename(entry.file) && entry.file.endsWith(".json") ? path.join(resultsDir, entry.file) : undefined;
-	return resultPayloadVisibility(resultsDir, sessionId, runId, indexedPath);
+	try {
+		const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
+		const indexedPath = entry && entry.file === path.basename(entry.file) && entry.file.endsWith(".json") ? path.join(resultsDir, entry.file) : undefined;
+		return resultPayloadVisibility(resultsDir, sessionId, runId, indexedPath);
+	} catch (error) {
+		if (isStorageAccessError(error)) return "unknown";
+		throw error;
+	}
 }
 
 export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {

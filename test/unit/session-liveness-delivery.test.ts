@@ -84,13 +84,15 @@ const terminalBeforePublicationScript = String.raw`
 	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
 	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
 	const inheritedPublication = process.argv[1] === "inherited-publication";
+	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
+	const indexedAlias = process.argv[1] === "closed-index-alias";
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
 	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
-	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun;
 	const statusOnlyClosure = process.argv[1] === "closed-overlay";
 	const indexDenied = process.argv[1] === "closed-index-denied";
-	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied;
+	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied || indexedAlias;
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
@@ -136,7 +138,7 @@ const terminalBeforePublicationScript = String.raw`
 	let asyncDir;
 	if (restoredCase) {
 		const observed = provisionalReload ? exitProof() : undefined;
-		asyncDir = writeStatus(mismatchedRunningMarker ? "running" : "complete", observed, "running");
+		asyncDir = writeStatus(mismatchedRunningMarker || restoreDeadRun ? "running" : "complete", observed, "running");
 		if (observed) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), observed);
 	}
 	const unrelatedRoute = mismatchedMarker ? createNestedRoute("different-run") : undefined;
@@ -191,6 +193,52 @@ const terminalBeforePublicationScript = String.raw`
 			fsDefault.statSync = restoreStat;
 			syncBuiltinESMExports();
 		}
+	}
+	if (restoreDeadRun || indexedAlias) {
+		const publicPath = resultFilePath(DIRS.results, indexedAlias ? "alternate" : runId);
+		const bytes = JSON.stringify({ id: runId, sessionId: "other-session", success: true });
+		const stat = fsDefault.statSync;
+		let visibilityDenied = false;
+		try {
+			if (indexedAlias) {
+				writeAsyncResultFile(publicPath, { id: runId, runId, sessionId, completionOwnerId, success: true, notificationDeliveredAt: Date.now() });
+				fsDefault.statSync = (file, ...args) => {
+					if (String(file) === publicPath) {
+						visibilityDenied ||= new Error().stack.includes("indexedResultPayloadVisibility");
+						throw Object.assign(new Error("indexed alias temporarily inaccessible"), { code: "EACCES" });
+					}
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				asyncDir = writeStatus("running");
+				events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
+				writeStatus("complete", exitProof());
+				events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, exitProof());
+				for (let i = 0; i < 130 && !visibilityDenied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(visibilityDenied, true);
+				assert.deepEqual(holds, [true]);
+				assert.equal(provider.isActive(), true);
+			} else {
+				assert.deepEqual(holds, [true]);
+				fs.mkdirSync(DIRS.results, { recursive: true });
+				fs.writeFileSync(publicPath, bytes);
+				const statusPath = path.join(asyncDir, "status.json");
+				writeAtomicJson(statusPath, { ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 2147483647 });
+			}
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		for (let i = 0; i < 180 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		if (restoreDeadRun) {
+			assert.equal(fs.readFileSync(publicPath, "utf-8"), bytes);
+			assert.ok(reports.some(report => /state=error:/.test(report)));
+		} else assert.equal(fs.existsSync(publicPath), false, "owned acknowledged alias was retired");
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
 	}
 	if (mismatchedMarker) {
 		assert.equal(readActiveRunIndex(DIRS.async).includes(runId), true, "the directory was discovered via its active marker");
@@ -441,6 +489,8 @@ describe("session liveness through result delivery", () => {
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["closed-overlay", "settles with validated status-only closure and leaves a mismatched pending result untouched"],
+		["closed-index-alias", "retains a closed writer hold while its indexed public alias is inaccessible"],
+		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],

@@ -904,6 +904,7 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.repaired, true);
 			assert.equal(result.status?.state, "failed");
 			assert.equal(result.resultPath, undefined);
+			assert.equal(result.noPublication, true);
 			assert.equal(fs.readFileSync(resultPath, "utf-8"), bytes);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

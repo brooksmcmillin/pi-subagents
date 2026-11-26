@@ -31,7 +31,7 @@ import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summar
 import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { hasObservedRunnerClose, readProcessTerminal } from "./process-terminal.ts";
-import { resultPayloadVisibility } from "./result-files.ts";
+import { indexedResultPayloadVisibility } from "./result-files.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
@@ -676,11 +676,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						}
 					}
 					const wasPending = publication?.pending;
-					let publicationClosed = false;
-					if (publication?.pending) {
+					let publicationClosed = reconciliation.noPublication === true;
+					if (publicationClosed) {
+						publication = { pending: false };
+						terminalPublications.set(job.asyncId, publication);
+					} else if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
-						const visibility = job.sessionId ? resultPayloadVisibility(resultsDir, job.sessionId, job.asyncId, reconciliation.resultPath) : "unknown";
+						const visibility = job.sessionId ? indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) : "unknown";
 						const published = visibility === "present";
 						publicationClosed = visibility === "absent" && (!publication.instanceId
 							|| (status.processTerminal?.runnerProcessInstanceId === publication.instanceId && rootWriterClosed(job, status))
@@ -691,7 +694,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!nestedOnly && (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending))) options.onJobTerminal?.(job, publicationClosed);
+					if (!nestedOnly && (publicationClosed || !isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending))) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
