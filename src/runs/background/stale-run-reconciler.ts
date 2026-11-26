@@ -586,16 +586,27 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		&& indexedResultPayloadVisibility(resultsDir, effectiveStatus.sessionId, runId) !== "absent") {
 		return { status: effectiveStatus, repaired: false };
 	}
-	const preservePublicResult = Boolean(options.expectedRunId && existingResultPath && regularFileExists(resultPath));
 	const liveness = runnerLiveness(effectiveStatus.pid);
+	const fail = (reason?: string, ownerExited = false): ReconcileAsyncRunResult => {
+		const preservePublicResult = Boolean(options.expectedRunId && regularFileExists(resultPath));
+		if (options.expectedRunId) {
+			if (effectiveStatus.sessionId && indexedResultPayloadVisibility(resultsDir, effectiveStatus.sessionId, runId) !== "absent") {
+				const current = readStatus(asyncDir);
+				return { status: mayWrite(current) ? current ?? status : null, repaired: false };
+			}
+			const current = readStatus(asyncDir);
+			// readStatus returns the same cached snapshot while the file is unchanged.
+			if (!mayWrite(current) || current !== status) return { status: mayWrite(current) ? current : null, repaired: false };
+		}
+		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, reason, ownerExited,
+			ownerExited ? options.adoptCompletionOwnerId : undefined, preservePublicResult);
+	};
 	if (liveness !== "dead") {
 		if (now - lastUpdate <= staleAfterMs) return { status: status ?? null, repaired: false, resultPath };
 		const probe = liveness === "alive" ? "is still live" : "cannot be probed from this process";
 		const message = `Async runner PID ${effectiveStatus.pid} ${probe}; status has not updated for ${now - lastUpdate}ms, so stale-run reconciliation marked the run failed because PID ownership is unverified.`;
-		if (options.expectedRunId && !mayWrite(readStatus(asyncDir))) return { status: null, repaired: false };
-		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, message, false, undefined, preservePublicResult);
+		return fail(message);
 	}
 
-	if (options.expectedRunId && !mayWrite(readStatus(asyncDir))) return { status: null, repaired: false };
-	return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, undefined, true, options.adoptCompletionOwnerId, preservePublicResult);
+	return fail(undefined, true);
 }

@@ -610,7 +610,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				resultsDir,
 				kill: options.kill,
 				now: options.now,
-				startedRun: restored ? undefined : {
+				startedRun: restored || isTerminalJobStatus(job.status) ? undefined : {
 					runId: job.asyncId,
 					pid: job.pid,
 					sessionId: job.sessionId,
@@ -623,7 +623,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			if (restored && !reconciliation.status) {
+			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
 				const publication = terminalPublications.get(job.asyncId);
 				if (publication?.pending && publication.instanceId && !options.hasDeliveredResult?.(job.asyncId)
 					&& !verifiedRootClose.has(job)
@@ -643,6 +643,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					cancelCleanup(job.asyncId);
 					return false;
 				}
+				retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
 				forgetJob(job.asyncId);
 				return true;
 			}

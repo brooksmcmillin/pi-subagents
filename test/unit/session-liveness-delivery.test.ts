@@ -21,7 +21,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { createEventBus } from "@earendil-works/pi-coding-agent";
 	import registerSubagentExtension from "./src/extension/index.ts";
 	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
-	import { recordSessionReplacement } from "./src/shared/session-succession.ts";
+	import { recordSessionReplacement, recordSessionStart } from "./src/shared/session-succession.ts";
 	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT, TEMP_ROOT_DIR } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
 	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
@@ -93,9 +93,11 @@ const terminalBeforePublicationScript = String.raw`
 	const provisionalReload = process.argv[1] === "provisional-reload";
 	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
 	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
-	const inheritedPublication = process.argv[1] === "inherited-publication";
+	const originalReopened = process.argv[1] === "inherited-reclaimed";
+	const inheritedPublication = process.argv[1] === "inherited-publication" || originalReopened;
 	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
 	const forgetRestored = process.argv[1] === "forget-restored";
+	const forgetStarted = process.argv[1] === "forget-started";
 	const aliasEvent = process.argv[1] === "closed-event-alias";
 	const indexedAlias = process.argv[1] === "closed-index-alias" || aliasEvent;
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
@@ -107,7 +109,7 @@ const terminalBeforePublicationScript = String.raw`
 	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied || indexedAlias;
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
-	const tui = closedCase || pendingCase;
+	const tui = closedCase || pendingCase || forgetStarted;
 	const holds = [];
 	const reports = [];
 	if (tui) {
@@ -313,7 +315,25 @@ const terminalBeforePublicationScript = String.raw`
 		process.stdout.write("ok");
 		process.exit(0);
 	}
-	if (forgetRestored) {
+	if (originalReopened) {
+		assert.deepEqual(holds, [true]);
+		recordSessionStart(runSessionId, false);
+		for (let i = 0; i < 140 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		assert.equal(fs.existsSync(path.join(asyncDir, "status.json")), true, "original session keeps its own status");
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
+	if (forgetStarted) {
+		writeStatus("complete");
+		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
+		for (let i = 0; i < 130 && !reports.some(report => report.includes("state=clear:")); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.ok(reports.some(report => report.includes("state=clear:")), "terminal child was projected while the root still held");
+	}
+	if (forgetRestored || forgetStarted) {
+		assert.deepEqual(holds, [true]);
 		fs.rmSync(path.join(asyncDir, "status.json"));
 		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
 		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
@@ -571,6 +591,7 @@ describe("session liveness through result delivery", () => {
 		["closed-event-alias", "retains a completion event hold while its indexed public alias is inaccessible"],
 		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
 		["forget-restored", "settles a restored hold after status disappears with no payload"],
+		["forget-started", "settles a start-event terminal hold after status disappears and writer closes"],
 		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],
 		["statusless-delayed-no-reload", "preserves the verified pending writer after status loss refresh without reload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
@@ -578,6 +599,7 @@ describe("session liveness through result delivery", () => {
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
 		["provisional-reload", "second reload preserves a markerless terminal publication through status EIO"],
 		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
+		["inherited-reclaimed", "original session reopening releases its successor's inherited hold"],
 		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
 		["mismatched-running-marker", "does not restore running status claiming a run ID different from the active marker"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],

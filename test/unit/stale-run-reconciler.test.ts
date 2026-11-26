@@ -890,6 +890,27 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("keeps a real result finalized during the stale runner PID probe", () => {
+		const root = tempRoot("pi-stale-pid-finalized-");
+		try {
+			const asyncDir = path.join(root, "finished");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "finished.json");
+			const status = { runId: "finished", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 };
+			const finished = { ...status, state: "complete" };
+			const payload = { id: "finished", sessionId: "parent", success: true };
+			writeStatus(asyncDir, status);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "finished", expectedSessionId: "parent", resultsDir,
+				kill: () => { writeAsyncResultFile(resultPath, payload); writeStatus(asyncDir, finished); throw errno("ESRCH"); } });
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.state, "complete");
+			assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf-8")), payload);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")), finished);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("does not publish failed repair after the PID probe finds a replaced session", () => {
 		const root = tempRoot("pi-stale-pid-session-swap-");
 		try {

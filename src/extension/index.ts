@@ -500,7 +500,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 		getOwedResultRunIds: () => owedResultRunIds,
 		hasDeliveredResult: (runId) => deliveredRunIds.has(runId),
-		onJobCleanup: (asyncId) => deliveredRunIds.delete(asyncId),
+		onJobCleanup: (asyncId) => {
+			deliveredRunIds.delete(asyncId);
+			if (owedResultRunIds.delete(asyncId)) programStatus.sync();
+		},
 		deliveryOwnerId: resultDeliveryOwnership.deliveryOwnerId,
 		supervisorRequestState: supervisorChannel.getSupervisorRequestState,
 		onJobsChanged: programStatus.sync,
