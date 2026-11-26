@@ -833,8 +833,18 @@ export function createResultWatcher(
 			if (!canonicalOnly && isStorageAccessError(error)) return isPendingOwnedResult(file, true);
 			return !canonicalOnly && !isNotFound(error);
 		}
+		if (requireFilenameMatch) {
+			try {
+				const data = parseResult(raw);
+				const runId = data.runId || data.id;
+				return typeof runId === "string" && `${runId}.json` === file && typeof data.sessionId === "string"
+					&& ownsResult(data.sessionId, deliveryOwnerId(data.sessionId, data.completionOwnerId, data.completionOwnerProcess, data.parentWorkflowRunId))
+					&& !hasDeliveredNotification(data);
+			} catch {
+				return false; // An unreadable index does not authorize guessing a payload's identity.
+			}
+		}
 		const identity = resultFileIdentity(raw, file);
-		if (requireFilenameMatch && (!identity.runId || `${identity.runId}.json` !== file)) return false;
 		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
 		try {
 			return !hasDeliveredNotification(parseResult(raw));

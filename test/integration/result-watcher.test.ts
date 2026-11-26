@@ -2885,9 +2885,9 @@ describe("result watcher", () => {
 		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned payload when enumeration cannot read its entry");
 		assert.ok(denied > denialsBeforeEnumeration);
 		assert.equal(watcher.hasQueuedOwnedResults(), false, "fallback does not schedule delivery");
-		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", success: true }));
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
 		assert.equal(watcher.hasPendingResults(), false, "enumeration fallback rejects the wrong run");
-		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", success: true }));
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
 		assert.equal(watcher.hasPendingResults(), false, "canonical fallback still verifies ownership");
 		writeIndexedResult(deniedPath, { id: "a-denied", sessionId: "session-1", success: true, summary: "owned" });
 		denyIndex = false;
