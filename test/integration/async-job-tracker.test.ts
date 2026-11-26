@@ -550,7 +550,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const holds: boolean[] = [];
 		const reporter = registerProgramStatusReporter({ enabled: true, isTTY: true, env: { TERM: "xterm-256color" },
 			getJobs: () => [], getPendingRequests: () => [], hasBackgroundWork: () => hasLiveSubagentWork(state) });
-		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 200, onJobsChanged: reporter.sync });
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 400, onJobsChanged: reporter.sync });
 		const child = { id: "independent", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const,
 			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
 		try {
@@ -564,16 +564,20 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			holds.length = 0;
 			if (unreadable) {
 				const stat = fsDefault.statSync;
+				const cleanup = state.cleanupTimers.get(route.rootRunId);
+				let failedRefresh = false;
 				fsDefault.statSync = ((file, options) => {
-					if (file === statusPath) throw Object.assign(new Error("status unreadable"), { code: "EIO" });
+					if (file === statusPath) { failedRefresh = true; throw Object.assign(new Error("status unreadable"), { code: "EIO" }); }
 					return stat(file, options);
 				}) as typeof fs.statSync;
 				syncBuiltinESMExports();
 				t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); });
+				await waitForCondition(() => failedRefresh, "first EIO refresh before nested start");
+				assert.equal(state.cleanupTimers.get(route.rootRunId), cleanup, "EIO leaves original watcher retention armed");
 			} else fs.rmSync(statusPath);
 			writeNestedEvent(route, { type: "subagent.nested.started", ts: 200, parentRunId: route.rootRunId, child });
 			await waitForCondition(() => holds.at(-1) === true, "reporter receives late nested hold");
-			await new Promise(resolve => setTimeout(resolve, 250));
+			await new Promise(resolve => setTimeout(resolve, 450));
 			assert.equal(state.asyncJobs.has(route.rootRunId), true, "independent child outlasts original cleanup deadline");
 			assert.deepEqual(holds, [true]);
 			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: route.rootRunId, child: { ...child, state: "complete" } });
@@ -1530,6 +1534,36 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(fs.existsSync(payload), phase === "pre-write read", "foreign pending result was not promoted");
 		assert.ok(readActiveRunIndex(asyncRoot)?.includes("swapped"));
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
+	});
+
+	it("keeps a restored running job live until temporarily missing status returns", async (t) => {
+		const asyncRoot = createTempDir("pi-restored-live-status-gap-");
+		const asyncDir = path.join(asyncRoot, "restored");
+		const statusPath = path.join(asyncDir, "status.json");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results"), pollIntervalMs: 10 });
+		const stat = fsDefault.statSync;
+		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(asyncDir, "restored", "parent");
+		updateActiveRunIndex(asyncDir, "running");
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(state.asyncJobs.get("restored")?.status, "running");
+		const prior = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		fs.rmSync(statusPath);
+		let observedMissing = false;
+		fsDefault.statSync = ((file, options) => {
+			try { return stat(file, options); } catch (error) {
+				if (file === statusPath && (error as NodeJS.ErrnoException).code === "ENOENT") observedMissing = true;
+				throw error;
+			}
+		}) as typeof fs.statSync;
+		syncBuiltinESMExports();
+		await waitForCondition(() => observedMissing, "tracker reads missing status");
+		assert.equal(hasLiveSubagentWork(state), true);
+		assert.equal(fs.existsSync(statusPath), false, "tracking does not synthesize status");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...prior, turnCount: 4 }));
+		await waitForCondition(() => state.asyncJobs.get("restored")?.turnCount === 4, "restored tracking resumes from recovered status");
+		assert.equal(state.asyncJobs.get("restored")?.status, "running");
 	});
 
 	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {

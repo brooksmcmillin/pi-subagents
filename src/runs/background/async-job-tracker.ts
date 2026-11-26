@@ -590,7 +590,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		};
-		const settleWithoutStatus = (): boolean => {
+		const settleWithoutStatus = (unreadable = false): boolean => {
 			const publication = terminalPublications.get(job.asyncId);
 			if (publication?.instanceId && readProcessTerminal(job.asyncDir, {
 				runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
@@ -606,6 +606,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (owedSession) options.onJobTerminal?.(job, true);
 			if (nestedRefreshFailed || job.nestedWorkActive) {
 				cancelCleanup(job.asyncId);
+				return nestedChanged;
+			}
+			if (unreadable) {
+				// Keep watching for late descendants for the original terminal retention window.
+				if (!state.cleanupTimers.has(job.asyncId)) scheduleCleanup(job.asyncId);
 				return nestedChanged;
 			}
 			retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
@@ -649,7 +654,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) return settleWithoutStatus();
+			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
+				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) return false;
+				return settleWithoutStatus();
+			}
 			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
 			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
@@ -786,7 +794,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				}
 			}
 			if (isStatusAccessError(error, job.asyncDir) && job.sessionId && isTerminalJobStatus(job.status)) {
-				return settleWithoutStatus();
+				return settleWithoutStatus(true);
 			}
 			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
 				if (!unreadableStatusRuns.has(job.asyncId)) {
