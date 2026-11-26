@@ -2893,6 +2893,9 @@ describe("result watcher", () => {
 		const originalRead = fsDefault.readFileSync;
 		const order: string[] = [];
 		for (const id of ["a-denied", "z-healthy"]) writeIndexedResult(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-1", success: true, summary: id });
+		const deniedPath = path.join(resultsDir, "a-denied.json");
+		const ownedBytes = fs.readFileSync(deniedPath, "utf-8");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", success: true }));
 		let denied = 0;
 		let denyIndex = true;
 		let denyEnumeration = false;
@@ -2913,10 +2916,10 @@ describe("result watcher", () => {
 		assert.equal(await waitForPredicate(() => order.includes("z-healthy")), true);
 		assert.ok(denied > 0);
 		assert.deepEqual(order, ["z-healthy"]);
-		const deniedPath = path.join(resultsDir, "a-denied.json");
 		assert.equal(await waitForPredicate(() => !fs.existsSync(path.join(resultsDir, "z-healthy.json"))), true);
 		assert.equal(watcher.hasQueuedOwnedResults(), false);
 		assert.equal(state.asyncJobs.size, 0);
+		fs.writeFileSync(deniedPath, ownedBytes);
 		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned public payload despite index EIO");
 		denyEnumeration = true;
 		const denialsBeforeEnumeration = denied;
@@ -2937,6 +2940,40 @@ describe("result watcher", () => {
 		const previousDenials = denied;
 		assert.equal(watcher.hasPendingResults(), true, "known queue protects switches without consulting the index");
 		assert.equal(denied, previousDenials);
+	});
+
+	it("holds and retries the sole owned result when the macOS startup index is unreadable", async (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const output = path.join(resultsDir, "saved.json");
+		writeIndexedResult(output, { id: "saved", sessionId: "session-1", success: true });
+		const read = fsDefault.readFileSync;
+		let failing = true;
+		let denials = 0;
+		fsDefault.readFileSync = ((file, ...args) => {
+			if (failing && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				denials++;
+				throw Object.assign(new Error("index unreadable"), { code: "EIO" });
+			}
+			return read(file, ...args);
+		}) as typeof fs.readFileSync;
+		syncBuiltinESMExports();
+		let delivered = 0;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			platform: "darwin", notifier: { deliver: async () => { delivered++; return true; } },
+		});
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		watcher.startResultWatcher();
+		watcher.primeExistingResults();
+		assert.equal(state.asyncJobs.size, 0);
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		const startupDenials = denials;
+		assert.ok(startupDenials > 0);
+		assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		failing = false;
+		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults()), true);
 	});
 
 	for (const indexEIO of [false, true]) it(`retries native delivery after a transient ${indexEIO ? "unowned index EIO" : "session index access denial"}`, async () => {

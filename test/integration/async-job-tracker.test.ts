@@ -1638,12 +1638,13 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("keeps a restored running job live until temporarily missing status returns", async (t) => {
+	for (const staleMarker of [false, true]) it(`recovers temporarily missing status and settles after ${staleMarker ? "marker expiry" : "removal"}`, async (t) => {
 		const asyncRoot = createTempDir("pi-restored-live-status-gap-");
 		const asyncDir = path.join(asyncRoot, "restored");
 		const statusPath = path.join(asyncDir, "status.json");
 		const state = { ...createState(), currentSessionId: "parent" };
-		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results"), pollIntervalMs: 10 });
+		let now = Date.now();
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir: path.join(asyncRoot, "results"), pollIntervalMs: 10, now: () => now });
 		const stat = fsDefault.statSync;
 		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		writeRunningAsyncStatus(asyncDir, "restored", "parent");
@@ -1666,9 +1667,14 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		fs.writeFileSync(statusPath, JSON.stringify({ ...prior, turnCount: 4 }));
 		await waitForCondition(() => state.asyncJobs.get("restored")?.turnCount === 4, "restored tracking resumes from recovered status");
 		assert.equal(state.asyncJobs.get("restored")?.status, "running");
-		updateActiveRunIndex(asyncDir, "failed");
-		fs.rmSync(asyncDir, { recursive: true });
-		await waitForCondition(() => !state.asyncJobs.has("restored"), "permanently removed status and marker release tracking");
+		if (staleMarker) {
+			fs.rmSync(statusPath);
+			now += 2 * 24 * 60 * 60 * 1000;
+		} else {
+			updateActiveRunIndex(asyncDir, "failed");
+			fs.rmSync(asyncDir, { recursive: true });
+		}
+		await waitForCondition(() => !state.asyncJobs.has("restored"), "permanent status loss releases tracking");
 		assert.equal(hasLiveSubagentWork(state), false);
 	});
 
@@ -1706,21 +1712,27 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(hasLiveSubagentWork(state), false);
 	});
 
-	it("detaches a locally started job when its canonical session is replaced", async (t) => {
+	for (const restored of [false, true]) it(`detaches a ${restored ? "restored" : "locally started"} job without replaying replacement events`, async (t) => {
 		const root = createTempDir("pi-local-replaced-status-");
 		const asyncDir = path.join(root, "started");
 		const statusPath = path.join(asyncDir, "status.json");
 		const state = { ...createState(), currentSessionId: "parent" };
-		const tracker = createTracker(createEventRecorder().pi, state, root, { resultsDir: path.join(root, "results"), pollIntervalMs: 10 });
+		const recorder = createEventRecorder();
+		const tracker = createTracker(recorder.pi, state, root, { resultsDir: path.join(root, "results"), pollIntervalMs: 10 });
 		t.after(() => { tracker.dispose(); removeTempDir(root); });
 		writeRunningAsyncStatus(asyncDir, "started", "parent");
-		tracker.handleStarted({ id: "started", asyncDir, sessionId: "parent", agent: "worker" });
+		if (restored) {
+			updateActiveRunIndex(asyncDir, "running");
+			tracker.restoreActiveJobs();
+		} else tracker.handleStarted({ id: "started", asyncDir, sessionId: "parent", agent: "worker" });
 		await waitForCondition(() => state.asyncJobs.get("started")?.status === "running", "local start observed");
 		writeRunningAsyncStatus(asyncDir, "started", "other");
+		writeControlRecord(asyncDir, supervisorControlEvent("started", "replacement-call", "intercom"));
 		const replacement = fs.readFileSync(statusPath, "utf-8");
 		await waitForCondition(() => !state.asyncJobs.has("started"), "replacement rejected by local refresh");
 		assert.equal(hasLiveSubagentWork(state), false);
 		assert.equal(fs.readFileSync(statusPath, "utf-8"), replacement);
+		assert.equal(recorder.events.some(({ channel }) => channel === SUBAGENT_CONTROL_EVENT || channel === SUBAGENT_CONTROL_INTERCOM_EVENT), false);
 	});
 
 	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {

@@ -666,7 +666,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				forgetJob(job.asyncId);
 				return true;
 			}
-			emitNewControlEvents(job);
+			if (!reconciliation.identityMismatch) emitNewControlEvents(job);
 			const bridgeAlreadyRequired = externalJobBridgeRuns.has(job.asyncId) || externalJobBridgeEligibility(job.steps) === "required";
 			if (bridgeAlreadyRequired && !reconciliation.identityMismatch) {
 				externalJobBridgeRuns.add(job.asyncId);
@@ -676,7 +676,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			refreshNested();
 			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
 				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) {
-					if (activeRunMarkerAgeMs(job.asyncDir, options.now?.()) !== undefined) return false;
+					const age = activeRunMarkerAgeMs(job.asyncDir, options.now?.());
+					if (age !== undefined && age <= DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) return false;
 					if (job.sessionId && ownsRun(state.currentSessionId, job.sessionId) && !options.hasDeliveredResult?.(job.asyncId)
 						&& indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") return false;
 				}
