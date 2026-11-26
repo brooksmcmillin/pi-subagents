@@ -51,8 +51,8 @@ afterEach(() => {
 });
 
 describe("retained foreground nested route tracker", () => {
-	it("holds TUI terminal status until the retained descendant completes without Pi Web", async () => {
-		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
+	it("holds TUI terminal status across reload until the retained descendant completes without Pi Web", async () => {
+		let state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("retained-root");
 		writeState(nestedRoute, "running", 100);
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
@@ -64,9 +64,19 @@ describe("retained foreground nested route tracker", () => {
 			isTTY: true, env: { TERM: "xterm-256color" },
 		});
 		assert.equal(reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) }), true);
-		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10, onRoutesChanged: reporter.sync });
+		let tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10, onRoutesChanged: reporter.sync });
 		try {
 			tracker.track(nestedRoute.rootRunId);
+			assert.deepEqual(holds, [true]);
+			const session = { manager: {}, id: "parent" };
+			tracker.captureReloadRoutes(session);
+			reporter.dispose("reload");
+			tracker.clear();
+			state = {};
+			holds.length = 0;
+			tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10, onRoutesChanged: reporter.sync });
+			tracker.restoreReloadRoutes(session);
+			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => holds.push(active) });
 			assert.deepEqual(holds, [true]);
 			writeState(nestedRoute, "complete", 200);
 			await waitFor(() => holds.length === 2);

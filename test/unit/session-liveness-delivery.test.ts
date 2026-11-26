@@ -76,7 +76,8 @@ const terminalBeforePublicationScript = String.raw`
 	const workflowReload = process.argv[1] === "workflow-reload";
 	const publishedReload = process.argv[1] === "published-reload";
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
-	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload";
+	const denyFirstRefresh = process.argv[1] === "restore-retry";
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh;
 	const closedFirst = process.argv[1] === "closed-first";
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
@@ -122,7 +123,28 @@ const terminalBeforePublicationScript = String.raw`
 	registerSubagentExtension(pi);
 	let asyncDir;
 	if (restoredCase) asyncDir = writeStatus("complete", undefined, "running");
-	for (const handler of handlers.get("session_start")) await handler({ reason: restoredCase ? "reload" : "startup" }, ctx);
+	const restoreStat = fsDefault.statSync;
+	let restoredRefreshDenied = false;
+	if (denyFirstRefresh) {
+		fsDefault.statSync = (file, ...args) => {
+			if (!restoredRefreshDenied && String(file) === path.join(asyncDir, "status.json")
+				&& new Error().stack.includes("at refreshJob")) {
+				restoredRefreshDenied = true;
+				throw Object.assign(new Error("first terminal refresh inaccessible"), { code: "EACCES" });
+			}
+			return restoreStat(file, ...args);
+		};
+		syncBuiltinESMExports();
+	}
+	try {
+		for (const handler of handlers.get("session_start")) await handler({ reason: restoredCase ? "reload" : "startup" }, ctx);
+		if (denyFirstRefresh) assert.equal(restoredRefreshDenied, true);
+	} finally {
+		if (denyFirstRefresh) {
+			fsDefault.statSync = restoreStat;
+			syncBuiltinESMExports();
+		}
+	}
 	if (restoredCase) {
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		assert.deepEqual(holds, [true]);
@@ -322,6 +344,7 @@ describe("session liveness through result delivery", () => {
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
+		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 		["published-reload", "published delivery remains held on reload even when active listing fails"],
@@ -461,6 +484,13 @@ describe("session liveness through result delivery", () => {
 		const previousRegistry = globals[registryKey];
 		let provider: { isActive(): boolean } | undefined;
 		let registrations = 0;
+		const terminalHolds: boolean[] = [];
+		const term = process.env.TERM;
+		const programStatus = process.env.PI_PROGRAM_STATUS;
+		const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		process.env.TERM = "xterm-256color";
+		process.env.PI_PROGRAM_STATUS = "1";
+		Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
 		globals[registryKey] = {
 			version: 1,
 			register(value: { isActive(): boolean }) {
@@ -503,6 +533,7 @@ describe("session liveness through result delivery", () => {
 						pendingMessageCount: session!.pendingMessageCount,
 						noticeAppended: session!.messages.some((message) => message.role === "custom" && message.customType === "subagent-notify"),
 						activeAfterReload: provider?.isActive(),
+						terminalHoldsAfterReload: [...terminalHolds],
 					};
 				});
 			}],
@@ -511,9 +542,10 @@ describe("session liveness through result delivery", () => {
 			await resourceLoader.reload();
 			const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json"), allowModelNetwork: false });
 			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
-			// With no bindings, SDK reload skips session_start. Bind an error listener
-			// to exercise the real reload lifecycle.
-			await session.bindExtensions({ onError: (error) => { errors.push(error); } });
+			await session.bindExtensions({ mode: "tui", onError: (error) => { errors.push(error); }, uiContext: {
+				setWidget() {}, setStatus() {},
+				setBackgroundWork: (_key: string, active: boolean) => terminalHolds.push(active),
+			} as unknown as NonNullable<Parameters<typeof session.bindExtensions>[0]["uiContext"]> });
 			await session.prompt("Yield with a completion pending.");
 			assert.equal(reloaded, true);
 			assert.deepEqual(errors, []);
@@ -524,12 +556,20 @@ describe("session liveness through result delivery", () => {
 				pendingMessageCount: 0, // Pi's deferred settled action is not counted as a pending message
 				noticeAppended: false, // the notice starts the run Pi deferred past agent_settled, so it is not in the session yet
 				activeAfterReload: true, // the retained wake owns liveness until that deferred run starts
+				terminalHoldsAfterReload: [true, true],
 			});
+			assert.deepEqual(terminalHolds, [true, true, false], "only follow-up settlement releases the replacement hold");
 			assert.equal(provider?.isActive(), false, "the woken run releases the retained wake");
 			assert.equal(session.getLastAssistantText(), "Processed completion after reload.");
 		} finally {
 			if (session) await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 			session?.dispose();
+			if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			if (term === undefined) delete process.env.TERM;
+			else process.env.TERM = term;
+			if (programStatus === undefined) delete process.env.PI_PROGRAM_STATUS;
+			else process.env.PI_PROGRAM_STATUS = programStatus;
 			if (previousRegistry === undefined) delete globals[registryKey];
 			else globals[registryKey] = previousRegistry;
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

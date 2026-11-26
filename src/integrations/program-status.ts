@@ -237,7 +237,6 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 			const handoff = session && reloadWakes.get(session.manager);
 			if (session) reloadWakes.delete(session.manager);
 			wakeDeadlines = handoff && handoff.id === session?.id ? handoff.deadlines : new Map();
-			for (const [key, deadline] of wakeDeadlines) if (deadline !== null && now() >= deadline) wakeDeadlines.set(key, null);
 			setBackgroundWork = reportBackgroundWork;
 			active = options.enabled && hasUI && mode === "tui" && isTTY && env.TERM !== "dumb" && env.PI_PROGRAM_STATUS !== "0";
 			if (active && !listeningForResume && process.platform !== "win32") {

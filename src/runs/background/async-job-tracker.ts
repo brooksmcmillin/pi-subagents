@@ -473,7 +473,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		return job.nestedWorkActive !== previous;
 	};
 
-	const refreshJob = (job: AsyncJobState, firstObservation = false): boolean => {
+	const refreshJob = (job: AsyncJobState): boolean => {
 		if (unverifiedRuns.has(job.asyncId)) {
 			let stored: ReturnType<typeof readStatus> = null;
 			let summary: AsyncRunSummary | undefined;
@@ -669,7 +669,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (firstObservation || !isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
+					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
@@ -1004,7 +1004,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (pending?.has(run.id)) continue;
 			const job = summaryToJob(run);
 			state.asyncJobs.set(run.id, job);
-			if (isTerminalJobStatus(job.status)) refreshJob(job, true);
+			if (isTerminalJobStatus(job.status)) {
+				// Active-index discovery does not establish whether publication has settled.
+				job.status = "running";
+				refreshJob(job);
+			}
 			if (job.status === "running") runningJobIds.add(job.asyncId);
 			rememberFleetJob(state, job);
 			watchJob(job);

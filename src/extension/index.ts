@@ -1133,6 +1133,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
 			state.asyncJobs.clear();
+			if (shutdownReason === "reload" && runtimeEntry.sessionManager && state.currentSessionId) {
+				retainedNestedRouteTracker?.captureReloadRoutes({ manager: runtimeEntry.sessionManager, id: state.currentSessionId });
+			}
 			retainedNestedRouteTracker?.clear();
 			retainedNestedRouteTracker = undefined;
 			executorDeps.trackRetainedNestedRoute = undefined;
@@ -1300,12 +1303,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		const ui = ctx.mode === "tui" && ctx.hasUI
 			? ctx.ui as ExtensionContext["ui"] & Pick<Parameters<typeof programStatus.sessionStarted>[0], "setBackgroundWork">
 			: undefined;
-		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork,
-			session: state.currentSessionId ? { manager: ctx.sessionManager, id: state.currentSessionId } : undefined });
+		const statusSession = state.currentSessionId ? { manager: ctx.sessionManager, id: state.currentSessionId } : undefined;
+		const routeTracker = createRetainedNestedRouteTracker(state, { onRoutesChanged: programStatus.sync });
+		if (statusSession) routeTracker.restoreReloadRoutes(statusSession);
+		const terminalStatusActive = programStatus.sessionStarted({ hasUI: ctx.hasUI === true, mode: ctx.mode, setBackgroundWork: ui?.setBackgroundWork, session: statusSession });
 		if (liveness.registered || terminalStatusActive) {
-			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state, { onRoutesChanged: programStatus.sync });
-			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
-		}
+			retainedNestedRouteTracker = routeTracker;
+			executorDeps.trackRetainedNestedRoute = routeTracker.track;
+		} else routeTracker.clear();
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
 		supervisorChannel.activateTransport();

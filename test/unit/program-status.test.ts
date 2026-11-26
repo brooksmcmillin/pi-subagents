@@ -284,6 +284,26 @@ describe("OSC 7501 program status", () => {
 		replacement.instance.dispose("quit");
 	});
 
+	it("retains a live wake when preparation spans reload and its original deadline", () => {
+		let now = 0;
+		let queued = ["result:preparing"];
+		const options = { getQueuedWakes: () => queued, now: () => now, isParentPreparing: () => true,
+			session: { manager: {}, id: "parent" } };
+		const original = reporter(options);
+		assert.deepEqual(original.holds, [true]);
+		original.instance.dispose("reload");
+		now += 60_000;
+		const replacement = reporter(options);
+		assert.deepEqual(replacement.holds, [true]);
+		replacement.instance.agentStarted();
+		queued = [];
+		replacement.instance.sync();
+		assert.deepEqual(replacement.holds, [true]);
+		replacement.instance.agentSettled();
+		assert.deepEqual(replacement.holds, [true, false]);
+		replacement.instance.dispose("quit");
+	});
+
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {
 		const { instance, records, pending } = reporter({ jobs: [job("run-a", "running")] });
 		pending.push({ id: "req-1", runId: "run-a" });

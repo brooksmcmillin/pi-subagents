@@ -4,6 +4,14 @@ import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { hasLiveOwnedNestedWork, projectNestedEvents } from "../shared/nested-events.ts";
 import { reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 
+type RouteState = Pick<SubagentState, "retainedForegroundNestedRoutes">;
+type RouteSession = { manager: object; id: string };
+const reloadKey = Symbol.for("pi-subagents.foreground-route-reload");
+const globals = globalThis as typeof globalThis & {
+	[reloadKey]?: WeakMap<object, { id: string; routes: NonNullable<RouteState["retainedForegroundNestedRoutes"]> }>;
+};
+const reloadRoutes = globals[reloadKey] ??= new WeakMap();
+
 interface RetainedNestedRouteTrackerOptions {
 	pollIntervalMs?: number;
 	platform?: NodeJS.Platform;
@@ -15,9 +23,9 @@ const DEFAULT_POLL_INTERVAL_MS = 5000;
 const REFRESH_DEBOUNCE_MS = 25;
 
 export function createRetainedNestedRouteTracker(
-	state: Pick<SubagentState, "retainedForegroundNestedRoutes">,
+	state: RouteState,
 	options: RetainedNestedRouteTrackerOptions = {},
-): { track: (rootRunId: string) => void; clear: () => void } {
+) {
 	const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 	const watch = options.watch ?? fs.watch;
 	const watchers = new Map<string, fs.FSWatcher>();
@@ -97,5 +105,16 @@ export function createRetainedNestedRouteTracker(
 		state.retainedForegroundNestedRoutes?.clear();
 	};
 
-	return { track, clear };
+	const captureReloadRoutes = ({ manager, id }: RouteSession) => {
+		const routes = state.retainedForegroundNestedRoutes;
+		if (routes?.size) reloadRoutes.set(manager, { id, routes: new Map(routes) });
+	};
+	const restoreReloadRoutes = ({ manager, id }: RouteSession) => {
+		const handoff = reloadRoutes.get(manager);
+		reloadRoutes.delete(manager);
+		if (handoff?.id !== id) return;
+		state.retainedForegroundNestedRoutes = handoff.routes;
+		for (const rootRunId of handoff.routes.keys()) track(rootRunId);
+	};
+	return { track, clear, captureReloadRoutes, restoreReloadRoutes };
 }
