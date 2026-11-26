@@ -1536,23 +1536,31 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});
 
-	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
-		const foreign = phase === "foreign replacement";
+	for (const phase of ["startup", "reconciliation", "terminal refresh", "foreign replacement", "inherited replacement after EIO"]) it(`retains a fresh marker for missing status during ${phase}`, async (t) => {
+		const inherited = phase === "inherited replacement after EIO";
+		const foreign = phase === "foreign replacement" || inherited;
+		const sessionId = inherited ? "marker-successor" : "parent";
+		const verifiedOwner = inherited ? "marker-predecessor" : "parent";
 		const terminal = phase === "terminal refresh";
-		const missingAtRead = terminal ? 3 : phase === "reconciliation" ? 2 : 0;
+		const missingAtRead = terminal ? 3 : phase === "reconciliation" || inherited ? 2 : 0;
 		const asyncRoot = createTempDir("pi-missing-startup-status-");
 		const asyncDir = path.join(asyncRoot, "starting");
 		const statusPath = path.join(asyncDir, "status.json");
 		const resultsDir = path.join(asyncRoot, "results");
 		const output = resultFilePath(resultsDir, "starting");
-		const state = { ...createState(), currentSessionId: "parent" };
+		const state = { ...createState(), currentSessionId: sessionId };
+		if (inherited) {
+			const { recordSessionReplacement, recordSessionStart } = await import("../../src/shared/session-succession.ts");
+			recordSessionReplacement(sessionId, verifiedOwner);
+			t.after(() => recordSessionStart(sessionId, true));
+		}
 		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
 		const stat = fsDefault.statSync;
 		let reads = 0;
 		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		fs.mkdirSync(asyncDir, { recursive: true });
 		const writeOwnedStatus = () => {
-			writeRunningAsyncStatus(asyncDir, "starting", "parent");
+			writeRunningAsyncStatus(asyncDir, "starting", verifiedOwner);
 			if (terminal) {
 				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
 				fs.writeFileSync(statusPath, JSON.stringify({ ...status, state: "complete",
@@ -1562,7 +1570,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		if (missingAtRead) writeOwnedStatus();
 		updateActiveRunIndex(asyncDir, "running");
 		fsDefault.statSync = ((file, options) => {
-			if (file === statusPath && ++reads === missingAtRead) fs.rmSync(statusPath);
+			if (file === statusPath && ++reads === missingAtRead) {
+				fs.rmSync(statusPath);
+				if (inherited) throw Object.assign(new Error("status unreadable during reconciliation"), { code: "EIO" });
+			}
 			return stat(file, options);
 		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
@@ -1572,8 +1583,9 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(hasLiveSubagentWork(state), true);
 		assert.equal(fs.existsSync(statusPath), false);
 		if (foreign) {
-			writePendingAsyncResultFile(output, { id: "starting", sessionId: "foreign", success: true });
-			writeRunningAsyncStatus(asyncDir, "starting", "foreign");
+			const replacementOwner = inherited ? sessionId : "foreign";
+			writePendingAsyncResultFile(output, { id: "starting", sessionId: replacementOwner, success: true });
+			writeRunningAsyncStatus(asyncDir, "starting", replacementOwner);
 			await waitForCondition(() => !state.asyncJobs.has("starting"), "foreign identity rejected");
 			assert.equal(fs.existsSync(output), false);
 			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
@@ -1612,6 +1624,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		fs.writeFileSync(statusPath, JSON.stringify({ ...prior, turnCount: 4 }));
 		await waitForCondition(() => state.asyncJobs.get("restored")?.turnCount === 4, "restored tracking resumes from recovered status");
 		assert.equal(state.asyncJobs.get("restored")?.status, "running");
+		updateActiveRunIndex(asyncDir, "failed");
+		fs.rmSync(asyncDir, { recursive: true });
+		await waitForCondition(() => !state.asyncJobs.has("restored"), "permanently removed status and marker release tracking");
+		assert.equal(hasLiveSubagentWork(state), false);
 	});
 
 	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {

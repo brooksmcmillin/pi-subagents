@@ -621,7 +621,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 				continue;
 			}
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
-			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir);
+			if (isolateCorruptActiveRun(asyncDir, entry, error, options.now) && isStatusAccessError(error, asyncDir)) options.onUnreadableActiveRun?.(entry, asyncDir, verifiedSessionId);
 			continue;
 		}
 		if (!status) {

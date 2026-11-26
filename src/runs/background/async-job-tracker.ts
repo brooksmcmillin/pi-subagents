@@ -667,7 +667,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				},
 			});
 			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
-				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) return false;
+				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) {
+					if (activeRunMarkerAgeMs(job.asyncDir, options.now?.()) !== undefined) return false;
+					if (job.sessionId && ownsRun(state.currentSessionId, job.sessionId) && !options.hasDeliveredResult?.(job.asyncId)
+						&& indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") return false;
+				}
 				return settleWithoutStatus();
 			}
 			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
