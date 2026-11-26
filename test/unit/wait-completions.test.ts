@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { writeCompletionReplay } from "../../src/runs/background/completion-replay.ts";
@@ -35,7 +36,7 @@ describe("workflow wait completion projection", () => {
 		assert.equal(collectWaitCompletions([{ ...terminal[0]!, sessionId: "sibling" }], state, resultsDir), undefined);
 	});
 
-	it("only references an unindexed public fallback owned by the completed run session", (t) => {
+	for (const indexEio of [false, true]) it(`only references exact public fallback${indexEio ? " on index EIO" : " without index"}`, (t) => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-public-fallback-"));
 		t.after(() => fs.rmSync(resultsDir, { recursive: true, force: true }));
 		const runId = "shared-run";
@@ -43,6 +44,19 @@ describe("workflow wait completion projection", () => {
 		// SAFETY: recordWaitCompletion initializes the only state collection used by this fixture.
 		const state = { currentSessionId: "owner" } as SubagentState;
 		recordWaitCompletion(state, runId, { runId, sessionId: "owner", agent: "owner-agent", success: true }, Date.now(), 60_000);
+		let denials = 0;
+		if (indexEio) {
+			const read = fs.readFileSync;
+			fs.readFileSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
+					denials++;
+					throw Object.assign(new Error("completion index unreadable"), { code: "EIO" });
+				}
+				return read(file, ...args);
+			}) as typeof fs.readFileSync;
+			syncBuiltinESMExports();
+			t.after(() => { fs.readFileSync = read; syncBuiltinESMExports(); });
+		}
 		const resultPath = path.join(resultsDir, `${runId}.json`);
 		fs.writeFileSync(resultPath, JSON.stringify({ runId, sessionId: "foreign", agent: "foreign-agent", state: "failed", results: [{ error: "FOREIGN_PAYLOAD" }] }));
 
@@ -59,6 +73,7 @@ describe("workflow wait completion projection", () => {
 		const ownerCompletion = collectWaitCompletions(terminal, state, resultsDir, (text) => ownerReferences.push(text))?.[0];
 		assert.equal(ownerCompletion?.agent, "owner-agent");
 		assert.deepEqual(ownerReferences, [`Result [${runId}]: ${resultPath}`]);
+		assert.equal(denials > 0, indexEio);
 	});
 
 	it("does not surface an in-memory completion after the run id is reused by another session", (t) => {

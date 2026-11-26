@@ -7,8 +7,8 @@ import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { deliverStopRequest, stopInboxClosedPath } from "../background/control-channel.ts";
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
-import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { SUBAGENT_STOPPED_MESSAGE, isStatusAccessError, isStorageAccessError, readStatus } from "../../shared/utils.ts";
+import { reconcileAsyncRunForControl } from "../background/stale-run-reconciler.ts";
+import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
@@ -170,17 +170,7 @@ export function stopAsyncRun(
 			details: { mode: "management", results: [] },
 		};
 	}
-	if (status) {
-		const { runId: expectedRunId, sessionId: expectedSessionId } = status;
-		try {
-			status = reconcileAsyncRun(target.asyncDir, { kill, expectedRunId, expectedSessionId }).status;
-		} catch (error) {
-			if (!isStorageAccessError(error) || isStatusAccessError(error, target.asyncDir)) throw error;
-			// Completion storage is not required to send stop to a verified live runner.
-			const current = readStatus(target.asyncDir);
-			status = current?.runId === expectedRunId && current.sessionId === expectedSessionId ? current : null;
-		}
-	}
+	if (status) status = reconcileAsyncRunForControl(target.asyncDir, status, kill);
 	const pausedWholeRun = status?.state === "paused" && childId === undefined;
 	if (!status || (status.state !== "running" && status.state !== "queued" && !pausedWholeRun)) {
 		return {

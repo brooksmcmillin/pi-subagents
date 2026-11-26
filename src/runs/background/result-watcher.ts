@@ -126,38 +126,25 @@ interface ResultScanStats {
 	startedAt: number;
 }
 
-/** The last `"property": <value>` whose value matches `valuePattern`, parsed without reading the whole file; malformed reads as none. */
-function jsonPropertyValue(raw: string, property: string, valuePattern: string): unknown {
-	let encoded: string | undefined;
-	for (const match of raw.matchAll(new RegExp(`"${property}"\\s*:\\s*(${valuePattern})`, "g"))) encoded = match[1];
-	if (!encoded) return undefined;
-	try {
-		return JSON.parse(encoded) as unknown;
-	} catch {
-		return undefined;
-	}
-}
-
-function jsonStringProperty(raw: string, property: string): string | undefined {
-	const value = jsonPropertyValue(raw, property, `"(?:\\\\.|[^"\\\\])*"`);
-	return typeof value === "string" && value ? value : undefined;
+function parsedResultIdentity(data: ResultFileData, runId: string): ResultFileIdentity {
+	return {
+		acknowledged: hasDeliveredNotification(data),
+		runId,
+		sessionId: typeof data.sessionId === "string" ? data.sessionId : undefined,
+		completionOwnerId: typeof data.completionOwnerId === "string" ? data.completionOwnerId : undefined,
+		completionOwnerProcess: data.completionOwnerProcess,
+		parentWorkflowRunId: typeof data.parentWorkflowRunId === "string" ? data.parentWorkflowRunId : undefined,
+	};
 }
 
 function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
-	let acknowledged = false;
-	if (raw.includes('"notificationDeliveredAt"')) {
-		try { acknowledged = hasDeliveredNotification(JSON.parse(raw) as ResultFileData); }
-		catch { /* Incomplete results remain on the delivery path. */ }
+	const runId = file.replace(/\.json$/i, "");
+	try {
+		return parsedResultIdentity(JSON.parse(raw) as ResultFileData, runId);
+	} catch {
+		// Incomplete results are retried by the delivery parser without an ownership hold.
+		return { acknowledged: false, runId };
 	}
-	return {
-		acknowledged,
-		sessionId: jsonStringProperty(raw, "sessionId"),
-		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
-		// Recorded as a flat object, so a brace-free match is the whole value.
-		completionOwnerProcess: jsonPropertyValue(raw, "completionOwnerProcess", `\\{[^{}]*\\}`),
-		parentWorkflowRunId: jsonStringProperty(raw, "parentWorkflowRunId"),
-		runId: file.replace(/\.json$/i, ""),
-	};
 }
 
 function reportResultWatcherWarning(state: SubagentState, message: string, error?: unknown, key = message): void {
@@ -448,12 +435,15 @@ export function createResultWatcher(
 		let observed: ReadonlySet<string> | undefined;
 		try {
 			let identityReadFailed = false;
+			let unreadablePayload = false;
 			const missingIdentity = () => { identityReadFailed = true; };
-			if (!shouldProcessResult(file, undefined, undefined, true, missingIdentity)) {
+			const payloadReadFailed = () => { unreadablePayload = true; };
+			if (!shouldProcessResult(file, undefined, undefined, true, missingIdentity, payloadReadFailed)) {
 				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
 				observed = observedRunIds();
-				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true, missingIdentity)) {
-					if (identityReadFailed) retryInaccessibleOwnedResult(file, triggerTurn);
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true, missingIdentity, payloadReadFailed)) {
+					if (unreadablePayload && canRetryResult(file)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					else if (identityReadFailed) retryInaccessibleOwnedResult(file, triggerTurn);
 					return;
 				}
 			}
@@ -839,14 +829,7 @@ export function createResultWatcher(
 			const data = parseResult(raw);
 			const runId = data.runId || data.id;
 			if (typeof runId !== "string" || `${runId}.json` !== file || typeof data.sessionId !== "string" || hasDeliveredNotification(data)) return;
-			const identity: ResultFileIdentity = {
-				acknowledged: false,
-				runId,
-				sessionId: data.sessionId,
-				completionOwnerId: typeof data.completionOwnerId === "string" ? data.completionOwnerId : undefined,
-				completionOwnerProcess: data.completionOwnerProcess,
-				parentWorkflowRunId: typeof data.parentWorkflowRunId === "string" ? data.parentWorkflowRunId : undefined,
-			};
+			const identity = parsedResultIdentity(data, runId);
 			if (stillOwns(identity)) return identity;
 		} catch {
 			// An unreadable index does not authorize guessing a payload's identity.
@@ -864,13 +847,13 @@ export function createResultWatcher(
 			if (isStorageAccessError(error)) return Boolean(pendingCanonicalIdentity(file));
 			return !isNotFound(error);
 		}
-		const identity = resultFileIdentity(raw, file);
-		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
 		try {
-			return !hasDeliveredNotification(parseResult(raw));
-		} catch {
-			// A partial write is retried by the watcher; until then it counts as undelivered.
-			return true;
+			const identity = parsedResultIdentity(parseResult(raw), file.replace(/\.json$/i, ""));
+			return !identity.acknowledged && stillOwns(identity);
+		} catch (error) {
+			// Only the switch prompt is conservative for incomplete data; this never claims delivery ownership.
+			return isIncompleteJson(error) && [state.currentSessionId, ...claimedSessionIds()].some((sessionId) =>
+				sessionId && resultCandidateFilesForSession(resultsDir, sessionId).includes(file));
 		}
 	};
 	const hasPendingResults = () => {

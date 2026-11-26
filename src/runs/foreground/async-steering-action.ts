@@ -7,7 +7,7 @@ import type { AsyncStatus, Details, SteerActionResult, SubagentState, ToolBudget
 import { readStatus } from "../../shared/utils.ts";
 import { deliverInterruptRequest, queueRevivalBrief, requestAsyncSteer, type SteerDeliveryMode, type SteerRequest } from "../background/control-channel.ts";
 import { resolveAsyncResumeTarget } from "../background/async-resume.ts";
-import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
+import { reconcileAsyncRunForControl } from "../background/stale-run-reconciler.ts";
 import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringReceipt, updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 
@@ -55,8 +55,9 @@ export async function steerAsyncRun(input: {
 		};
 	}
 	const asyncDir = input.location.asyncDir;
-	const snapshot = input.findPendingAsks ? readStatus(asyncDir) : null;
-	if (snapshot?.mode === "single"
+	const stored = readStatus(asyncDir);
+	const snapshot = stored?.runId === input.runId ? stored : null;
+	if (input.findPendingAsks && snapshot?.mode === "single"
 		&& (!input.state.currentSessionId || ownsRun(input.state.currentSessionId, snapshot.sessionId))
 		&& (snapshot.state === "running" || snapshot.state === "queued")
 		&& snapshot.steps?.length === 1 && (input.index === undefined || input.index === 0)
@@ -73,14 +74,14 @@ export async function steerAsyncRun(input: {
 	}
 	// The read-only snapshot precedes even stale-run reconciliation. An ask arriving
 	// later does not make a runner acknowledgement proof of consumption or unblocking.
-	const status = reconcileAsyncRun(asyncDir, { kill: input.kill }).status;
-	if (input.state.currentSessionId && !ownsRun(input.state.currentSessionId, status?.sessionId)) {
+	if (input.state.currentSessionId && !ownsRun(input.state.currentSessionId, snapshot?.sessionId)) {
 		return {
 			content: [{ type: "text", text: `Async run '${input.runId}' was not found in the active session.` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
 	}
+	const status = snapshot ? reconcileAsyncRunForControl(asyncDir, snapshot, input.kill) : null;
 	if (!status) {
 		return {
 			content: [{ type: "text", text: `Async run '${input.runId}' was not found.` }],

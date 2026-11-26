@@ -2977,13 +2977,11 @@ describe("result watcher", () => {
 		watcher.primeExistingResults();
 		assert.equal(state.asyncJobs.size, 0);
 		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload);
-		if (hasNestedOwner) return; // The assertion covers the unreadable-index ownership fallback.
 		const startupDenials = denials;
 		assert.ok(startupDenials > 0);
-		if (!failPayload) {
-			assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
-			assert.equal(watcher.hasQueuedOwnedResults(), true);
-		}
+		assert.equal(await waitForPredicate(() => denials > startupDenials), true, "first delivery attempt still sees EIO");
+		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload);
+		assert.equal(delivered, 0);
 		failing = false;
 		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults()), true);
 	});

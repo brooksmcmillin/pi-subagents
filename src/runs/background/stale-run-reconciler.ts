@@ -5,7 +5,7 @@ import { indexedResultPayloadVisibility, resultFilePath, resultPayloadMatchesSes
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
-import { readStatus } from "../../shared/utils.ts";
+import { isStatusAccessError, isStorageAccessError, readStatus } from "../../shared/utils.ts";
 import { DIRS, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode } from "../../shared/types.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
@@ -492,6 +492,18 @@ export function checkRecordedPidLiveness(recorded: RecordedPid, observation: Rec
 		? observation.probe(recorded.pid)
 		: checkPidLiveness(recorded.pid, observation.kill, scopeVerified);
 	return liveness === "dead" && scopeMismatch ? "unknown" : liveness;
+}
+
+// A caller must authorize the snapshot before attempting live control.
+export function reconcileAsyncRunForControl(asyncDir: string, verified: AsyncStatus, kill?: ReconcileAsyncRunOptions["kill"]): AsyncStatus | null {
+	const { runId: expectedRunId, sessionId: expectedSessionId } = verified;
+	try {
+		return reconcileAsyncRun(asyncDir, { kill, expectedRunId, expectedSessionId }).status;
+	} catch (error) {
+		if (!isStorageAccessError(error) || isStatusAccessError(error, asyncDir)) throw error;
+		const current = readStatus(asyncDir);
+		return current?.runId === expectedRunId && current.sessionId === expectedSessionId ? current : null;
+	}
 }
 
 export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}, observeStatus?: RawDrainStatusObserver): ReconcileAsyncRunResult {

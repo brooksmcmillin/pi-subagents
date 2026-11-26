@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import type { ArtifactPaths, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
+import { isStorageAccessError } from "../../shared/utils.ts";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
 import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun } from "./result-files.ts";
@@ -33,11 +34,6 @@ function errorCode(error: unknown): string | undefined {
 		: undefined;
 }
 
-function isAccessDenied(error: unknown): boolean {
-	const code = errorCode(error);
-	return code === "EPERM" || code === "EACCES";
-}
-
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -51,7 +47,7 @@ function waitResultPayloadCandidate(resultsDir: string, run: AsyncRunSummary): s
 		const indexedPath = resultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id);
 		return indexedPath ?? publicPath;
 	} catch (error) {
-		if (!isAccessDenied(error)) throw error;
+		if (!isStorageAccessError(error)) throw error;
 		const pendingPath = fallbackResultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id);
 		return pendingPath ?? publicPath;
 	}
