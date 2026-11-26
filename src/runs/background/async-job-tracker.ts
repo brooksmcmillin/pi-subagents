@@ -465,11 +465,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		unverifiedPublications.delete(asyncId);
 		clearSupervisorNotices(asyncId);
 	};
-	const forgetJob = (asyncId: string) => {
+	const forgetJob = (asyncId: string, keepFleetEntry = false) => {
 		cancelCleanup(asyncId);
 		closeJobWatcher(asyncId);
 		state.asyncJobs.delete(asyncId);
-		state.fleetJobs?.delete(asyncId);
+		if (!keepFleetEntry) state.fleetJobs?.delete(asyncId);
 		options.onJobCleanup?.(asyncId);
 	};
 
@@ -603,7 +603,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		};
-		const settleWithoutStatus = (unreadable = false): boolean => {
+		const settleWithoutStatus = (unreadable = false, preserveTerminal = false): boolean => {
 			const publication = terminalPublications.get(job.asyncId);
 			if (publication?.instanceId && readProcessTerminal(job.asyncDir, {
 				runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
@@ -627,7 +627,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				return nestedChanged;
 			}
 			retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
-			forgetJob(job.asyncId);
+			if (preserveTerminal) rememberFleetJob(state, job);
+			forgetJob(job.asyncId, preserveTerminal);
 			return true;
 		};
 		const refreshNested = () => {
@@ -681,7 +682,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					if (job.sessionId && ownsRun(state.currentSessionId, job.sessionId) && !options.hasDeliveredResult?.(job.asyncId)
 						&& indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") return false;
 				}
-				return settleWithoutStatus();
+				return settleWithoutStatus(false, reconciliation.statusMissing === true && isTerminalJobStatus(job.status));
 			}
 			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
 			unreadableStatusRuns.delete(job.asyncId);

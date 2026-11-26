@@ -548,8 +548,11 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
 		const state = { ...createState(), currentSessionId: "parent" };
 		const holds: boolean[] = [];
+		const writes: string[] = [];
+		let delayFirstCompletion = !unreadable;
 		const reporter = registerProgramStatusReporter({ enabled: true, isTTY: true, env: { TERM: "xterm-256color" },
-			getJobs: () => [], getPendingRequests: () => [], hasBackgroundWork: () => hasLiveSubagentWork(state) });
+			getJobs: () => new Map([...state.fleetJobs, ...state.asyncJobs]).values(), getPendingRequests: () => [],
+			write: (data) => writes.push(data), hasBackgroundWork: () => delayFirstCompletion || hasLiveSubagentWork(state) });
 		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 400, onJobsChanged: reporter.sync });
 		const child = { id: "independent", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const,
 			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
@@ -576,13 +579,19 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				assert.equal(state.cleanupTimers.get(route.rootRunId), cleanup, "EIO leaves original watcher retention armed");
 			} else fs.rmSync(statusPath);
 			writeNestedEvent(route, { type: "subagent.nested.started", ts: 200, parentRunId: route.rootRunId, child });
-			await waitForCondition(() => holds.at(-1) === true, "reporter receives late nested hold");
+			await waitForCondition(() => hasLiveSubagentWork(state) && (!unreadable || holds.at(-1) === true), "reporter receives late nested hold");
 			await new Promise(resolve => setTimeout(resolve, 450));
 			assert.equal(state.asyncJobs.has(route.rootRunId), true, "independent child outlasts original cleanup deadline");
-			assert.deepEqual(holds, [true]);
+			assert.deepEqual(holds, unreadable ? [true] : []);
+			if (!unreadable) assert.ok(!writes.some((report) => report.includes("state=done:id=subagents/statuslessne")));
+			delayFirstCompletion = false;
 			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: route.rootRunId, child: { ...child, state: "complete" } });
 			await waitForCondition(() => holds.at(-1) === false, "reporter receives nested drain");
-			assert.deepEqual(holds, [true, false]);
+			assert.deepEqual(holds, unreadable ? [true, false] : [false]);
+			if (!unreadable) {
+				assert.equal(state.asyncJobs.has(route.rootRunId), false);
+				assert.ok(writes.some((report) => report.includes("state=done:id=subagents/statuslessne")));
+			}
 		} finally {
 			tracker.dispose(); reporter.dispose(); removeTempDir(asyncRoot); removeTempDir(path.dirname(route.eventSink));
 		}

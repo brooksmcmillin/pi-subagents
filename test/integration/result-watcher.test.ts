@@ -3005,7 +3005,10 @@ describe("result watcher", () => {
 		});
 		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; fsDefault.readdirSync = readdir; fsDefault.statSync = stat; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
 		watcher.startResultWatcher();
-		if (hasNestedOwner) assert.equal(watcher.hasPendingResults(), true, "switch uses only top-level ownership fields");
+		if (hasNestedOwner || recheckStat) {
+			assert.equal(watcher.hasPendingResults(), true, "switch sees the exact owned payload despite storage error");
+			assert.equal(watcher.hasQueuedOwnedResults(), false, "switch check does not schedule delivery");
+		}
 		watcher.primeExistingResults();
 		assert.equal(state.asyncJobs.size, 0);
 		assert.equal(watcher.hasQueuedOwnedResults(), !failListing && !failStat && !failPayload && !pendingOnly);

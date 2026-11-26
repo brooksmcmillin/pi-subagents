@@ -862,7 +862,8 @@ export function createResultWatcher(
 	const hasPendingResults = () => {
 		if (hasQueuedOwnedResults()) return true;
 		const inaccessible = new Set<string>();
-		const eligible = eligibleResultFiles((file) => inaccessible.add(file));
+		const noteInaccessible = (file: string) => inaccessible.add(file);
+		const eligible = eligibleResultFiles(noteInaccessible, noteInaccessible);
 		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => pendingCanonicalIdentity(file) !== undefined);
 	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
