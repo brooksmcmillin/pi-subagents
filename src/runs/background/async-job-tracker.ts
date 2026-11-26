@@ -498,6 +498,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const nested = handoff?.nested;
 		if (!nested || nested.route.rootRunId !== job.asyncId || !ownsRun(state.currentSessionId, nested.sessionId)) return false;
 		try {
+			reconcileNestedAsyncDescendants(nested.route, { resultsDir, kill: options.kill, now: options.now });
 			return hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(nested.route).children, nested.rootExited);
 		} catch {
 			return true; // The original owner verified this route; retry after storage recovers.
@@ -520,7 +521,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				stored = readStatus(job.asyncDir);
 				if (stored?.runId === job.asyncId) summary = summarizeAsyncStatus(job.asyncDir, stored);
 			} catch (error) {
-				if (isStatusAccessError(error, job.asyncDir)) return false;
+				if (isStatusAccessError(error, job.asyncDir)) {
+					if (pending?.pending === false && pending.nested && !hasRestoredNestedWork(job, pending)) {
+						forgetJob(job.asyncId);
+						return true;
+					}
+					return false;
+				}
 				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
@@ -615,6 +622,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						return false;
 					}
 					options.onJobTerminal?.(job, true);
+				}
+				refreshNestedLiveness(job, null);
+				if (nestedRefreshFailed || job.nestedWorkActive) {
+					cancelCleanup(job.asyncId);
+					return false;
 				}
 				forgetJob(job.asyncId);
 				return true;

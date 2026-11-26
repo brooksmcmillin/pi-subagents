@@ -586,6 +586,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		let owned = false;
+		let verifiedSessionId: string | undefined;
 		const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
@@ -597,11 +598,13 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 					continue;
 				}
 				owned = Boolean(owners && stored);
+				if (owned) verifiedSessionId = stored?.sessionId;
 			}
 			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined, expectedRunId: verifyMarker ? entry : undefined }, observeStatus);
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: owned ? options.adoptCompletionOwnerId : undefined, expectedRunId: verifyMarker ? entry : undefined, expectedSessionId: verifyMarker ? verifiedSessionId : undefined }, observeStatus);
+			if (verifyMarker && reconciliation && !reconciliation.status && verifiedSessionId) continue;
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
