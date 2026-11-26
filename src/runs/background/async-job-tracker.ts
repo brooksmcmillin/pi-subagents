@@ -590,6 +590,28 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 		};
+		const settleWithoutStatus = (): boolean => {
+			const publication = terminalPublications.get(job.asyncId);
+			if (publication?.instanceId && readProcessTerminal(job.asyncDir, {
+				runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
+			})?.state === "observed") verifiedRootClose.add(job);
+			const nestedChanged = refreshNestedLiveness(job, null);
+			const writerPending = publication?.pending && publication.instanceId && !verifiedRootClose.has(job)
+				&& !options.hasDeliveredResult?.(job.asyncId);
+			const owedSession = options.getOwedResultRunIds?.().has(job.asyncId) ? job.sessionId : undefined;
+			if (writerPending || (owedSession && indexedResultPayloadVisibility(resultsDir, owedSession, job.asyncId) !== "absent")) {
+				cancelCleanup(job.asyncId);
+				return nestedChanged;
+			}
+			if (owedSession) options.onJobTerminal?.(job, true);
+			if (nestedRefreshFailed || job.nestedWorkActive) {
+				cancelCleanup(job.asyncId);
+				return nestedChanged;
+			}
+			retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
+			forgetJob(job.asyncId);
+			return true;
+		};
 		let bridgeSweepAttempted = false;
 		try {
 			emitNewControlEvents(job);
@@ -627,33 +649,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
-				const publication = terminalPublications.get(job.asyncId);
-				if (publication?.instanceId) {
-					if (readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed") {
-						verifiedRootClose.add(job);
-					}
-					if (publication.pending && !verifiedRootClose.has(job) && !options.hasDeliveredResult?.(job.asyncId)) {
-						cancelCleanup(job.asyncId);
-						return false;
-					}
-				}
-				if (job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
-					if (indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") {
-						cancelCleanup(job.asyncId);
-						return false;
-					}
-					options.onJobTerminal?.(job, true);
-				}
-				const nestedChanged = refreshNestedLiveness(job, null);
-				if (nestedRefreshFailed || job.nestedWorkActive) {
-					cancelCleanup(job.asyncId);
-					return nestedChanged;
-				}
-				retainNestedLookupRoute(state, job.nestedRoute, job.sessionId);
-				forgetJob(job.asyncId);
-				return true;
-			}
+			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) return settleWithoutStatus();
 			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
 			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
@@ -789,14 +785,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
 			}
-			if (isStatusAccessError(error, job.asyncDir) && restoredJobs.has(job) && job.nestedRoute
-				&& terminalPublications.get(job.asyncId)?.pending === false && !options.getOwedResultRunIds?.().has(job.asyncId)) {
-				if (nestedRefreshFailed) return false;
-				refreshNestedLiveness(job, null);
-				if (!job.nestedWorkActive) {
-					forgetJob(job.asyncId);
-					return true;
-				}
+			if (isStatusAccessError(error, job.asyncDir) && job.sessionId && isTerminalJobStatus(job.status)) {
+				return settleWithoutStatus();
 			}
 			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
 				if (!unreadableStatusRuns.has(job.asyncId)) {

@@ -101,8 +101,9 @@ const terminalBeforePublicationScript = String.raw`
 	const forgetRestored = process.argv[1] === "forget-restored";
 	const completeBeforeRefresh = process.argv[1] === "forget-completion-first";
 	const forgetPublished = process.argv[1] === "forget-published-started" || completeBeforeRefresh;
-	const forgetStarted = process.argv[1] === "forget-started" || forgetPublished;
-	const startedRoute = forgetStarted ? createNestedRoute(runId) : undefined;
+	const inPlaceCloseEIO = process.argv[1] === "in-place-close-eio";
+	const forgetStarted = process.argv[1] === "forget-started" || forgetPublished || inPlaceCloseEIO;
+	const startedRoute = forgetStarted && !inPlaceCloseEIO ? createNestedRoute(runId) : undefined;
 	if (startedRoute) {
 		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId,
 			child: { id: "foreground", parentRunId: runId, depth: 1, path: [{ runId }], agent: "worker", state: "running" } });
@@ -384,7 +385,20 @@ const terminalBeforePublicationScript = String.raw`
 			assert.equal(fs.existsSync(pathToResult), false);
 		}
 		assert.deepEqual(holds, [true]);
-		fs.rmSync(path.join(asyncDir, "status.json"));
+		const statusPath = path.join(asyncDir, "status.json");
+		if (inPlaceCloseEIO) {
+			const stat = fsDefault.statSync;
+			let denied = false;
+			fsDefault.statSync = (file, ...args) => {
+				if (file === statusPath) { denied = true; throw Object.assign(new Error("root status unreadable"), { code: "EIO" }); }
+				return stat(file, ...args);
+			};
+			syncBuiltinESMExports();
+			fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+			for (let i = 0; i < 130 && !denied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(denied, true);
+			assert.deepEqual(holds, [true]);
+		} else fs.rmSync(statusPath);
 		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
 		if (startedRoute) {
 			await new Promise(resolve => originalSetTimeout(resolve, 100));
@@ -648,6 +662,7 @@ describe("session liveness through result delivery", () => {
 		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
 		["forget-restored", "settles a restored hold after status disappears with no payload"],
 		["forget-started", "settles a start-event terminal hold after status disappears and writer closes"],
+		["in-place-close-eio", "settles a closed start-event writer with no payload under persistent in-place EIO"],
 		["forget-published-started", "settles a start-event terminal hold after result delivery and status loss"],
 		["forget-completion-first", "settles a statusless writer whose completion event preceded the first terminal refresh"],
 		["statusless-delayed-writer", "preserves the verified pending writer after status loss refresh and reload"],

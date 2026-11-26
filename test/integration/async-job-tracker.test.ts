@@ -542,7 +542,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("notifies the terminal reporter of independent work discovered after root status loss", async () => {
+	for (const unreadable of [false, true]) it(`notifies the terminal reporter of independent work after root status ${unreadable ? "EIO" : "loss"}`, async (t) => {
 		const asyncRoot = createTempDir("pi-statusless-nested-notify-");
 		const route = createNestedRoute("statusless-nested-notify");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -550,7 +550,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const holds: boolean[] = [];
 		const reporter = registerProgramStatusReporter({ enabled: true, isTTY: true, env: { TERM: "xterm-256color" },
 			getJobs: () => [], getPendingRequests: () => [], hasBackgroundWork: () => hasLiveSubagentWork(state) });
-		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 1000, onJobsChanged: reporter.sync });
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10, completionRetentionMs: 200, onJobsChanged: reporter.sync });
 		const child = { id: "independent", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" as const,
 			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, "independent") };
 		try {
@@ -562,9 +562,20 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", asyncDir, agent: "worker", nestedRoute: route });
 			await waitForCondition(() => state.cleanupTimers.has(route.rootRunId) && !hasLiveSubagentWork(state), "terminal root is idle");
 			holds.length = 0;
-			fs.rmSync(statusPath);
+			if (unreadable) {
+				const stat = fsDefault.statSync;
+				fsDefault.statSync = ((file, options) => {
+					if (file === statusPath) throw Object.assign(new Error("status unreadable"), { code: "EIO" });
+					return stat(file, options);
+				}) as typeof fs.statSync;
+				syncBuiltinESMExports();
+				t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); });
+			} else fs.rmSync(statusPath);
 			writeNestedEvent(route, { type: "subagent.nested.started", ts: 200, parentRunId: route.rootRunId, child });
 			await waitForCondition(() => holds.at(-1) === true, "reporter receives late nested hold");
+			await new Promise(resolve => setTimeout(resolve, 250));
+			assert.equal(state.asyncJobs.has(route.rootRunId), true, "independent child outlasts original cleanup deadline");
+			assert.deepEqual(holds, [true]);
 			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: route.rootRunId, child: { ...child, state: "complete" } });
 			await waitForCondition(() => holds.at(-1) === false, "reporter receives nested drain");
 			assert.deepEqual(holds, [true, false]);
