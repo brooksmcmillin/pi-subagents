@@ -93,11 +93,18 @@ const terminalBeforePublicationScript = String.raw`
 	const provisionalReload = process.argv[1] === "provisional-reload";
 	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
 	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
-	const originalReopened = process.argv[1] === "inherited-reclaimed";
+	const reclaimedAfterReload = process.argv[1] === "inherited-reclaimed-after-reload";
+	const originalReopened = process.argv[1] === "inherited-reclaimed" || reclaimedAfterReload;
 	const inheritedPublication = process.argv[1] === "inherited-publication" || originalReopened;
 	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
 	const forgetRestored = process.argv[1] === "forget-restored";
 	const forgetStarted = process.argv[1] === "forget-started";
+	const startedRoute = forgetStarted ? createNestedRoute(runId) : undefined;
+	if (startedRoute) {
+		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: runId,
+			child: { id: "foreground", parentRunId: runId, depth: 1, path: [{ runId }], agent: "worker", state: "running" } });
+		writeNestedEvent(startedRoute, { type: "subagent.nested.started", ts: 101, parentRunId: runId, child: ackChild });
+	}
 	const aliasEvent = process.argv[1] === "closed-event-alias";
 	const indexedAlias = process.argv[1] === "closed-index-alias" || aliasEvent;
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
@@ -274,7 +281,7 @@ const terminalBeforePublicationScript = String.raw`
 	} else {
 		assert.equal(provider.isActive(), false);
 		asyncDir = writeStatus("running");
-		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir, nestedRoute: ackRoute });
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir, nestedRoute: ackRoute ?? startedRoute });
 	}
 	assert.equal(provider.isActive(), true);
 	if (delayedStatusless || statuslessWithoutReload) {
@@ -316,12 +323,32 @@ const terminalBeforePublicationScript = String.raw`
 		process.exit(0);
 	}
 	if (originalReopened) {
-		assert.deepEqual(holds, [true]);
-		recordSessionStart(runSessionId, false);
-		for (let i = 0; i < 140 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
-		assert.equal(provider.isActive(), false);
-		assert.deepEqual(holds, [true, false]);
-		assert.equal(fs.existsSync(path.join(asyncDir, "status.json")), true, "original session keeps its own status");
+		const statusPath = path.join(asyncDir, "status.json");
+		const stat = fsDefault.statSync;
+		try {
+			if (reclaimedAfterReload) {
+				updateActiveRunIndex(asyncDir, "failed");
+				fsDefault.statSync = (file, ...args) => {
+					if (file === statusPath) throw Object.assign(new Error("status unreadable"), { code: "EIO" });
+					return stat(file, ...args);
+				};
+				syncBuiltinESMExports();
+				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+				handlers.clear();
+				holds.length = 0;
+				registerSubagentExtension(pi);
+				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+			}
+			assert.deepEqual(holds, [true]);
+			recordSessionStart(runSessionId, false);
+			for (let i = 0; i < 140 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+			assert.equal(provider.isActive(), false);
+			assert.deepEqual(holds, [true, false]);
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		assert.equal(fs.existsSync(statusPath), true, "original session keeps its own status");
 		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
 		process.stdout.write("ok");
 		process.exit(0);
@@ -336,6 +363,12 @@ const terminalBeforePublicationScript = String.raw`
 		assert.deepEqual(holds, [true]);
 		fs.rmSync(path.join(asyncDir, "status.json"));
 		writeAtomicJson(path.join(asyncDir, "process-terminal.json"), exitProof());
+		if (startedRoute) {
+			await new Promise(resolve => originalSetTimeout(resolve, 100));
+			assert.equal(provider.isActive(), true, "independent child still contributes liveness");
+			assert.deepEqual(holds, [true]);
+			writeNestedEvent(startedRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: runId, child: { ...ackChild, state: "complete" } });
+		}
 		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.equal(provider.isActive(), false);
 		assert.deepEqual(holds, [true, false]);
@@ -600,6 +633,7 @@ describe("session liveness through result delivery", () => {
 		["provisional-reload", "second reload preserves a markerless terminal publication through status EIO"],
 		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
 		["inherited-reclaimed", "original session reopening releases its successor's inherited hold"],
+		["inherited-reclaimed-after-reload", "original session reopening releases its successor's inherited placeholder after reload"],
 		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
 		["mismatched-running-marker", "does not restore running status claiming a run ID different from the active marker"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],

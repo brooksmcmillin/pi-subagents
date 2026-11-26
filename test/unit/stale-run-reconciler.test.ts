@@ -890,18 +890,22 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
-	it("keeps a real result finalized during the stale runner PID probe", () => {
+	for (const payloadAlreadyPresent of [false, true]) it(`keeps final status written during the PID probe ${payloadAlreadyPresent ? "with a visible result" : "before result discovery"}`, () => {
 		const root = tempRoot("pi-stale-pid-finalized-");
 		try {
 			const asyncDir = path.join(root, "finished");
 			const resultsDir = path.join(root, "results");
 			const resultPath = path.join(resultsDir, "finished.json");
-			const status = { runId: "finished", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 };
+			const status = { runId: "finished", sessionId: "parent", mode: "single", state: "running", pid: 12345, pidNamespaceScope: "pid:[same]", startedAt: 1000 };
 			const finished = { ...status, state: "complete" };
 			const payload = { id: "finished", sessionId: "parent", success: true };
 			writeStatus(asyncDir, status);
+			if (payloadAlreadyPresent) writeAsyncResultFile(resultPath, payload);
+			let probed = false;
 			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "finished", expectedSessionId: "parent", resultsDir,
-				kill: () => { writeAsyncResultFile(resultPath, payload); writeStatus(asyncDir, finished); throw errno("ESRCH"); } });
+				now: () => 2000, pidNamespaceScope: () => "pid:[same]",
+				kill: () => { probed = true; if (!payloadAlreadyPresent) writeAsyncResultFile(resultPath, payload); writeStatus(asyncDir, finished); throw errno("ESRCH"); } });
+			assert.equal(probed, true);
 			assert.equal(result.repaired, false);
 			assert.equal(result.status?.state, "complete");
 			assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf-8")), payload);

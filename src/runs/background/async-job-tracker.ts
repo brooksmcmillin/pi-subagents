@@ -516,7 +516,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (verifyingIdentity) {
 			const pending = unverifiedPublications.get(job.asyncId);
 			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
-			if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && options.hasDeliveredResult?.(job.asyncId)
+			const handoffSession = deliverySession ?? pending?.nested?.sessionId;
+			if (handoffSession && !ownsRun(state.currentSessionId, handoffSession)) {
+				forgetJob(job.asyncId);
+				return true;
+			}
+			if (deliverySession && options.hasDeliveredResult?.(job.asyncId)
 				&& !hasRestoredNestedWork(job, pending)) {
 				forgetJob(job.asyncId);
 				return true;
@@ -625,11 +630,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			});
 			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
 				const publication = terminalPublications.get(job.asyncId);
-				if (publication?.pending && publication.instanceId && !options.hasDeliveredResult?.(job.asyncId)
-					&& !verifiedRootClose.has(job)
-					&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state !== "observed") {
-					cancelCleanup(job.asyncId);
-					return false;
+				if (publication?.pending && publication.instanceId) {
+					if (readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed") {
+						verifiedRootClose.add(job);
+					}
+					if (!verifiedRootClose.has(job) && !options.hasDeliveredResult?.(job.asyncId)) {
+						cancelCleanup(job.asyncId);
+						return false;
+					}
 				}
 				if (job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
 					if (indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") {
