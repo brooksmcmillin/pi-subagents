@@ -254,6 +254,18 @@ describe("retained foreground nested route tracker", () => {
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), true, "foreign-session status cannot prove closure");
 			writeStatus(pending);
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), false);
+			const independent = { ...base, id: "independent", parentRunId: "child", depth: 2, state: "running" as const,
+				asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootId, "independent") };
+			const statuslessChildren = [{ ...children[0]!, processTerminal: { ...pending, version: 1 as const, state: "pending" as const },
+				children: [...children[0]!.children, independent] }];
+			fs.rmSync(path.join(asyncDir, "status.json"));
+			writeProof("previous");
+			assert.equal(hasLiveOwnedNestedWork(rootId, children), true);
+			assert.equal(hasLiveOwnedNestedWork(rootId, [{ ...statuslessChildren[0]!, children: children[0]!.children }]), true,
+				"statusless projection must reject another writer's sidecar");
+			writeProof("current");
+			assert.equal(hasLiveOwnedNestedWork(rootId, statuslessChildren), true, "independent work survives matching close");
+			assert.equal(hasLiveOwnedNestedWork(rootId, [{ ...statuslessChildren[0]!, children: [...children[0]!.children, { ...independent, state: "complete" }] }]), false);
 		} finally {
 			fs.rmSync(path.dirname(asyncDir), { recursive: true, force: true });
 			fs.rmSync(results, { recursive: true, force: true });

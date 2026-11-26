@@ -798,7 +798,7 @@ export function createResultWatcher(
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
@@ -811,6 +811,7 @@ export function createResultWatcher(
 					stats.scheduled += 1;
 					files.push(file);
 				} catch (error) {
+					if (isStorageAccessError(error)) onStorageError?.(file);
 					if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to inspect indexed subagent result '${file}'`, error);
 				}
 			}
@@ -820,15 +821,17 @@ export function createResultWatcher(
 		}
 		return files;
 	};
-	const hasPendingResults = () => eligibleResultFiles().some((file) => {
+	const isPendingOwnedResult = (file: string, canonicalOnly = false): boolean => {
+		if (file !== path.basename(file) || !file.endsWith(".json")) return false;
 		let raw: string;
 		try {
-			const payloadPath = resultPayloadPath(file);
+			const payloadPath = canonicalOnly ? publicResultPath(file) : resultPayloadPath(file);
 			if (!payloadPath) return false;
 			raw = fsApi.readFileSync(payloadPath, "utf-8");
 		} catch (error) {
 			// Removed since the scan means delivered; an unreadable file is still owed to someone, so the switch asks.
-			return !isNotFound(error);
+			if (!canonicalOnly && isStorageAccessError(error)) return isPendingOwnedResult(file, true);
+			return !canonicalOnly && !isNotFound(error);
 		}
 		const identity = resultFileIdentity(raw, file);
 		if (!identity.sessionId || !ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return false;
@@ -838,7 +841,13 @@ export function createResultWatcher(
 			// A partial write is retried by the watcher; until then it counts as undelivered.
 			return true;
 		}
-	});
+	};
+	const hasPendingResults = () => {
+		if (queuedOwnedResults.size) return true;
+		const inaccessible: string[] = [];
+		const eligible = eligibleResultFiles((file) => inaccessible.push(file));
+		return eligible.some((file) => isPendingOwnedResult(file)) || inaccessible.some((file) => isPendingOwnedResult(file, true));
+	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;
 		for (const file of eligibleResultFiles()) scheduleResult(file, triggerTurn);

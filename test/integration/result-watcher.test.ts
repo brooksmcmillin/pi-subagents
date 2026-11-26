@@ -2855,11 +2855,12 @@ describe("result watcher", () => {
 		const originalRead = fsDefault.readFileSync;
 		const order: string[] = [];
 		for (const id of ["a-denied", "z-healthy"]) writeIndexedResult(path.join(resultsDir, `${id}.json`), { id, sessionId: "session-1", success: true, summary: id });
-		let denied = false;
+		let denied = 0;
+		let denyIndex = true;
 		fsDefault.readFileSync = ((file, ...args) => {
-			if (String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "a-denied.json"
+			if (denyIndex && String(file).includes(`${path.sep}result-index${path.sep}`) && path.basename(String(file)) === "a-denied.json"
 				&& new Error().stack?.includes("readResultIndexForSessionRun")) {
-				denied = true;
+				denied++;
 				throw Object.assign(new Error("index read failed"), { code: "EIO" });
 			}
 			return originalRead(file, ...args);
@@ -2871,9 +2872,23 @@ describe("result watcher", () => {
 		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
 		watcher.primeExistingResults();
 		assert.equal(await waitForPredicate(() => order.includes("z-healthy")), true);
-		assert.equal(denied, true);
+		assert.ok(denied > 0);
 		assert.deepEqual(order, ["z-healthy"]);
-		assert.equal(fs.existsSync(path.join(resultsDir, "a-denied.json")), true);
+		const deniedPath = path.join(resultsDir, "a-denied.json");
+		assert.equal(await waitForPredicate(() => !fs.existsSync(path.join(resultsDir, "z-healthy.json"))), true);
+		assert.equal(watcher.hasQueuedOwnedResults(), false);
+		assert.equal(state.asyncJobs.size, 0);
+		assert.equal(watcher.hasPendingResults(), true, "switch check sees the only owned public payload despite index EIO");
+		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", success: true }));
+		assert.equal(watcher.hasPendingResults(), false, "canonical fallback still verifies ownership");
+		writeIndexedResult(deniedPath, { id: "a-denied", sessionId: "session-1", success: true, summary: "owned" });
+		denyIndex = false;
+		watcher.primeExistingResults();
+		assert.equal(watcher.hasQueuedOwnedResults(), true);
+		denyIndex = true;
+		const previousDenials = denied;
+		assert.equal(watcher.hasPendingResults(), true, "known queue protects switches without consulting the index");
+		assert.equal(denied, previousDenials);
 	});
 
 	for (const indexEIO of [false, true]) it(`retries native delivery after a transient ${indexEIO ? "unowned index EIO" : "session index access denial"}`, async () => {

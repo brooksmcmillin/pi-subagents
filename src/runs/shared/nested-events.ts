@@ -1016,11 +1016,14 @@ export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSum
 		if (asyncDir && terminal(child.state)) {
 			try {
 				const status = readStatus(asyncDir);
-				if (status ? status.runId === child.id && (!child.sessionId || status.sessionId === child.sessionId) : !child.sessionId) {
-					const recorded = status?.processTerminal;
+				const projectedProof = !status ? sanitizeProcessTerminal(child.processTerminal, { runId: child.id }) : undefined;
+				if (status ? status.runId === child.id && (!child.sessionId || status.sessionId === child.sessionId)
+					: !child.sessionId || projectedProof?.state === "pending" || projectedProof?.state === "observed") {
+					const recorded = status?.processTerminal ?? projectedProof;
 					childOwnerExited = hasObservedRunnerClose(asyncDir, child.id, recorded);
 					if (recorded?.state === "pending" || recorded?.state === "observed") {
-						const visibility = status?.sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), status.sessionId, child.id) : "absent";
+						const sessionId = status?.sessionId ?? child.sessionId;
+						const visibility = sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), sessionId, child.id) : "absent";
 						if (visibility === "unknown" || (visibility === "absent" && !childOwnerExited)) return true;
 					}
 				}
