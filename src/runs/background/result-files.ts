@@ -424,14 +424,16 @@ export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: st
 }
 
 /** Do not infer absence from an inaccessible pending or public location. */
-export function resultPayloadVisibility(resultsDir: string, sessionId: string, runId: string): "present" | "absent" | "unknown" {
+export function resultPayloadVisibility(resultsDir: string, sessionId: string, runId: string, resolvedPath?: string): "present" | "absent" | "unknown" {
 	let unknown = false;
-	for (const candidate of [...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)]) {
+	const candidates = [...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)];
+	if (resolvedPath && !candidates.includes(resolvedPath)) candidates.unshift(resolvedPath);
+	for (const candidate of candidates) {
 		try {
-			if (fs.statSync(candidate).isFile()) return "present";
+			if (fs.statSync(candidate).isFile() && resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(candidate, "utf-8")), sessionId, runId)) return "present";
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "ENOENT" && code !== "ENAMETOOLONG") unknown = true;
+			if (!(error instanceof SyntaxError) && code !== "ENOENT" && code !== "ENAMETOOLONG") unknown = true;
 		}
 	}
 	return unknown ? "unknown" : "absent";

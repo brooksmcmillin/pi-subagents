@@ -984,6 +984,7 @@ describe("result watcher", () => {
 
 	it("does not redeliver user notification after reload while observer retry is pending", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-observer-reload-"));
+		const route = createNestedRoute("observer-reload");
 		const originalError = console.error;
 		try {
 			console.error = () => {};
@@ -1012,6 +1013,7 @@ describe("result watcher", () => {
 				firstWatcher.stopResultWatcher();
 			}
 
+			fs.writeFileSync(path.join(path.dirname(route.eventSink), "registry.json"), "{");
 			const secondState = createState();
 			secondState.currentSessionId = "session-current";
 			let queueChanges = 0;
@@ -1038,6 +1040,7 @@ describe("result watcher", () => {
 			assert.equal(deliveries, 1);
 			assert.equal(emitted, 1);
 		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}

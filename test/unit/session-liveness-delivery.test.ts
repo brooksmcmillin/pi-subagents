@@ -88,7 +88,8 @@ const terminalBeforePublicationScript = String.raw`
 	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
 	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication;
-	const closedFirst = process.argv[1] === "closed-first";
+	const statusOnlyClosure = process.argv[1] === "closed-overlay";
+	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure;
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
@@ -338,7 +339,12 @@ const terminalBeforePublicationScript = String.raw`
 			const watcher = fs.watch(asyncDir, () => { originalClearTimeout(timer); watcher.close(); resolve(); });
 		});
 		const proof = exitProof();
-		if (closedFirst) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+		if (closedFirst && !statusOnlyClosure) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+		const mismatchedPending = path.join(DIRS.results, "result-pending", sessionId, runId + ".json");
+		if (statusOnlyClosure) {
+			fs.mkdirSync(path.dirname(mismatchedPending), { recursive: true });
+			writeAtomicJson(mismatchedPending, { id: "different-run", sessionId });
+		}
 		writeStatus("complete", closedFirst ? proof : undefined);
 		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, closedFirst ? proof : { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
 		await observed;
@@ -377,6 +383,7 @@ const terminalBeforePublicationScript = String.raw`
 			assert.equal(reports.some(report => /state=done:/.test(report)), true);
 			assert.equal(provider.isActive(), false);
 			assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
+			if (statusOnlyClosure) assert.equal(JSON.parse(fs.readFileSync(mismatchedPending, "utf-8")).id, "different-run");
 			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
 			process.stdout.write("ok");
 			process.exit(0);
@@ -406,6 +413,7 @@ describe("session liveness through result delivery", () => {
 		["pending", "holds detached terminal status while a pending-only result is temporarily inaccessible"],
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
+		["closed-overlay", "settles with validated status-only closure and leaves a mismatched pending result untouched"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
 		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],

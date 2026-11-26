@@ -554,9 +554,17 @@ export function createResultWatcher(
 				sessionId,
 			});
 			const completionKey = buildCompletionKey(data, `result:${file}`);
-			const alreadyDelivered = hasDeliveredNotification(data);
+			if (hasDeliveredNotification(data)) {
+				if (markReplacedPayload()) return;
+				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
+				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
+				deps.onResultDelivered?.(runId);
+				if (!observerSucceeded || !completionPersisted) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				else removeDeliveredResult(file, triggerTurn, read);
+				return;
+			}
 			const lastSeenAt = state.completionSeen.get(completionKey);
-			if (!alreadyDelivered && (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs)) holdOwnedResult(file, identity);
+			if (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs) holdOwnedResult(file, identity);
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(state, data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {
@@ -634,19 +642,6 @@ export function createResultWatcher(
 				};
 			}), nestedChildren);
 
-			if (alreadyDelivered) {
-				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
-				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
-				deps.onResultDelivered?.(runId);
-				if (!observerSucceeded || !completionPersisted) {
-					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-					return;
-				}
-				removeDeliveredResult(file, triggerTurn, read);
-				return;
-			}
 
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;

@@ -676,14 +676,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					if (publication?.pending) {
 						// Reconciliation resolves pending as well as public payloads. The
 						// watcher already discovers exact tracked run IDs without promotion.
-						let published = Boolean(reconciliation.resultPath && fs.existsSync(reconciliation.resultPath));
-						if (!published && job.sessionId && (!publication.instanceId || readProcessTerminal(job.asyncDir, {
-							runId: job.asyncId, runnerProcessInstanceId: publication.instanceId,
-						})?.state === "observed")) {
-							const visibility = resultPayloadVisibility(resultsDir, job.sessionId, job.asyncId);
-							published = visibility === "present";
-							publicationClosed = visibility === "absent";
-						}
+						const visibility = job.sessionId ? resultPayloadVisibility(resultsDir, job.sessionId, job.asyncId, reconciliation.resultPath) : "unknown";
+						const published = visibility === "present";
+						publicationClosed = visibility === "absent" && (!publication.instanceId
+							|| (status.processTerminal?.runnerProcessInstanceId === publication.instanceId && rootWriterClosed(job, status))
+							|| readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: publication.instanceId })?.state === "observed");
 						if (published || publicationClosed) {
 							publication = { pending: false };
 							terminalPublications.set(job.asyncId, publication);
