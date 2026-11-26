@@ -121,6 +121,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// Restored runs whose status.json was unreadable, so their owner is unknown. Each is counted as
 	// this session's until a read shows otherwise; nothing writes to it before then.
 	const unverifiedRuns = new Set<string>();
+	const restoredJobs = new WeakSet<AsyncJobState>();
 	const supervisorNoticeTimers = new Map<string, { asyncId: string; timer: ReturnType<typeof setTimeout> }>();
 	let rootWatcher: fs.FSWatcher | undefined;
 	let nextLivenessAt = Date.now() + livenessIntervalMs;
@@ -530,6 +531,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				}
 				unverifiedPublications.delete(job.asyncId);
 			}
+			restoredJobs.add(job);
 			rememberFleetJob(state, job);
 			unverifiedRuns.delete(job.asyncId);
 		}
@@ -560,8 +562,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 			refreshNestedProjection();
+			const exact = restoredJobs.has(job);
 			const reconciliation = reconcileAsyncRun(job.asyncDir, {
-				expectedRunId: verifyingIdentity ? job.asyncId : undefined,
+				expectedRunId: exact ? job.asyncId : undefined,
+				expectedSessionId: exact ? job.sessionId : undefined,
 				resultsDir,
 				kill: options.kill,
 				now: options.now,
@@ -578,7 +582,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			if (verifyingIdentity && !reconciliation.status) {
+			if (exact && !reconciliation.status) {
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -1041,6 +1045,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		for (const run of runs) {
 			if (pending?.has(run.id) || (isTerminalJobStatus(run.state) && path.basename(run.asyncDir) !== run.id)) continue;
 			const job = summaryToJob(run);
+			restoredJobs.add(job);
 			state.asyncJobs.set(run.id, job);
 			if (isTerminalJobStatus(job.status)) {
 				// Active-index discovery does not establish whether publication has settled.

@@ -890,6 +890,26 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("settles a dead exact run without consuming or overwriting an unrelated public snapshot", () => {
+		const root = tempRoot("pi-stale-unrelated-result-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const resultPath = path.join(resultsDir, "dead.json");
+			const bytes = JSON.stringify({ id: "dead", sessionId: "other-session", success: true });
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 });
+			fs.mkdirSync(resultsDir);
+			fs.writeFileSync(resultPath, bytes);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir, kill: () => { throw errno("ESRCH"); } });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.resultPath, undefined);
+			assert.equal(fs.readFileSync(resultPath, "utf-8"), bytes);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves an existing result instead of overwriting it with stale-run failure", () => {
 		const root = tempRoot("pi-stale-existing-result-");
 		try {

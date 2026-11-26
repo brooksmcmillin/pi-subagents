@@ -460,13 +460,19 @@ function readResultIndexForSessionRun(resultsDir: string, sessionId: string, run
 			return entry;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EPERM" || code === "EACCES") throw error;
+			if (code === "EPERM" || code === "EACCES" || code === "EIO") throw error;
 			if (code !== "ENOENT" && code !== "ENOTDIR" && !isUnaddressableResultCandidate(error)) {
 				console.error(`Ignoring invalid async result index for '${runId}':`, error);
 			}
 		}
 	}
 	return undefined;
+}
+
+export function indexedResultPayloadVisibility(resultsDir: string, sessionId: string, runId: string): ReturnType<typeof resultPayloadVisibility> {
+	const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
+	const indexedPath = entry && entry.file === path.basename(entry.file) && entry.file.endsWith(".json") ? path.join(resultsDir, entry.file) : undefined;
+	return resultPayloadVisibility(resultsDir, sessionId, runId, indexedPath);
 }
 
 export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {

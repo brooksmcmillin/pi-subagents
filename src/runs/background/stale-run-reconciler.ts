@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
+import { indexedResultPayloadVisibility, resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
@@ -37,6 +37,7 @@ interface StartedRunMetadata {
 
 interface ReconcileAsyncRunOptions {
 	expectedRunId?: string;
+	expectedSessionId?: string;
 	resultsDir?: string;
 	kill?: KillFn;
 	now?: () => number;
@@ -364,9 +365,10 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 	};
 }
 
-function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string, ownerExited = false, adoptCompletionOwnerId?: string): ReconcileAsyncRunResult {
+function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string, ownerExited = false, adoptCompletionOwnerId?: string, preservePublicResult = false): ReconcileAsyncRunResult {
 	const repair = buildFailedRepair(status, asyncDir, now, reason, ownerExited, adoptCompletionOwnerId);
-	if (repair.result.sessionId) writeAsyncResultFile(resultPath, repair.result);
+	const published = Boolean(repair.result.sessionId) && !preservePublicResult;
+	if (published) writeAsyncResultFile(resultPath, repair.result);
 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
 	updateActiveRunIndex(asyncDir, repair.status.state, repair.status.toolCallId);
 	appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), {
@@ -374,10 +376,10 @@ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: st
 		ts: now,
 		runId: repair.status.runId,
 		pid: status.pid,
-		...(repair.result.sessionId ? { resultPath } : {}),
+		...(published ? { resultPath } : {}),
 		message: repair.message,
 	});
-	return { status: repair.status, repaired: true, ...(repair.result.sessionId ? { resultPath } : {}), message: repair.message };
+	return { status: repair.status, repaired: true, ...(published ? { resultPath } : {}), message: repair.message };
 }
 
 function terminal(state: AsyncStatus["state"]): boolean {
@@ -491,7 +493,8 @@ export function checkRecordedPidLiveness(recorded: RecordedPid, observation: Rec
 export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}, observeStatus?: RawDrainStatusObserver): ReconcileAsyncRunResult {
 	const now = options.now?.() ?? Date.now();
 	const status = readStatus(asyncDir);
-	if (options.expectedRunId !== undefined && status?.runId !== options.expectedRunId) return { status: null, repaired: false };
+	if ((options.expectedRunId !== undefined && status?.runId !== options.expectedRunId)
+		|| (options.expectedSessionId !== undefined && status?.sessionId !== options.expectedSessionId)) return { status: null, repaired: false };
 	observeStatus?.(status);
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
@@ -550,7 +553,10 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			updateActiveRunIndex(asyncDir, statusToWrite.state, statusToWrite.toolCallId);
 			return { status: statusToWrite, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };
 		}
-		if (effectiveStatus.displayDismissedAt === undefined) return { status: effectiveStatus, repaired: false, resultPath: existingResultPath };
+		if (effectiveStatus.displayDismissedAt === undefined && (!options.expectedRunId || runnerStillFinishing
+			|| (effectiveStatus.state !== "running" && effectiveStatus.state !== "queued"))) {
+			return { status: effectiveStatus, repaired: false, resultPath: existingResultPath };
+		}
 	}
 	if (effectiveStatus.displayDismissedAt !== undefined) {
 		return { status: null, repaired: false, resultPath };
@@ -567,13 +573,18 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		}
 	}
 
+	if (options.expectedRunId && effectiveStatus.sessionId
+		&& indexedResultPayloadVisibility(resultsDir, effectiveStatus.sessionId, runId) !== "absent") {
+		return { status: effectiveStatus, repaired: false };
+	}
+	const preservePublicResult = Boolean(options.expectedRunId && existingResultPath && regularFileExists(resultPath));
 	const liveness = runnerLiveness(effectiveStatus.pid);
 	if (liveness !== "dead") {
 		if (now - lastUpdate <= staleAfterMs) return { status: status ?? null, repaired: false, resultPath };
 		const probe = liveness === "alive" ? "is still live" : "cannot be probed from this process";
 		const message = `Async runner PID ${effectiveStatus.pid} ${probe}; status has not updated for ${now - lastUpdate}ms, so stale-run reconciliation marked the run failed because PID ownership is unverified.`;
-		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, message);
+		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, message, false, undefined, preservePublicResult);
 	}
 
-	return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, undefined, true, options.adoptCompletionOwnerId);
+	return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, undefined, true, options.adoptCompletionOwnerId, preservePublicResult);
 }

@@ -1386,10 +1386,14 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		let denyPayload = false;
 		let indexDenied = 0;
 		let payloadDenied = 0;
+		let payloadReads = 0;
 		fsDefault.readFileSync = ((file, options) => {
 			if (!statFailure && denyIndex && String(file).includes(path.sep + "result-index" + path.sep) && path.basename(String(file)) === "terminal.json") indexDenied++;
 			else if (denyPayload && file === resultPath) payloadDenied++;
-			else return originalRead(file, options);
+			else {
+				if (file === resultPath) payloadReads++;
+				return originalRead(file, options);
+			}
 			throw Object.assign(new Error("temporarily inaccessible result storage"), { code: "EACCES" });
 		}) as typeof fs.readFileSync;
 		if (statFailure) fsDefault.statSync = ((file, options) => {
@@ -1415,12 +1419,43 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		await waitForCondition(() => state.asyncJobs.get("terminal")?.status === "complete", "publisher succeeds on retry");
 		fs.mkdirSync(resultsDir, { recursive: true });
 		denyPayload = true;
-		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId, success: true }));
+		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId: "other-session", success: true }));
 		await waitForCondition(() => payloadDenied > 0, "stale repair attempts an unreadable payload");
 		assert.equal(state.asyncJobs.get("running")?.status, "running");
 		assert.equal(state.cleanupTimers.has("running"), false);
 		denyPayload = false;
-		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair retries after recovery");
+		await waitForCondition(() => payloadReads > 0, "repair examines recovered public payload");
+		assert.equal(state.asyncJobs.get("running")?.status, "running", "retries still reject unrelated results");
+		fs.writeFileSync(resultPath, JSON.stringify({ id: "running", sessionId, success: true }));
+		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair accepts only the matching result");
+	});
+
+	it("defers dead-run repair until its indexed pending result is readable", async (t) => {
+		const asyncRoot = createTempDir("pi-dead-pending-io-");
+		const resultsDir = path.join(asyncRoot, "results");
+		const runDir = path.join(asyncRoot, "dead");
+		const healthyDir = path.join(asyncRoot, "healthy");
+		const result = resultFilePath(resultsDir, "dead");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10,
+			kill: () => { throw Object.assign(new Error("runner exited"), { code: "ESRCH" }); } });
+		const denied = denyStat(t);
+		t.after(() => { denied.clear(); tracker.dispose(); removeTempDir(asyncRoot); });
+		writeRunningAsyncStatus(healthyDir, "healthy", "parent");
+		writeRunningAsyncStatus(runDir, "dead", "parent");
+		const statusPath = path.join(runDir, "status.json");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 12345 }));
+		updateActiveRunIndex(runDir, "running");
+		updateActiveRunIndex(healthyDir, "running");
+		writePendingAsyncResultFile(result, { id: "dead", sessionId: "parent", success: true });
+		denied.add(path.join(resultsDir, "result-pending", "parent", "dead.json"));
+		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
+		assert.equal(state.asyncJobs.get("dead")?.status, "running");
+		assert.equal(state.asyncJobs.get("healthy")?.status, "running");
+		assert.equal(fs.existsSync(result), false);
+		assert.ok(readActiveRunIndex(asyncRoot)?.includes("dead"));
+		denied.clear();
+		await waitForCondition(() => state.asyncJobs.get("dead")?.status === "complete", "original success repairs the dead run after recovery");
 	});
 
 	it("restores an unreadable active run as live work until a read shows its owner", async (t) => {
