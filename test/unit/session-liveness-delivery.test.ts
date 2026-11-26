@@ -21,6 +21,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { createEventBus } from "@earendil-works/pi-coding-agent";
 	import registerSubagentExtension from "./src/extension/index.ts";
 	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+	import { recordSessionReplacement } from "./src/shared/session-succession.ts";
 	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
 	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
@@ -77,8 +78,12 @@ const terminalBeforePublicationScript = String.raw`
 	const publishedReload = process.argv[1] === "published-reload";
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
 	const provisionalReload = process.argv[1] === "provisional-reload";
+	const mismatchedMarker = process.argv[1] === "mismatched-marker";
+	const inheritedPublication = process.argv[1] === "inherited-publication";
+	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
+	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
-	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication;
 	const closedFirst = process.argv[1] === "closed-first";
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
@@ -108,7 +113,7 @@ const terminalBeforePublicationScript = String.raw`
 		const asyncDir = path.join(DIRS.async, runId);
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeAtomicJson(path.join(asyncDir, "status.json"), {
-			runId, sessionId, completionOwnerId, mode: workflowReload ? "workflow" : "single", state,
+			runId: mismatchedMarker ? "different-run" : runId, sessionId: runSessionId, completionOwnerId, mode: workflowReload ? "workflow" : "single", state,
 			startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
 			steps: [{ agent: "worker", status: state, index: 0 }],
 			...(state === "running" ? {} : { processTerminal: proof ?? { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
@@ -161,6 +166,15 @@ const terminalBeforePublicationScript = String.raw`
 			fsDefault.statSync = restoreStat;
 			syncBuiltinESMExports();
 		}
+	}
+	if (mismatchedMarker) {
+		assert.equal(readActiveRunIndex(DIRS.async).includes(runId), true, "the directory was discovered via its active marker");
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, []);
+		assert.equal(reports.some(report => report.includes("differentrun")), false);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
 	}
 	if (restoredCase) {
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
@@ -371,6 +385,8 @@ describe("session liveness through result delivery", () => {
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
 		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],
+		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
+		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 		["published-reload", "published delivery remains held on reload even when active listing fails"],

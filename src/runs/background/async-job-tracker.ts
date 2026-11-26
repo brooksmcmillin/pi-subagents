@@ -35,7 +35,7 @@ import { resultPayloadVisibility } from "./result-files.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
-import { ownerSessionIds } from "../shared/run-ownership.ts";
+import { ownerSessionIds, ownsRun } from "../shared/run-ownership.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -473,6 +473,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		return job.nestedWorkActive !== previous;
 	};
 
+	const publicationOwner = (status: NonNullable<ReturnType<typeof readStatus>>): string | undefined => {
+		if (!state.completionOwnerId || !ownsRun(state.currentSessionId, status.sessionId)) return;
+		const owner = options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) ?? status.completionOwnerId;
+		if (owner === state.completionOwnerId || owner === OWNING_SESSION_COMPLETION_OWNER) return owner;
+	};
+
 	const refreshJob = (job: AsyncJobState): boolean => {
 		if (unverifiedRuns.has(job.asyncId)) {
 			let stored: ReturnType<typeof readStatus> = null;
@@ -504,8 +510,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
 			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
 			if (pending && !pending.provisional) {
-				const ownerId = options.deliveryOwnerId?.(stored.sessionId, stored.completionOwnerId, stored.completionOwnerProcess, stored.parentWorkflowRunId) ?? stored.completionOwnerId;
-				if (ownerId && (ownerId === state.completionOwnerId || ownerId === OWNING_SESSION_COMPLETION_OWNER)
+				const ownerId = publicationOwner(stored);
+				if (ownerId
 					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
 					job.completionOwnerId = ownerId;
 					terminalPublications.set(job.asyncId, pending);
@@ -639,16 +645,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				const nestedLivenessChanged = refreshNestedLiveness(job);
 				if (isTerminalJobStatus(job.status)) {
 					let publication = terminalPublications.get(job.asyncId);
-					if (!publication && status.mode !== "workflow" && (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")
-						&& status.runId === job.asyncId && status.completionOwnerId
-						&& ((status.sessionId === state.currentSessionId && status.completionOwnerId === state.completionOwnerId)
-							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
-							|| (typeof status.sessionId === "string"
-								&& options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) === OWNING_SESSION_COMPLETION_OWNER))) {
-						job.completionOwnerId ??= status.completionOwnerId === state.completionOwnerId
-							? status.completionOwnerId : OWNING_SESSION_COMPLETION_OWNER;
-						publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
-						terminalPublications.set(job.asyncId, publication);
+					if (!publication && status.mode !== "workflow" && status.runId === job.asyncId
+						&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")) {
+						const owner = publicationOwner(status);
+						if (owner) {
+							job.completionOwnerId = owner;
+							publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
+							terminalPublications.set(job.asyncId, publication);
+						}
 					}
 					const wasPending = publication?.pending;
 					let publicationClosed = false;
@@ -1002,7 +1006,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 		if (publicationSession) reloadPublications.delete(publicationSession.manager);
 		for (const run of runs) {
-			if (pending?.has(run.id)) continue;
+			if (pending?.has(run.id) || (isTerminalJobStatus(run.state) && path.basename(run.asyncDir) !== run.id)) continue;
 			const job = summaryToJob(run);
 			state.asyncJobs.set(run.id, job);
 			if (isTerminalJobStatus(job.status)) {
