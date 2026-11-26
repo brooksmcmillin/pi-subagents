@@ -73,10 +73,11 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
-	const repeatReload = process.argv[1] === "repeat-reload";
-	const restoredCase = process.argv[1] === "restored" || repeatReload;
+	const workflowReload = process.argv[1] === "workflow-reload";
+	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload;
+	const restoredCase = process.argv[1] === "restored" || (repeatReload && !workflowReload);
 	const closedFirst = process.argv[1] === "closed-first";
-	const closedCase = process.argv[1] === "closed" || restoredCase || closedFirst;
+	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
 	const holds = [];
@@ -104,7 +105,7 @@ const terminalBeforePublicationScript = String.raw`
 		const asyncDir = path.join(DIRS.async, runId);
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeAtomicJson(path.join(asyncDir, "status.json"), {
-			runId, sessionId, completionOwnerId, mode: "single", state,
+			runId, sessionId, completionOwnerId, mode: workflowReload ? "workflow" : "single", state,
 			startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
 			steps: [{ agent: "worker", status: state, index: 0 }],
 			...(state === "running" ? {} : { processTerminal: proof ?? { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" } }),
@@ -133,7 +134,13 @@ const terminalBeforePublicationScript = String.raw`
 	if (repeatReload) {
 		const proof = exitProof();
 		const stat = fsDefault.statSync;
+		let denyStatus = false;
+		let statusDenied = false;
 		fsDefault.statSync = (file, ...args) => {
+			if (denyStatus && String(file) === path.join(asyncDir, "status.json")) {
+				statusDenied = true;
+				throw Object.assign(new Error("temporarily inaccessible status"), { code: "EACCES" });
+			}
 			if (String(file).includes("result-pending")) throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
 			return stat(file, ...args);
 		};
@@ -141,13 +148,16 @@ const terminalBeforePublicationScript = String.raw`
 		try {
 			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
 			writeStatus("complete", proof);
+			if (workflowReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, state: "complete", success: true, triggerTurn: false });
 			assert.equal(readActiveRunIndex(DIRS.async)?.includes(runId), false);
 			for (let i = 0; i < 2; i++) {
 				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
 				handlers.clear();
 				holds.length = 0;
+				denyStatus = i === 0 && !workflowReload;
 				registerSubagentExtension(pi);
 				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+				if (denyStatus) assert.equal(statusDenied, true);
 				assert.deepEqual(holds, [true]);
 				assert.equal(provider.isActive(), true);
 			}
@@ -280,7 +290,8 @@ describe("session liveness through result delivery", () => {
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
-		["repeat-reload", "unresolved closed publication survives two reloads after active marker release"],
+		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
+		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

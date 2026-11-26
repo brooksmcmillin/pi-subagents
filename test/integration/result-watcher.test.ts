@@ -264,14 +264,25 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry", "native stat retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
 		const order: string[] = [];
 		const terminalHolds: boolean[] = [];
 		let watchEvent: fs.WatchListener<string> | undefined;
-		const denyDiscovery = source === "native watch retry" || source === "native payload retry";
+		const denyDiscovery = source.endsWith("retry");
+		let denyStat = source === "native stat retry";
+		let statDenied = false;
+		const originalStat = fsDefault.statSync;
+		const stat = ((file, options) => {
+			if (denyStat && resultReads >= 2 && String(file).endsWith("wake-order.json")) {
+				assert.deepEqual(terminalHolds, [true]);
+				statDenied = true;
+				throw Object.assign(new Error("transient stat denial"), { code: "EACCES" });
+			}
+			return originalStat(file, options);
+		}) as typeof fs.statSync;
 		let resultReads = 0;
 		let payloadRetryObserved = false;
 		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
@@ -288,6 +299,7 @@ describe("result watcher", () => {
 					const handle = { on: () => handle, close() {}, unref() {} };
 					return handle as unknown as fs.FSWatcher;
 				},
+				statSync: stat,
 				readFileSync: ((file, options) => {
 					if (String(file).endsWith("wake-order.json")) {
 						resultReads++;
@@ -303,6 +315,10 @@ describe("result watcher", () => {
 			},
 		});
 		try {
+			if (denyStat) {
+				fsDefault.statSync = stat;
+				syncBuiltinESMExports();
+			}
 			reporter.sessionStarted({ hasUI: true, mode: "tui", setBackgroundWork: (_key, active) => terminalHolds.push(active) });
 			if (source !== "indexed scan") watcher.startResultWatcher();
 			const resultPath = path.join(resultsDir, "wake-order.json");
@@ -314,11 +330,20 @@ describe("result watcher", () => {
 			assert.equal(state.asyncJobs.size, 0);
 			assert.deepEqual(terminalHolds, denyDiscovery ? [] : [true], "hold begins when ownership is known");
 			assert.deepEqual(order, []);
+			if (denyStat) {
+				assert.equal(await waitForPredicate(() => statDenied), true);
+				assert.deepEqual(terminalHolds, [true]);
+				denyStat = false;
+			}
 			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
 			assert.deepEqual(terminalHolds, [true, false]);
 			if (source === "native payload retry") assert.equal(payloadRetryObserved, true);
 		} finally {
+			if (source === "native stat retry") {
+				fsDefault.statSync = originalStat;
+				syncBuiltinESMExports();
+			}
 			reporter.dispose();
 			watcher.stopResultWatcher();
 			fs.rmSync(resultsDir, { recursive: true, force: true });

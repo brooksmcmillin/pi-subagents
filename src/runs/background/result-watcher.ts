@@ -24,7 +24,7 @@ import { resolveWatchPath } from "../../shared/utils.ts";
 import { FileLeaseBusyError } from "../../shared/file-lease.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
 import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
-import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
+import { acknowledgeMissionObserverSnapshot, missionObserverIndexPath, missionObserverResultCandidateFiles, promotePendingResultFile, readResultPayload, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, resultPayloadVisibility, resultSnapshotReplaced, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writeResultIndexForData, type ResultSnapshot } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 import { reportSessionWarning } from "../../shared/session-warnings.ts";
@@ -255,7 +255,7 @@ export function createResultWatcher(
 	});
 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
 	const pendingTriggerTurn = new Map<string, boolean>();
-	const queuedOwnedResults = new Set<string>();
+	const queuedOwnedResults = new Map<string, ResultFileIdentity>();
 	const incompleteResultRetries = new Map<string, number>();
 	const processing = new Set<string>();
 	const handling = new Set<Promise<void>>();
@@ -286,9 +286,10 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
-	const holdOwnedResult = (file: string) => {
-		if (queuedOwnedResults.has(file)) return;
-		queuedOwnedResults.add(file);
+	const holdOwnedResult = (file: string, identity: ResultFileIdentity) => {
+		const alreadyHeld = queuedOwnedResults.has(file);
+		queuedOwnedResults.set(file, identity);
+		if (alreadyHeld) return;
 		deps.onOwnedQueueChanged?.();
 	};
 
@@ -297,7 +298,7 @@ export function createResultWatcher(
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
 		if (delayMs === 0 && identity?.sessionId && !identity.acknowledged
 			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
-			holdOwnedResult(file);
+			holdOwnedResult(file, identity);
 		}
 		state.resultFileCoalescer.schedule(file, delayMs);
 	};
@@ -380,7 +381,7 @@ export function createResultWatcher(
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
 		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
-			if (holdForDelivery && !identity.acknowledged) holdOwnedResult(file);
+			if (holdForDelivery && !identity.acknowledged) holdOwnedResult(file, identity);
 			return true;
 		}
 		// Acknowledgment removes the observer index; gating on the mission binding instead
@@ -406,6 +407,15 @@ export function createResultWatcher(
 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		}
 	};
+	const retryInaccessibleOwnedResult = (file: string, triggerTurn: boolean) => {
+		const identity = queuedOwnedResults.get(file);
+		if (identity?.sessionId && identity.runId
+			&& ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))
+			&& resultPayloadVisibility(resultsDir, identity.sessionId, identity.runId) === "unknown") {
+			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+		}
+	};
+
 	const handleResult = async (file: string, triggerTurn: boolean) => {
 		if (processing.has(file)) return;
 		let observed: ReadonlySet<string> | undefined;
@@ -413,7 +423,10 @@ export function createResultWatcher(
 			if (!shouldProcessResult(file, undefined, undefined, true)) {
 				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
 				observed = observedRunIds();
-				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true)) return;
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true)) {
+					retryInaccessibleOwnedResult(file, triggerTurn);
+					return;
+				}
 			}
 		} catch (error) {
 			if (!isAccessDenied(error)) throw error;
@@ -433,7 +446,10 @@ export function createResultWatcher(
 		};
 		try {
 			const payloadPath = resultPayloadPath(file, observed);
-			if (!payloadPath) return;
+			if (!payloadPath) {
+				retryInaccessibleOwnedResult(file, triggerTurn);
+				return;
+			}
 			resultPath = payloadPath;
 			let raw = readPayload(resultPath);
 			let identity = resultFileIdentity(raw, file);
@@ -525,7 +541,7 @@ export function createResultWatcher(
 			const completionKey = buildCompletionKey(data, `result:${file}`);
 			const alreadyDelivered = hasDeliveredNotification(data);
 			const lastSeenAt = state.completionSeen.get(completionKey);
-			if (!alreadyDelivered && (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs)) holdOwnedResult(file);
+			if (!alreadyDelivered && (lastSeenAt === undefined || Date.now() - lastSeenAt > completionTtlMs)) holdOwnedResult(file, identity);
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(state, data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {

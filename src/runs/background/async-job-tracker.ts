@@ -105,10 +105,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const externalJobBridgeRuns = new Set<string>();
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
-	const terminalPublications = new Map<string, { instanceId?: string; pending: true } | { pending: false }>();
+	type PendingPublication = { instanceId?: string; pending: true };
+	const terminalPublications = new Map<string, PendingPublication | { pending: false }>();
+	const unverifiedPublications = new Map<string, PendingPublication>();
 	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
 	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
-	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: string[] }> };
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, PendingPublication> }> };
 	const reloadPublications = globals[handoffKey] ??= new WeakMap();
 	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
@@ -451,6 +453,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		terminalPublications.delete(asyncId);
 		unreadableStatusRuns.delete(asyncId);
 		unverifiedRuns.delete(asyncId);
+		unverifiedPublications.delete(asyncId);
 		clearSupervisorNotices(asyncId);
 	};
 	const forgetJob = (asyncId: string) => {
@@ -481,7 +484,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
-			if (!stored || !summary || (owners && !owners.has(stored.sessionId))) {
+			const pending = unverifiedPublications.get(job.asyncId);
+			if (!stored || !summary || (pending && stored.runId !== job.asyncId) || (owners && !owners.has(stored.sessionId))) {
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -498,6 +502,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// Become the job a normal restore would have made, but keep the placeholder's state so the
 			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
 			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
+			if (pending) {
+				const ownerId = options.deliveryOwnerId?.(stored.sessionId, stored.completionOwnerId, stored.completionOwnerProcess, stored.parentWorkflowRunId) ?? stored.completionOwnerId;
+				if (ownerId && (ownerId === state.completionOwnerId || ownerId === OWNING_SESSION_COMPLETION_OWNER)
+					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
+					job.completionOwnerId = ownerId;
+					terminalPublications.set(job.asyncId, pending);
+				}
+				unverifiedPublications.delete(job.asyncId);
+			}
 			rememberFleetJob(state, job);
 			unverifiedRuns.delete(job.asyncId);
 		}
@@ -914,8 +927,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 
 	const dispose = (shutdownReason?: string) => {
 		if (shutdownReason === "reload" && publicationSession) {
-			const runs = [...terminalPublications].filter(([, publication]) => publication.pending).map(([runId]) => runId);
-			if (runs.length) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
+			const runs = new Map(unverifiedPublications);
+			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
+			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
@@ -931,6 +945,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		terminalPublications.clear();
 		unreadableStatusRuns.clear();
 		unverifiedRuns.clear();
+		unverifiedPublications.clear();
 		clearSupervisorNotices();
 	};
 
@@ -970,15 +985,19 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			return;
 		}
-		if (handoff?.sessionId === state.currentSessionId) {
-			const known = new Set(runs.map((run) => run.id));
-			for (const runId of handoff.runs) {
-				if (known.has(runId)) continue;
-				const [run] = listAsyncRuns(asyncDirRoot, { runId, exactRunId: true, sessionId: state.currentSessionId, resultsDir });
-				if (run) runs.push(run);
-			}
+		const pending = handoff?.sessionId === state.currentSessionId ? handoff.runs : undefined;
+		if (pending) for (const [runId, publication] of pending) {
+			if (path.basename(runId) !== runId || runId === "." || runId === "..") continue;
+			const job: AsyncJobState = { asyncId: runId, asyncDir: path.join(asyncDirRoot, runId), status: "running", updatedAt: Date.now() };
+			state.asyncJobs.set(runId, job);
+			runningJobIds.add(runId);
+			unverifiedRuns.add(runId);
+			unverifiedPublications.set(runId, publication);
+			refreshJob(job);
+			if (state.asyncJobs.has(runId)) watchJob(job);
 		}
 		for (const run of runs) {
+			if (pending?.has(run.id)) continue;
 			const job = summaryToJob(run);
 			state.asyncJobs.set(run.id, job);
 			if (isTerminalJobStatus(job.status)) refreshJob(job, true);
@@ -1001,7 +1020,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			watchJob(job);
 		}
 		state.statusProjectionSessionId = state.currentSessionId;
-		if (runs.length === 0 && unreadable.length === 0) return;
+		if (state.asyncJobs.size === 0) return;
 		ensurePoller();
 		rerenderLastWidget();
 	};
