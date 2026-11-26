@@ -1338,7 +1338,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("restores a terminal publisher and other active jobs when marker maintenance is denied", (t) => {
+	for (const mode of ["single", "workflow"]) it(`restores active jobs when ${mode} terminal marker maintenance is denied`, (t) => {
 		const asyncRoot = createTempDir("pi-active-marker-write-denied-");
 		const terminalDir = path.join(asyncRoot, "terminal");
 		const runningDir = path.join(asyncRoot, "running");
@@ -1351,7 +1351,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const proof = { version: 1, runId: "terminal", runnerProcessInstanceId: "writer", state: "observed", observedAt: 300,
 			instances: [{ kind: "runner", processInstanceId: "writer", closeObservedAt: 300, exitCode: 0, signal: null }] };
 		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId: "parent", completionOwnerId: "owner",
-			state: "complete", mode: "single", startedAt: 100, processTerminal: proof }));
+			state: "complete", mode, startedAt: 100, processTerminal: proof }));
 		fs.writeFileSync(path.join(terminalDir, "process-terminal.json"), JSON.stringify(proof));
 		updateActiveRunIndex(terminalDir, "running");
 		updateActiveRunIndex(runningDir, "running");
@@ -1366,7 +1366,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		syncBuiltinESMExports();
 		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
 		assert.equal(denied, true);
-		assert.equal(state.asyncJobs.get("terminal")?.status, "complete");
+		assert.equal(state.asyncJobs.get("terminal")?.status, mode === "single" ? "complete" : undefined);
 		assert.equal(state.asyncJobs.get("running")?.status, "running");
 	});
 

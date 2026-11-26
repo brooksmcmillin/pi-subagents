@@ -1162,6 +1162,33 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("keeps the owned hold when a seen snapshot is replaced during dedupe", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-dedupe-replaced-"));
+		const file = "dedupe-replaced.json";
+		const resultPath = path.join(resultsDir, file);
+		const initial = { id: "dedupe-replaced", sessionId: "session-current", success: true, summary: "seen" };
+		const state = createState();
+		state.currentSessionId = initial.sessionId;
+		state.completionSeen.set(buildCompletionKey(initial, `result:${file}`), Date.now());
+		const order: string[] = [];
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			observeCompletion: (result) => {
+				if (result.summary === "seen") writeIndexedResult(resultPath, { ...initial, id: "replacement", runId: "replacement", summary: "replacement" });
+			},
+			notifier: { deliver: async (result) => { order.push(String(result.summary)); return true; } },
+			onOwnedQueueChanged: () => order.push(watcher.hasQueuedOwnedResults() ? "held" : "released"),
+		});
+		try {
+			writeIndexedResult(resultPath, initial);
+			watcher.primeExistingResults();
+			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			assert.deepEqual(order, ["held", "replacement", "released"]);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("delivers the final result that replaced a paused result while the paused one was being delivered", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-replaced-"));
 		try {

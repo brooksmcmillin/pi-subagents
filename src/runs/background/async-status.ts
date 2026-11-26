@@ -623,14 +623,14 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
 		if (options.includeTerminalPublication && activeEntries.has(entry) && status.runId !== entry) continue;
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
-			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
-			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
-				try {
+			try {
+				const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
+				if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
 					updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
-				} catch (error) {
-					// A verified publisher is still trackable without retiring its marker.
-					if (!terminalPublication || !owned || !isStorageAccessError(error)) throw error;
 				}
+			} catch (error) {
+				// Marker housekeeping must not discard the other restored jobs.
+				if (!verifyMarker || !owned || !isStorageAccessError(error)) throw error;
 			}
 		}
 		if (status.displayDismissedAt !== undefined) continue;

@@ -585,13 +585,12 @@ export function createResultWatcher(
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch) || markReplacedPayload()) return;
 				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
 				deps.onResultDelivered?.(runId);
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
