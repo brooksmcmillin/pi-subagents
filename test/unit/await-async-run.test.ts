@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import * as fs from "node:fs";
+import fs, { type PathOrFileDescriptor } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -92,6 +93,20 @@ describe("awaitExistingAsyncRun", () => {
 		assert.equal(outcome.status === "settled" && outcome.result.output, "late output");
 	});
 
+	it("refuses a new session that takes over the same run ID during polling", async () => {
+		const asyncDir = childDir();
+		writeStatus(asyncDir, { pid: process.pid });
+		const waiting = awaitExistingAsyncRun(asyncDir, "child-run", AbortSignal.timeout(2_000));
+		const resultPath = path.join(asyncDir, "workflow-result.json");
+		const replacement = { id: "child-run", sessionId: "session-b", state: "complete", success: true };
+		writeStatus(asyncDir, { sessionId: "session-b", state: "complete" });
+		writeJson(resultPath, replacement);
+		const outcome = await waiting;
+		assert.equal(outcome.status, "unavailable");
+		assert.match(outcome.reason, /changed identity/);
+		assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf-8")), replacement);
+	});
+
 	it("is unavailable when the status belongs to a different run", async () => {
 		const asyncDir = childDir();
 		writeStatus(asyncDir, { runId: "other-run", state: "complete" });
@@ -123,13 +138,100 @@ describe("awaitExistingAsyncRun", () => {
 
 	it("is unavailable when the runner died while status still says running", async () => {
 		const asyncDir = childDir();
-		writeStatus(asyncDir, { pid: deadPid() });
+		writeStatus(asyncDir, { pid: deadPid(), pidNamespaceScope: currentPidNamespaceScope() });
 
 		const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", new AbortController().signal);
 
 		assert.equal(outcome.status, "unavailable");
 		assert.match(outcome.status === "unavailable" ? outcome.reason : "", /exited without publishing a result/);
 		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "running");
+	});
+
+	it("reattaches and claims an exact pending result despite index EIO and a dead runner", async (t) => {
+		const asyncDir = childDir();
+		writeStatus(asyncDir, { pid: deadPid(), pidNamespaceScope: currentPidNamespaceScope() });
+		writePendingAsyncResultFile(path.join(asyncDir, "workflow-result.json"), {
+			id: "child-run", sessionId: "session-a", state: "complete", success: true,
+			results: [{ agent: "worker", output: "original output", success: true }],
+		});
+		const read = fs.readFileSync;
+		let failures = 0;
+		t.mock.method(fs, "readFileSync", (file: PathOrFileDescriptor, ...args: unknown[]) => {
+			if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				failures++;
+				throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+			}
+			return Reflect.apply(read, fs, [file, ...args]);
+		});
+		syncBuiltinESMExports();
+		try {
+			const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", AbortSignal.timeout(2_000));
+			assert.equal(failures, 2); // The dead-runner probe and the attachment both saw EIO.
+			assert.equal(outcome.status, "settled");
+			assert.equal(outcome.result.output, "original output");
+			const snapshot = { ...outcome.result.importedPublication, runId: "child-run" };
+			const claimedPath = claimWorkflowAwaitedResult(asyncDir, "workflow-b", snapshot);
+			assert.ok(claimedPath);
+			assert.equal(read(claimedPath, "utf-8"), snapshot.snapshot);
+			assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-c", snapshot), undefined);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("does not attach to a foreign payload behind a stale public alias", async () => {
+		const asyncDir = childDir();
+		writeStatus(asyncDir, { pid: deadPid(), pidNamespaceScope: currentPidNamespaceScope() });
+		const alias = path.join(asyncDir, "alias.json");
+		writeAsyncResultFile(alias, { id: "child-run", sessionId: "session-a", success: true });
+		const foreign = JSON.stringify({ id: "other-run", sessionId: "other-session", success: true });
+		fs.writeFileSync(alias, foreign);
+		const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", AbortSignal.timeout(2_000));
+		assert.equal(outcome.status, "unavailable");
+		assert.match(outcome.reason, /exited without publishing a result/);
+		writeStatus(asyncDir, { state: "complete" });
+		const terminal = await awaitExistingAsyncRun(asyncDir, "child-run", AbortSignal.timeout(3_000));
+		assert.equal(terminal.status, "unavailable");
+		assert.match(terminal.reason, /ended without a result file/);
+		assert.equal(fs.readFileSync(alias, "utf-8"), foreign);
+	});
+
+	it("waits through temporary pending payload EIO and claims the same bytes after promotion", async (t) => {
+		const asyncDir = childDir();
+		writeStatus(asyncDir, { pid: deadPid(), pidNamespaceScope: currentPidNamespaceScope() });
+		const publicPath = path.join(asyncDir, "workflow-result.json");
+		writePendingAsyncResultFile(publicPath, {
+			id: "child-run", sessionId: "session-a", state: "complete", success: true,
+			results: [{ agent: "worker", output: "original output", success: true }],
+		});
+		const stat = fs.statSync;
+		let failures = 0;
+		t.mock.method(fs, "statSync", (file: fs.PathLike, ...args: unknown[]) => {
+			if (failures < 2 && String(file).includes(`${path.sep}result-pending${path.sep}`) && path.basename(String(file)) === "child-run.json") {
+				failures++;
+				throw Object.assign(new Error("pending payload unavailable"), { code: "EIO" });
+			}
+			return Reflect.apply(stat, fs, [file, ...args]);
+		});
+		syncBuiltinESMExports();
+		try {
+			const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", AbortSignal.timeout(2_000));
+			assert.equal(failures, 2);
+			assert.equal(outcome.status, "settled");
+			assert.equal(outcome.result.output, "original output");
+			const snapshot = { ...outcome.result.importedPublication, runId: "child-run" };
+			assert.ok(snapshot.payloadPath && fs.existsSync(snapshot.payloadPath));
+			assert.equal(resultPayloadPathForSessionRun(asyncDir, "session-a", "child-run"), publicPath);
+			assert.equal(fs.existsSync(snapshot.payloadPath), false);
+			const claimedPath = claimWorkflowAwaitedResult(asyncDir, "workflow-b", snapshot);
+			assert.ok(claimedPath);
+			assert.equal(fs.readFileSync(claimedPath, "utf-8"), snapshot.snapshot);
+			assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-c", snapshot), undefined);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		}
 	});
 
 	it("is unavailable when a live-looking runner pid was saved before a reboot", async () => {
@@ -258,6 +360,30 @@ describe("claimWorkflowAwaitedResult", () => {
 		assertFinalPublished(asyncDir);
 	});
 
+	for (const replaced of [false, true]) it(`checks snapshot identity after pending promotion to an indexed alias (replaced: ${replaced})`, async () => {
+		const asyncDir = childDir();
+		const alias = path.join(asyncDir, "indexed-alias.json");
+		writeStatus(asyncDir, { state: "paused" });
+		writePendingAsyncResultFile(alias, paused);
+		const outcome = await awaitExistingAsyncRun(asyncDir, "child-run", new AbortController().signal);
+		assert.equal(outcome.status, "settled");
+		const read = { runId: "child-run", ...outcome.result.importedPublication };
+		assert.ok(read.payloadPath && fs.existsSync(read.payloadPath));
+		assert.equal(resultPayloadPathForSessionRun(asyncDir, "session-a", read.runId), alias);
+		assert.equal(fs.existsSync(read.payloadPath), false);
+		if (replaced) writeAsyncResultFile(alias, final);
+		const claimed = claimWorkflowAwaitedResult(asyncDir, "workflow-b", read);
+		if (replaced) {
+			assert.equal(claimed, undefined);
+			assert.equal(JSON.parse(fs.readFileSync(alias, "utf-8")).toolCallId, final.toolCallId);
+			return;
+		}
+		assert.ok(claimed);
+		assert.equal(fs.readFileSync(claimed, "utf-8"), read.snapshot);
+		assert.equal(fs.existsSync(alias), false);
+		assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-c", read), undefined);
+	});
+
 	it("keeps a final result published after the claim when the claimed paused result is removed", async () => {
 		const asyncDir = childDir();
 		const resultPath = path.join(asyncDir, "workflow-result.json");
@@ -275,6 +401,7 @@ describe("claimWorkflowAwaitedResult", () => {
 		const asyncDir = childDir();
 		const read = await importPaused(asyncDir);
 		withResultRunLease(asyncDir, "child-run", () => assert.equal(claimWorkflowAwaitedResult(asyncDir, "workflow-b", read), undefined));
-		assert.equal(fs.readFileSync(path.join(asyncDir, "workflow-result.json"), "utf-8"), read.snapshot);
+		assert.ok(read.payloadPath);
+		assert.equal(fs.readFileSync(read.payloadPath, "utf-8"), read.snapshot);
 	});
 });

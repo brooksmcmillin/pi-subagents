@@ -316,6 +316,9 @@ export function retireResultSnapshot(publicPath: string, read: ResultSnapshot, p
 		for (const candidate of new Set([...resultPayloadCandidates(publicPath, read), payloadPath])) {
 			const current = readResultPayload(candidate);
 			if (current === undefined || !readByConsumer(publicPath, read, candidate, current)) continue;
+			// A public file beside pending bytes may belong to an unrelated publication.
+			if (candidate === publicPath && current !== read.snapshot && read.sessionId
+				&& !resultTextMatchesSessionRun(current, read.sessionId, read.runId)) continue;
 			try {
 				fs.rmSync(candidate, { force: true });
 			} catch (error) {
@@ -360,12 +363,20 @@ export function resultPayloadMatchesSessionRun(data: unknown, sessionId: string,
 	return (nonEmptyString(record.runId) ?? nonEmptyString(record.id)) === runId && nonEmptyString(record.sessionId) === sessionId;
 }
 
-function pendingResultPayloadMatches(filePath: string, sessionId: string, runId: string, onInaccessible?: () => void): boolean {
+function resultTextMatchesSessionRun(raw: string, sessionId: string, runId: string): boolean {
+	try {
+		return resultPayloadMatchesSessionRun(JSON.parse(raw), sessionId, runId);
+	} catch {
+		return false;
+	}
+}
+
+function resultPayloadFileMatches(filePath: string, sessionId: string, runId: string, onInaccessible?: () => void): boolean {
 	try {
 		return resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(filePath, "utf-8")), sessionId, runId);
 	} catch (error) {
 		if (onInaccessible && isStorageAccessError(error)) onInaccessible();
-		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid pending async result '${filePath}':`, error);
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Ignoring invalid async result '${filePath}':`, error);
 		return false;
 	}
 }
@@ -381,6 +392,8 @@ export function promotePendingResultFile(resultsDir: string, sessionId: string, 
 	const resultPath = path.join(resultsDir, file);
 	try {
 		if (!assertPendingResultPayloadMatches(pendingPath, sessionId, runId)) return "none";
+		const publicSnapshot = readResultPayload(resultPath);
+		if (publicSnapshot !== undefined && !resultTextMatchesSessionRun(publicSnapshot, sessionId, runId)) return "pending";
 		// POSIX rename replaces the destination atomically. Deleting it first lets a
 		// losing promoter unlink the result that another promoter just published.
 		fs.renameSync(pendingPath, resultPath);
@@ -413,19 +426,17 @@ interface ResultPayloadLocation {
 function pendingResultLocationForSessionRun(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), onInaccessible?: () => void): ResultPayloadLocation | undefined {
 	if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
 	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId), onInaccessible);
-	if (!pendingPath || !pendingResultPayloadMatches(pendingPath, sessionId, runId, onInaccessible)) return undefined;
+	if (!pendingPath || !resultPayloadFileMatches(pendingPath, sessionId, runId, onInaccessible)) return undefined;
 	return { file, path: pendingPath, state: "pending" };
 }
 
 export function fallbackResultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
-	if (!pendingPath || !assertPendingResultPayloadMatches(pendingPath, sessionId, runId)) return undefined;
-	return pendingPath;
+	return pendingResultLocationForSessionRun(resultsDir, sessionId, runId)?.path;
 }
 
 /** Any pending or public result file for the run, without validating its contents. */
-export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: string, runId: string): string | undefined {
-	return firstExistingResultFile([...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)]);
+export function resultPayloadFileForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void): string | undefined {
+	return firstExistingResultFile([...resultPendingPaths(resultsDir, sessionId, runId), resultFilePath(resultsDir, runId)], onInaccessible);
 }
 
 /** Do not infer absence from an inaccessible pending or public location. */
@@ -451,7 +462,20 @@ function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEn
 		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file, onInaccessible);
 	}
 	const resultPath = path.join(resultsDir, entry.file);
-	if (pendingState === "promoted" || existingResultFile(resultPath, onInaccessible)) return { file: entry.file, path: resultPath, state: "public" };
+	const canonical = resultFileName(entry.runId);
+	if (entry.file === canonical) {
+		return pendingState === "promoted" || existingResultFile(resultPath, onInaccessible)
+			? { file: entry.file, path: resultPath, state: "public" }
+			: undefined;
+	}
+	if (resultPayloadFileMatches(resultPath, entry.sessionId, entry.runId, onInaccessible)) {
+		return { file: entry.file, path: resultPath, state: "public" };
+	}
+	// An old alias can now belong to a different publication; look for the exact canonical result.
+	const canonicalPath = path.join(resultsDir, canonical);
+	if (resultPayloadFileMatches(canonicalPath, entry.sessionId, entry.runId, onInaccessible)) {
+		return { file: canonical, path: canonicalPath, state: "public" };
+	}
 	return undefined;
 }
 
@@ -483,8 +507,15 @@ export function indexedResultPayloadVisibility(resultsDir: string, sessionId: st
 	}
 }
 
-export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void): string | undefined {
+export function resultPayloadPathForSessionRun(resultsDir: string, sessionId: string, runId: string, onInaccessible?: () => void, options?: { promote: false }): string | undefined {
 	const entry = readResultIndexForSessionRun(resultsDir, sessionId, runId);
+	if (options?.promote === false) {
+		const pending = pendingResultLocationForSessionRun(resultsDir, sessionId, runId, undefined, onInaccessible);
+		if (pending) return pending.path;
+		if (!entry || entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
+		const indexedPath = path.join(resultsDir, entry.file);
+		return existingResultFile(indexedPath, onInaccessible) ? indexedPath : undefined;
+	}
 	return (entry ? resultPayloadLocationFromIndex(resultsDir, entry, onInaccessible) : undefined)?.path
 		?? pendingResultLocationForSessionRun(resultsDir, sessionId, runId, undefined, onInaccessible)?.path;
 }

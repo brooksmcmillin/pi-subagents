@@ -532,8 +532,9 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const runId = effectiveStatus.runId || path.basename(asyncDir);
 	const resultsDir = options.resultsDir ?? DIRS.results;
 	const resultPath = resultFilePath(resultsDir, runId);
-	const existingResultPath = effectiveStatus.sessionId
-		? resultPayloadPathForSessionRun(resultsDir, effectiveStatus.sessionId, runId) ?? (regularFileExists(resultPath) ? resultPath : undefined)
+	let existingResultPath = effectiveStatus.sessionId
+		? resultPayloadPathForSessionRun(resultsDir, effectiveStatus.sessionId, runId, undefined, options.expectedRunId ? { promote: false } : undefined)
+			?? (regularFileExists(resultPath) ? resultPath : undefined)
 		: regularFileExists(resultPath) ? resultPath : undefined;
 	const staleAfterMs = options.staleAlivePidMs ?? 24 * 60 * 60 * 1000;
 	const lastUpdate = effectiveStatus.lastUpdate ?? effectiveStatus.startedAt;
@@ -551,9 +552,14 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 		const runnerStillFinishing = effectiveStatus.state === "running" && effectiveStatus.mode !== "workflow" && typeof effectiveStatus.pid === "number"
 			&& effectiveStatus.pidNamespaceScope === observedScope
 			&& now - lastUpdate <= staleAfterMs && runnerLiveness(effectiveStatus.pid) === "alive";
-		const terminalStatus = (effectiveStatus.state === "running" || effectiveStatus.state === "queued") && !runnerStillFinishing
-			? terminalStatusFromResult(effectiveStatus, existingResultPath, now, options.expectedRunId)
-			: undefined;
+		let terminalStatus: AsyncStatus | undefined;
+		if ((effectiveStatus.state === "running" || effectiveStatus.state === "queued") && !runnerStillFinishing) {
+			terminalStatus = terminalStatusFromResult(effectiveStatus, existingResultPath, now, options.expectedRunId);
+			if (!terminalStatus && options.expectedRunId && existingResultPath !== resultPath && regularFileExists(resultPath)) {
+				terminalStatus = terminalStatusFromResult(effectiveStatus, resultPath, now, options.expectedRunId);
+				if (terminalStatus) existingResultPath = resultPath;
+			}
+		}
 		if (terminalStatus) {
 			const currentStatus = readStatus(asyncDir);
 			if (!mayWrite(currentStatus)) return rejectedReread(currentStatus);

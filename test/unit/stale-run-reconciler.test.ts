@@ -974,6 +974,53 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	for (const pendingOnly of [false, true]) it(`uses exact result bytes without promotion (pending: ${pendingOnly})`, () => {
+		const root = tempRoot("pi-stale-foreign-indexed-destination-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const alias = path.join(resultsDir, "indexed-alias.json");
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", pid: 12345, startedAt: 1000 });
+			const owned = { id: "dead", sessionId: "parent", success: true };
+			if (pendingOnly) writePendingAsyncResultFile(alias, owned);
+			else writeAsyncResultFile(alias, owned);
+			if (pendingOnly) fs.writeFileSync(alias, JSON.stringify({ id: "unrelated", sessionId: "other-session", success: true }));
+			const original = fs.readFileSync(alias, "utf-8");
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir, kill: () => { throw errno("ESRCH"); } });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "complete");
+			assert.ok(result.resultPath);
+			assert.equal(result.resultPath === alias, !pendingOnly);
+			assert.deepEqual(JSON.parse(fs.readFileSync(result.resultPath, "utf-8")), owned);
+			assert.equal(fs.readFileSync(alias, "utf-8"), original);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs from the canonical result when the indexed alias belongs to another session", () => {
+		const root = tempRoot("pi-stale-canonical-fallback-");
+		try {
+			const asyncDir = path.join(root, "dead");
+			const resultsDir = path.join(root, "results");
+			const canonical = path.join(resultsDir, "dead.json");
+			const alias = path.join(resultsDir, "indexed-alias.json");
+			writeStatus(asyncDir, { runId: "dead", sessionId: "parent", mode: "single", state: "running", startedAt: 1000 });
+			const owned = { id: "dead", sessionId: "parent", success: true };
+			writeAsyncResultFile(alias, owned);
+			fs.renameSync(alias, canonical);
+			const foreign = JSON.stringify({ ...owned, sessionId: "other-session" });
+			fs.writeFileSync(alias, foreign);
+			const result = reconcileAsyncRun(asyncDir, { expectedRunId: "dead", expectedSessionId: "parent", resultsDir });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "complete");
+			assert.equal(result.resultPath, canonical);
+			assert.equal(fs.readFileSync(alias, "utf-8"), foreign);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves an existing result instead of overwriting it with stale-run failure", () => {
 		const root = tempRoot("pi-stale-existing-result-");
 		try {

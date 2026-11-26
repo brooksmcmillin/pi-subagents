@@ -15,6 +15,7 @@ import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
 import { recordSessionReplacement, recordSessionStart } from "../../src/shared/session-succession.ts";
 import { missionObserverIndexPath, resultPayloadPathForMissionObserverRun, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { tryLease } from "../../src/shared/file-lease.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
 import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
@@ -1209,7 +1210,7 @@ describe("result watcher", () => {
 		state.currentSessionId = initial.sessionId;
 		if (seen) state.completionSeen.set(buildCompletionKey(initial, `result:${file}`), Date.now());
 		const order: string[] = [];
-		const replace = () => writeIndexedResult(resultPath, { ...initial, id: "replacement", runId: "replacement", summary: "replacement" });
+		const replace = () => fs.writeFileSync(resultPath, JSON.stringify({ ...initial, completionOwnerId: COMPLETION_OWNER_ID, id: "replacement", runId: "replacement", summary: "replacement" }));
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event, data) {
 			if (!seen && event === SUBAGENT_ASYNC_COMPLETE_EVENT && (data as { summary?: string }).summary === "seen") replace();
 		} } }, state, resultsDir, 60_000, {
@@ -1447,6 +1448,71 @@ describe("result watcher", () => {
 			assert.equal(fs.existsSync(path.join(resultsDir, "stale-0.json")), true);
 		} finally {
 			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	for (const scenario of ["pending canonical collision", "pending alias collision", "public canonical with stale alias"]) it(`delivers the reconciled result without changing foreign bytes: ${scenario}`, async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-foreign-alias-"));
+		const resultsDir = path.join(root, "results");
+		const asyncDir = path.join(root, "async");
+		const canonical = path.join(resultsDir, "canonical-run.json");
+		const output = scenario === "pending canonical collision" ? canonical : path.join(resultsDir, "indexed-alias.json");
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const delivered: string[] = [];
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			notifier: { async deliver(result) { delivered.push(result.runId); return true; } },
+		});
+		try {
+			fs.mkdirSync(asyncDir);
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "canonical-run", sessionId: "session-current", mode: "single", state: "running", startedAt: 1 }));
+			const owned = { id: "canonical-run", sessionId: "session-current", success: true, completionOwnerId: COMPLETION_OWNER_ID };
+			if (scenario === "public canonical with stale alias") {
+				writeAsyncResultFile(output, owned);
+				fs.renameSync(output, canonical);
+			} else {
+				writePendingAsyncResultFile(output, owned);
+			}
+			const foreign = JSON.stringify({ id: "other-run", sessionId: "other-session", success: true });
+			fs.writeFileSync(output, foreign);
+			const repaired = reconcileAsyncRun(asyncDir, { expectedRunId: "canonical-run", expectedSessionId: "session-current", resultsDir });
+			assert.equal(repaired.status?.state, "complete");
+			assert.ok(repaired.resultPath && repaired.resultPath !== output);
+			await watcher.deliverPendingResults();
+			assert.deepEqual(delivered, ["canonical-run"]);
+			assert.equal(fs.readFileSync(output, "utf-8"), foreign);
+			assert.equal(fs.existsSync(repaired.resultPath), false);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("marks and retires the indexed public alias reached by run id on first delivery", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-public-alias-"));
+		const state = createState();
+		state.currentSessionId = "session-current";
+		const alias = path.join(resultsDir, "public-alias.json");
+		const canonical = path.join(resultsDir, "canonical-run.json");
+		let delivered = 0;
+		let markedAtAlias: unknown;
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
+			if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) markedAtAlias = JSON.parse(fs.readFileSync(alias, "utf-8")).notificationDeliveredAt;
+		} } }, state, resultsDir, 60_000, {
+			observedCompletionRunIds: () => ["canonical-run"],
+			notifier: { async deliver() { delivered++; return true; } },
+		});
+		try {
+			writeIndexedResult(alias, { id: "canonical-run", runId: "canonical-run", sessionId: "session-current", success: true, summary: "done" });
+			fs.rmSync(path.join(resultsDir, "result-index", "sessions"), { recursive: true });
+			await watcher.deliverPendingResults();
+			assert.equal(delivered, 1);
+			assert.equal(typeof markedAtAlias, "number");
+			assert.equal(fs.existsSync(alias), false);
+			assert.equal(fs.existsSync(canonical), false);
+		} finally {
+			watcher.stopResultWatcher();
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});

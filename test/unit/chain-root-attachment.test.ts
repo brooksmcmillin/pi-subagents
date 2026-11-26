@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import fsDefault from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -93,6 +95,36 @@ describe("async chain root attachment", () => {
 
 		assert.equal(result.output, "pending root output");
 		assert.equal(result.exitCode, 0);
+	});
+
+	it("retries a transient completion-index read error while attaching", async (t) => {
+		const importedRoot = root();
+		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
+			runId: importedRoot.runId, mode: "single", sessionId: "session-a", state: "complete", startedAt: 1,
+			steps: [{ agent: "worker", status: "complete" }],
+		});
+		const read = fs.readFileSync;
+		let denied = false;
+		t.mock.method(fsDefault, "readFileSync", (file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+			if (!denied && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+				denied = true;
+				throw Object.assign(new Error("completion index unavailable"), { code: "EIO" });
+			}
+			return Reflect.apply(read, fs, [file, ...args]);
+		});
+		syncBuiltinESMExports();
+		try {
+			const waiting = waitForImportedAsyncRoot(importedRoot, { pollIntervalMs: 1 });
+			assert.equal(denied, true);
+			writePendingAsyncResultFile(importedRoot.resultPath, {
+				id: importedRoot.runId, sessionId: "session-a", state: "complete", success: true,
+				results: [{ agent: "worker", output: "recovered pending result", success: true }],
+			});
+			assert.equal((await waiting).output, "recovered pending result");
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		}
 	});
 
 	it("waits for a running async child to write its terminal result", async () => {

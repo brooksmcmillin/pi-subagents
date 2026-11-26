@@ -702,7 +702,7 @@ export function createResultWatcher(
 			// A newer payload replaced this one; keep the hold until that one is delivered.
 			if (markReplacedPayload()) return;
 			try {
-				const marked = markDeliveredNotification(publicResultPath(file), data, read, Date.now());
+				const marked = markDeliveredNotification(publicPathFor(resultPath), data, read, Date.now());
 				identityCache.delete(file);
 				if (!marked) {
 					rereadReplacedPayload = true;
