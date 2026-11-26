@@ -507,7 +507,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("cancels terminal cleanup when an independent nested child appears late", async () => {
+	for (const reloadBeforeRefresh of [false, true]) it(`retains late independent work ${reloadBeforeRefresh ? "before its first refresh" : "after it cancels terminal cleanup"}`, async () => {
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
 		const route = createNestedRoute("tracked-async-owner-close");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -537,10 +537,14 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			await waitForCondition(() => state.cleanupTimers.has(route.rootRunId), "terminal cleanup armed");
 			assert.equal(hasLiveSubagentWork(state), false, "stranded foreground activity does not hold cleanup");
 			writeNestedEvent(route, { type: "subagent.nested.started", ts: 201, parentRunId: independent.parentRunId, child: independent });
-			await waitForCondition(() => hasLiveSubagentWork(state), "late independent work observed");
-			assert.equal(state.cleanupTimers.has(route.rootRunId), false);
-			await new Promise((resolve) => setTimeout(resolve, retentionMs));
-			assert.equal(hasLiveSubagentWork(state), true, "independent work survives the old cleanup deadline");
+			if (reloadBeforeRefresh) {
+				assert.equal(hasLiveSubagentWork(state), false, "old tracker has not seen the child yet");
+			} else {
+				await waitForCondition(() => hasLiveSubagentWork(state), "late independent work observed");
+				assert.equal(state.cleanupTimers.has(route.rootRunId), false);
+				await new Promise((resolve) => setTimeout(resolve, retentionMs));
+				assert.equal(hasLiveSubagentWork(state), true, "independent work survives the old cleanup deadline");
+			}
 			assert.equal(terminalNotices, 1);
 			fs.rmSync(resultPath); // Result consumer has delivered and retired the payload.
 			updateActiveRunIndex(asyncDir, "failed");

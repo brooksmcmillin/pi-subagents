@@ -22,7 +22,7 @@ import {
 import { isStatusAccessError, readStatus, resolveWatchPath } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { findNestedRouteForRootId, hasLiveNestedDescendants, hasLiveOwnedNestedWork, projectNestedEvents, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
 import { listAsyncRuns, summarizeAsyncStatus, type AsyncRunSummary } from "./async-status.ts";
 import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
@@ -942,8 +942,19 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			for (const runId of options.getOwedResultRunIds?.() ?? []) if (!runs.has(runId)) runs.set(runId, { pending: true });
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
 			for (const job of state.asyncJobs.values()) {
-				if (!runs.has(job.asyncId) && job.nestedWorkActive && isTerminalJobStatus(job.status)
-					&& ownsRun(publicationSession.id, job.sessionId)) runs.set(job.asyncId, { pending: false });
+				if (runs.has(job.asyncId) || !isTerminalJobStatus(job.status) || !ownsRun(publicationSession.id, job.sessionId)) continue;
+				const route = job.nestedRoute;
+				let nestedActive = job.nestedWorkActive;
+				if (route?.rootRunId === job.asyncId && path.basename(job.asyncDir) === job.asyncId) {
+					try {
+						nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children,
+							readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed");
+					} catch {
+						// The replacement can retry the exact owned route if it is temporarily unreadable.
+						nestedActive = true;
+					}
+				}
+				if (nestedActive) runs.set(job.asyncId, { pending: false });
 			}
 			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}

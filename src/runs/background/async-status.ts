@@ -588,13 +588,15 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		try {
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
 			let owned = false;
-			if (owners) {
+			const verifyMarker = options.includeTerminalPublication && activeEntries.has(entry);
+			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
-				if (stored && !owners.has(stored.sessionId)) {
+				if (verifyMarker && stored && !isActiveAsyncState(stored.state) && stored.runId !== entry) continue;
+				if (stored && owners && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);
 					continue;
 				}
-				owned = stored !== null;
+				owned = Boolean(owners && stored);
 			}
 			// Only a run this session owns may adopt the caller's completion owner.
 			const reconciliation = options.reconcile === false

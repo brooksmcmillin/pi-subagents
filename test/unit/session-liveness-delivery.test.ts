@@ -28,6 +28,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { ACTIVE_RUN_INDEX_DIR, readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
 	import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "./src/runs/shared/nested-events.ts";
 	import { reconcileNestedAsyncDescendants } from "./src/runs/background/stale-run-reconciler.ts";
+	import { listAsyncRuns } from "./src/runs/background/async-status.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
 	// so a terminal status is observed before the result file exists.
@@ -143,6 +144,14 @@ const terminalBeforePublicationScript = String.raw`
 			child: { id: "nested-child", parentRunId: "different-run", depth: 1, path: [{ runId: "different-run" }], agent: "worker", state: "running", asyncDir: childDir } });
 		writeAtomicJson(path.join(childDir, "status.json"), { runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
 			steps: [{ agent: "worker", status: "failed" }] });
+		const resultsDir = path.join(TEMP_ROOT_DIR, "mismatch-results");
+		const publicPath = resultFilePath(resultsDir, unrelatedRoute.rootRunId);
+		writePendingAsyncResultFile(publicPath, { id: unrelatedRoute.rootRunId, sessionId, completionOwnerId, state: "complete", success: true, timestamp: Date.now() });
+		const pendingDir = path.join(resultsDir, "result-pending", sessionId);
+		assert.ok(fs.readdirSync(pendingDir).includes("different-run.json"));
+		listAsyncRuns(DIRS.async, { states: ["queued", "running"], includeTerminalPublication: true, sessionId, resultsDir });
+		assert.ok(fs.readdirSync(pendingDir).includes("different-run.json"), "unrelated payload stays pending during listing");
+		assert.equal(fs.existsSync(publicPath), false);
 	}
 	const restoreStat = fsDefault.statSync;
 	let restoredRefreshDenied = false;
