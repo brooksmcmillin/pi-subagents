@@ -12,6 +12,7 @@ import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-
 import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { currentPidNamespaceScope } from "../../src/runs/background/pid-namespace.ts";
 import { resultFilePath, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
@@ -625,7 +626,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			const proof = { version: 1, state: "observed", runId: route.rootRunId, runnerProcessInstanceId: "runner", observedAt: 200,
 				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 200, exitCode: 1, signal: null }] };
 			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
-			const writeRoot = (state: "running" | "failed") => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", state, mode: "single", startedAt: Date.now(), lastUpdate: Date.now(), ...(state === "failed" ? { processTerminal: proof } : { pid: process.pid }) }));
+			const writeRoot = (state: "running" | "failed") => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", state, mode: "single", startedAt: Date.now(), lastUpdate: Date.now(), ...(state === "failed" ? { processTerminal: proof } : { pid: process.pid, pidNamespaceScope: currentPidNamespaceScope() }) }));
 			writeRoot(rootStillRunning ? "running" : "failed");
 			tracker.restoreActiveJobs(ctx);
 			updateActiveRunIndex(asyncDir, "running");
