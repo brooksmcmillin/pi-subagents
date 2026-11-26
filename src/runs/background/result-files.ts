@@ -89,9 +89,9 @@ function pendingSessionDirs(resultsDir: string, sessionId: string): string[] {
 	return indexSegmentAliases(sessionId).map((segment) => path.join(resultsDir, RESULT_PENDING_DIR, segment));
 }
 
-function firstExistingResultFile(paths: string[]): string | undefined {
+function firstExistingResultFile(paths: string[], onInaccessible?: () => void): string | undefined {
 	for (const filePath of paths) {
-		if (existingResultFile(filePath)) return filePath;
+		if (existingResultFile(filePath, onInaccessible)) return filePath;
 	}
 	return undefined;
 }
@@ -340,11 +340,12 @@ export function acknowledgeMissionObserverSnapshot(publicPath: string, read: Res
 	}, leaseWaitMs);
 }
 
-function existingResultFile(resultPath: string): boolean {
+function existingResultFile(resultPath: string, onInaccessible?: () => void): boolean {
 	try {
 		return fs.statSync(resultPath).isFile();
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Failed to inspect async result payload '${resultPath}':`, error);
+		if (onInaccessible && isStorageAccessError(error)) onInaccessible();
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !isUnaddressableResultCandidate(error)) console.error(`Failed to inspect async result payload '${resultPath}':`, error);
 		return false;
 	}
 }
@@ -372,9 +373,9 @@ function assertPendingResultPayloadMatches(filePath: string, sessionId: string, 
 	return resultPayloadMatchesSessionRun(JSON.parse(fs.readFileSync(filePath, "utf-8")), sessionId, runId);
 }
 
-export function promotePendingResultFile(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), options: { logFailure?: boolean } = {}): "none" | "promoted" | "pending" {
+export function promotePendingResultFile(resultsDir: string, sessionId: string, runId: string, file = resultFileName(runId), options: { logFailure?: boolean; onInaccessible?: () => void } = {}): "none" | "promoted" | "pending" {
 	if (file !== path.basename(file) || !file.endsWith(".json")) return "none";
-	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId));
+	const pendingPath = firstExistingResultFile(resultPendingPaths(resultsDir, sessionId, runId), options.onInaccessible);
 	if (!pendingPath) return "none";
 	const resultPath = path.join(resultsDir, file);
 	try {
@@ -382,13 +383,13 @@ export function promotePendingResultFile(resultsDir: string, sessionId: string, 
 		// POSIX rename replaces the destination atomically. Deleting it first lets a
 		// losing promoter unlink the result that another promoter just published.
 		fs.renameSync(pendingPath, resultPath);
-		return existingResultFile(resultPath) ? "promoted" : "pending";
+		return existingResultFile(resultPath, options.onInaccessible) ? "promoted" : "pending";
 	} catch (error) {
 		if (error instanceof SyntaxError) return "none";
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "EEXIST" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) {
-			const pendingExists = existingResultFile(pendingPath);
-			const resultExists = existingResultFile(resultPath);
+			const pendingExists = existingResultFile(pendingPath, options.onInaccessible);
+			const resultExists = existingResultFile(resultPath, options.onInaccessible);
 			if (pendingExists) {
 				if (!resultExists && options.logFailure !== false && !isUnaddressableResultCandidate(error)) console.error(`Failed to promote pending async result '${pendingPath}' to '${resultPath}':`, error);
 				return "pending";
@@ -442,14 +443,14 @@ export function resultPayloadVisibility(resultsDir: string, sessionId: string, r
 	return unknown ? "unknown" : "absent";
 }
 
-function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEntry): ResultPayloadLocation | undefined {
+function resultPayloadLocationFromIndex(resultsDir: string, entry: ResultIndexEntry, onInaccessible?: () => void): ResultPayloadLocation | undefined {
 	if (entry.file !== path.basename(entry.file) || !entry.file.endsWith(".json")) return undefined;
-	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file);
+	const pendingState = promotePendingResultFile(resultsDir, entry.sessionId, entry.runId, entry.file, { onInaccessible });
 	if (pendingState === "pending") {
 		return pendingResultLocationForSessionRun(resultsDir, entry.sessionId, entry.runId, entry.file);
 	}
 	const resultPath = path.join(resultsDir, entry.file);
-	if (pendingState === "promoted" || existingResultFile(resultPath)) return { file: entry.file, path: resultPath, state: "public" };
+	if (pendingState === "promoted" || existingResultFile(resultPath, onInaccessible)) return { file: entry.file, path: resultPath, state: "public" };
 	return undefined;
 }
 
@@ -523,8 +524,8 @@ export function resultPayloadPathForIndexedRun(resultsDir: string, runId: string
 	return undefined;
 }
 
-function indexedResultFile(resultsDir: string, entry: ResultIndexEntry, includePending = false): string | undefined {
-	const location = resultPayloadLocationFromIndex(resultsDir, entry);
+function indexedResultFile(resultsDir: string, entry: ResultIndexEntry, includePending = false, onInaccessible?: () => void): string | undefined {
+	const location = resultPayloadLocationFromIndex(resultsDir, entry, onInaccessible);
 	if (!location) return undefined;
 	return includePending || location.state === "public" ? location.file : undefined;
 }
@@ -547,16 +548,16 @@ function listIndexFiles(dir: string, onUnreadableDirectory?: () => void): string
 	return files;
 }
 
-function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void, onUnreadableDirectory?: () => void): string[] {
+function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void, onIncompleteDiscovery?: () => void): string[] {
 	const candidates = new Set<string>();
-	for (const entryPath of listIndexFiles(dir, onUnreadableDirectory)) {
+	for (const entryPath of listIndexFiles(dir, onIncompleteDiscovery)) {
 		try {
 			const entry = parseResultIndexEntry(JSON.parse(fs.readFileSync(entryPath, "utf-8")));
 			if (!entry) {
 				fs.rmSync(entryPath, { force: true });
 				continue;
 			}
-			const resultFile = indexedResultFile(resultsDir, entry, includePending);
+			const resultFile = indexedResultFile(resultsDir, entry, includePending, onIncompleteDiscovery);
 			if (resultFile) candidates.add(resultFile);
 		} catch (error) {
 			if (isStorageAccessError(error)) onUnreadableEntry?.(path.basename(entryPath));
