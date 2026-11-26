@@ -494,6 +494,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			refreshResultDelivery();
 			programStatus.sync();
 		},
+		getOwedResultRunIds: () => owedResultRunIds,
 		onJobCleanup: (asyncId) => deliveredRunIds.delete(asyncId),
 		deliveryOwnerId: resultDeliveryOwnership.deliveryOwnerId,
 		supervisorRequestState: supervisorChannel.getSupervisorRequestState,

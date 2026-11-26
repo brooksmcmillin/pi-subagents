@@ -24,7 +24,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
 	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
-	import { readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+	import { ACTIVE_RUN_INDEX_DIR, readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
 	// so a terminal status is observed before the result file exists.
@@ -74,8 +74,9 @@ const terminalBeforePublicationScript = String.raw`
 		register(value) { provider = value; return () => {}; },
 	};
 	const workflowReload = process.argv[1] === "workflow-reload";
-	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload;
-	const restoredCase = process.argv[1] === "restored" || (repeatReload && !workflowReload);
+	const publishedReload = process.argv[1] === "published-reload";
+	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload";
 	const closedFirst = process.argv[1] === "closed-first";
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
@@ -91,7 +92,7 @@ const terminalBeforePublicationScript = String.raw`
 	}
 	const ctx = {
 		cwd: process.cwd(), hasUI: tui, mode: tui ? "tui" : undefined, model: undefined, isIdle() { return false; },
-		ui: { setBackgroundWork(_key, active) { holds.push(active); }, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+		ui: { setBackgroundWork(_key, active) { holds.push(active); }, notify() {}, setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
 	};
@@ -116,6 +117,7 @@ const terminalBeforePublicationScript = String.raw`
 	const publishResult = (pending = false) => (pending ? writePendingAsyncResultFile : writeAsyncResultFile)(resultFilePath(DIRS.results, runId), {
 		id: runId, runId, agent: "worker", mode: "single", state: "complete", success: true, exitCode: 0,
 		summary: "child complete", timestamp: Date.now(), sessionId, completionOwnerId,
+		...(publishedReload ? { triggerTurn: false } : {}),
 	});
 
 	registerSubagentExtension(pi);
@@ -134,36 +136,65 @@ const terminalBeforePublicationScript = String.raw`
 	if (repeatReload) {
 		const proof = exitProof();
 		const stat = fsDefault.statSync;
+		const readdir = fsDefault.readdirSync;
+		let listingDenied = false;
+		let denyListing = false;
 		let denyStatus = false;
 		let statusDenied = false;
+		fsDefault.readdirSync = (dir, ...args) => {
+			if (denyListing && String(dir) === path.join(DIRS.async, ACTIVE_RUN_INDEX_DIR)) {
+				listingDenied = true;
+				throw Object.assign(new Error("active listing inaccessible"), { code: "EACCES" });
+			}
+			return readdir(dir, ...args);
+		};
+		let denyResult = !publishedReload;
 		fsDefault.statSync = (file, ...args) => {
 			if (denyStatus && String(file) === path.join(asyncDir, "status.json")) {
 				statusDenied = true;
 				throw Object.assign(new Error("temporarily inaccessible status"), { code: "EACCES" });
 			}
-			if (String(file).includes("result-pending")) throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+			if (denyResult && (String(file).includes("result-pending") || (publishedReload && String(file) === resultFilePath(DIRS.results, runId)))) {
+				throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+			}
 			return stat(file, ...args);
 		};
 		syncBuiltinESMExports();
 		try {
 			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
 			writeStatus("complete", proof);
-			if (workflowReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, state: "complete", success: true, triggerTurn: false });
+			if (publishedReload) publishResult();
+			if (workflowReload || publishedReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+			denyResult = true;
 			assert.equal(readActiveRunIndex(DIRS.async)?.includes(runId), false);
 			for (let i = 0; i < 2; i++) {
 				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
 				handlers.clear();
 				holds.length = 0;
-				denyStatus = i === 0 && !workflowReload;
+				denyStatus = i === 0 && !workflowReload && !publishedReload;
+				denyListing = i === 0 && publishedReload;
 				registerSubagentExtension(pi);
 				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
 				if (denyStatus) assert.equal(statusDenied, true);
+				if (denyListing) assert.equal(listingDenied, true);
 				assert.deepEqual(holds, [true]);
 				assert.equal(provider.isActive(), true);
 			}
 		} finally {
 			fsDefault.statSync = stat;
+			fsDefault.readdirSync = readdir;
 			syncBuiltinESMExports();
+		}
+		if (publishedReload) {
+			ctx.isIdle = () => true;
+			rejectNextSend = false;
+			const sent = nextSend();
+			publishResult();
+			const accepted = await sent;
+			assert.equal(accepted.rejected, false);
+			for (const handler of handlers.get("agent_start")) handler({}, ctx);
+			for (const handler of handlers.get("message_start")) handler({ message: { role: "custom", ...accepted.message } });
+			for (const handler of handlers.get("agent_settled") ?? []) await handler({}, ctx);
 		}
 		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.equal(provider.isActive(), false);
@@ -292,6 +323,7 @@ describe("session liveness through result delivery", () => {
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
+		["published-reload", "published delivery remains held on reload even when active listing fails"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

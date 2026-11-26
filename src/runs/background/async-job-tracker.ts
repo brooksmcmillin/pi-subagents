@@ -47,6 +47,7 @@ interface AsyncJobTrackerOptions {
 	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
 	onJobTerminal?: (job: AsyncJobState, publicationClosed: boolean) => void;
+	getOwedResultRunIds?: () => Iterable<string>;
 	onJobCleanup?: (asyncId: string) => void;
 	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
 	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
@@ -508,6 +509,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
 					job.completionOwnerId = ownerId;
 					terminalPublications.set(job.asyncId, pending);
+					// Restore the delivery hold before reconciliation touches the payload.
+					if (isTerminalJobStatus(stored.state)) options.onJobTerminal?.(job, false);
 				}
 				unverifiedPublications.delete(job.asyncId);
 			}
@@ -928,6 +931,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const dispose = (shutdownReason?: string) => {
 		if (shutdownReason === "reload" && publicationSession) {
 			const runs = new Map(unverifiedPublications);
+			for (const runId of options.getOwedResultRunIds?.() ?? []) if (!runs.has(runId)) runs.set(runId, { pending: true });
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
 			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}
@@ -972,8 +976,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (!state.currentSessionId) return;
 		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
 		const handoff = publicationSession && reloadPublications.get(publicationSession.manager);
-		if (publicationSession) reloadPublications.delete(publicationSession.manager);
-		let runs: AsyncRunSummary[];
+		let runs: AsyncRunSummary[] = [];
 		const unreadable: Array<{ runId: string; asyncDir: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
@@ -983,7 +986,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
-			return;
+			// Exact handoff entries do not depend on the active index being readable.
 		}
 		const pending = handoff?.sessionId === state.currentSessionId ? handoff.runs : undefined;
 		if (pending) for (const [runId, publication] of pending) {
@@ -996,6 +999,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			refreshJob(job);
 			if (state.asyncJobs.has(runId)) watchJob(job);
 		}
+		if (publicationSession) reloadPublications.delete(publicationSession.manager);
 		for (const run of runs) {
 			if (pending?.has(run.id)) continue;
 			const job = summaryToJob(run);

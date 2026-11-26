@@ -148,6 +148,7 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 	const now = options.now ?? Date.now;
 	let lastQueuedWake: string | undefined;
 	let queuedWakeDeadline = 0;
+	let queuedWakeExpired = false;
 	// A request counts as waiting on the user only after the parent settled without answering it.
 	let unansweredAtSettle = new Set<string>();
 	// Pi clears every OSC 7501 record when it suspends on Ctrl+Z and re-reports only its own root
@@ -165,11 +166,15 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 		const queuedWake = options.getQueuedWake?.();
 		const pendingParentWake = options.hasPendingWake?.();
 		const queuedWakePreparing = queuedWake !== undefined && options.isParentPreparing?.();
-		if (queuedWake !== lastQueuedWake || !parentIdle || pendingParentWake || queuedWakePreparing) {
+		if (queuedWake !== lastQueuedWake) {
 			lastQueuedWake = queuedWake;
+			queuedWakeExpired = false;
+			queuedWakeDeadline = now() + WAKE_PENDING_MS;
+		} else if (!queuedWakeExpired && (!parentIdle || pendingParentWake || queuedWakePreparing)) {
 			queuedWakeDeadline = now() + WAKE_PENDING_MS;
 		}
-		const pendingWake = pendingParentWake || (queuedWake !== undefined && now() < queuedWakeDeadline);
+		if (queuedWake !== undefined && now() >= queuedWakeDeadline) queuedWakeExpired = true;
+		const pendingWake = pendingParentWake || (queuedWake !== undefined && !queuedWakeExpired);
 		if (parentIdle && pendingWake) {
 			if (!wakeRefresh) {
 				wakeRefresh = setTimeout(() => {
@@ -241,7 +246,7 @@ export function registerProgramStatusReporter(options: ProgramStatusReporterOpti
 		},
 		agentSettled() {
 			// A busy turn can queue a wake long before delivering it at the next boundary.
-			if (!parentIdle && options.getQueuedWake?.() !== undefined) {
+			if (!parentIdle && !queuedWakeExpired && options.getQueuedWake?.() !== undefined) {
 				queuedWakeDeadline = now() + WAKE_PENDING_MS;
 			}
 			parentIdle = true;

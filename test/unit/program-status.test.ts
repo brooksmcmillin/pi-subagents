@@ -261,6 +261,22 @@ describe("OSC 7501 program status", () => {
 		assert.equal(records().at(-1)?.state, "done");
 	});
 
+	it("does not rearm an expired queued wake on an unrelated turn", () => {
+		let now = 0;
+		let queued = "first";
+		const { instance, holds } = reporter({ getQueuedWake: () => queued, now: () => now });
+		now += 60_000;
+		instance.sync();
+		assert.deepEqual(holds, [true, false]);
+		instance.agentStarted();
+		instance.agentSettled();
+		assert.deepEqual(holds, [true, false]);
+		queued = "second";
+		instance.sync();
+		assert.deepEqual(holds, [true, false, true]);
+		instance.dispose("quit");
+	});
+
 	it("reports blocked only while the parent is idle after settling without answering the request", () => {
 		const { instance, records, pending } = reporter({ jobs: [job("run-a", "running")] });
 		pending.push({ id: "req-1", runId: "run-a" });
