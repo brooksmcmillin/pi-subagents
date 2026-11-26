@@ -529,7 +529,7 @@ function indexedResultFile(resultsDir: string, entry: ResultIndexEntry, includeP
 	return includePending || location.state === "public" ? location.file : undefined;
 }
 
-function listIndexFiles(dir: string): string[] {
+function listIndexFiles(dir: string, onUnreadableDirectory?: () => void): string[] {
 	let files: string[];
 	try {
 		files = fs.readdirSync(dir, { withFileTypes: true })
@@ -537,15 +537,19 @@ function listIndexFiles(dir: string): string[] {
 			.map((entry) => path.join(dir, entry.name));
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
+		if (onUnreadableDirectory && isStorageAccessError(error)) {
+			onUnreadableDirectory();
+			return [];
+		}
 		if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) return [];
 		throw error;
 	}
 	return files;
 }
 
-function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void): string[] {
+function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending = false, onUnreadableEntry?: (file: string) => void, onUnreadableDirectory?: () => void): string[] {
 	const candidates = new Set<string>();
-	for (const entryPath of listIndexFiles(dir)) {
+	for (const entryPath of listIndexFiles(dir, onUnreadableDirectory)) {
 		try {
 			const entry = parseResultIndexEntry(JSON.parse(fs.readFileSync(entryPath, "utf-8")));
 			if (!entry) {
@@ -577,6 +581,10 @@ function pendingResultFilesForSession(resultsDir: string, sessionId: string, onU
 		try {
 			entries = fs.readdirSync(dir, { withFileTypes: true });
 		} catch (error) {
+			if (onUnreadablePending && isStorageAccessError(error)) {
+				onUnreadablePending();
+				continue;
+			}
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) continue;
 			throw error;
@@ -597,12 +605,12 @@ function pendingResultFilesForSession(resultsDir: string, sessionId: string, onU
 	return [...files];
 }
 
-export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void, onUnreadablePending?: () => void): string[] {
+export function resultCandidateFilesForSession(resultsDir: string, sessionId: string, onUnreadableEntry?: (file: string) => void, onIncompleteDiscovery?: () => void): string[] {
 	const files = new Set<string>();
 	for (const dir of sessionIndexDirs(resultsDir, sessionId)) {
-		for (const file of resultFilesFromIndexDir(resultsDir, dir, true, onUnreadableEntry)) files.add(file);
+		for (const file of resultFilesFromIndexDir(resultsDir, dir, true, onUnreadableEntry, onIncompleteDiscovery)) files.add(file);
 	}
-	for (const file of pendingResultFilesForSession(resultsDir, sessionId, onUnreadablePending)) files.add(file);
+	for (const file of pendingResultFilesForSession(resultsDir, sessionId, onIncompleteDiscovery)) files.add(file);
 	return [...files];
 }
 

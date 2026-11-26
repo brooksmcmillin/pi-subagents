@@ -2942,8 +2942,9 @@ describe("result watcher", () => {
 		assert.equal(denied, previousDenials);
 	});
 
-	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
+	for (const failure of ["index", "payload", "index with nested ownership fields", "pending-only index", "pending-only payload", "index directory", "pending-only directory"]) it(`retries the sole macOS startup result when its ${failure} is unreadable`, async (t) => {
 		const pendingOnly = failure.startsWith("pending-only");
+		const failListing = failure.endsWith("directory");
 		const failPayload = failure.endsWith("payload");
 		const hasNestedOwner = failure === "index with nested ownership fields";
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-startup-eio-"));
@@ -2959,31 +2960,44 @@ describe("result watcher", () => {
 				structuredOutput: { parentWorkflowRunId: "not-the-parent" } }));
 		}
 		const read = fsDefault.readFileSync;
+		const readdir = fsDefault.readdirSync;
 		let failing = true;
 		let denials = 0;
 		fsDefault.readFileSync = ((file, ...args) => {
-			if (failing && (failPayload ? (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output) : String(file).includes(`${path.sep}result-index${path.sep}`))) {
+			if (failing && !failListing && (failPayload ? (pendingOnly ? String(file).includes(`${path.sep}result-pending${path.sep}`) : file === output) : String(file).includes(`${path.sep}result-index${path.sep}`))) {
 				denials++;
 				throw Object.assign(new Error("index unreadable"), { code: "EIO" });
 			}
 			return read(file, ...args);
 		}) as typeof fs.readFileSync;
+		if (failListing) {
+			const inaccessibleRoot = (pendingOnly ? path.join(resultsDir, "result-pending") : path.join(resultsDir, "result-index", "sessions")) + path.sep;
+			if (pendingOnly) fs.rmSync(path.join(resultsDir, "result-index"), { recursive: true, force: true });
+			fsDefault.readdirSync = ((file, options) => {
+				if (failing && String(file).startsWith(inaccessibleRoot)) {
+					denials++;
+					throw Object.assign(new Error("directory listing unavailable"), { code: pendingOnly ? "EACCES" : "EIO" });
+				}
+				return Reflect.apply(readdir, fsDefault, [file, options]);
+			}) as typeof fs.readdirSync;
+		}
 		syncBuiltinESMExports();
 		let delivered = 0;
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
 			platform: "darwin", ...(hasNestedOwner ? { ownership: createResultDeliveryOwnership(state) } : {}),
+			timers: { setTimeout: (callback, delay) => setTimeout(callback, Math.min(delay ?? 0, 100)) },
 			notifier: { deliver: async () => { delivered++; return true; } },
 		});
-		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
+		t.after(() => { watcher.stopResultWatcher(); fsDefault.readFileSync = read; fsDefault.readdirSync = readdir; syncBuiltinESMExports(); fs.rmSync(resultsDir, { recursive: true, force: true }); });
 		watcher.startResultWatcher();
 		if (hasNestedOwner) assert.equal(watcher.hasPendingResults(), true, "switch uses only top-level ownership fields");
 		watcher.primeExistingResults();
 		assert.equal(state.asyncJobs.size, 0);
-		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload && !pendingOnly);
+		assert.equal(watcher.hasQueuedOwnedResults(), !failListing && !failPayload && !pendingOnly);
 		const startupDenials = denials;
 		assert.ok(startupDenials > 0);
 		assert.equal(await waitForPredicate(() => denials > startupDenials, 4500), true, "first retry still sees EIO");
-		assert.equal(watcher.hasQueuedOwnedResults(), !failPayload && !pendingOnly);
+		assert.equal(watcher.hasQueuedOwnedResults(), !failListing && !failPayload && !pendingOnly);
 		assert.equal(delivered, 0);
 		failing = false;
 		assert.equal(await waitForPredicate(() => delivered === 1 && !watcher.hasQueuedOwnedResults(), 4500), true);
