@@ -136,7 +136,7 @@ function isNotFoundError(error: unknown): boolean {
 
 export function isStorageAccessError(error: unknown): boolean {
 	const errno = error as (NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) | null | undefined;
-	return [errno?.code, errno?.cause?.code].some((code) => code === "EACCES" || code === "EPERM");
+	return [errno?.code, errno?.cause?.code].some((code) => code === "EACCES" || code === "EPERM" || code === "EIO");
 }
 
 /** A transient I/O error on the run's own status file says nothing about whether its runner is alive. */

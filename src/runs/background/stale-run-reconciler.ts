@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
+import { resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
@@ -132,9 +132,10 @@ function regularFileExists(filePath: string): boolean {
 	}
 }
 
-function readResultRepairData(resultPath: string): ResultRepairData | undefined {
+function readResultRepairData(resultPath: string, expected?: { sessionId: string; runId: string }): ResultRepairData | undefined {
 	try {
 		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; error?: unknown; results?: unknown };
+		if (expected && !resultPayloadMatchesSessionRun(data, expected.sessionId, expected.runId)) return undefined;
 		if (data.error !== undefined && typeof data.error !== "string") throw new Error(`Invalid async result file '${resultPath}': error must be a string.`);
 		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "partial" ? "partial" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 		const results = Array.isArray(data.results)
@@ -165,8 +166,9 @@ function failureDiagnostic(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: number): AsyncStatus | undefined {
-	const repair = readResultRepairData(resultPath);
+function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: number, expectedRunId?: string): AsyncStatus | undefined {
+	if (expectedRunId && !status.sessionId) return undefined;
+	const repair = readResultRepairData(resultPath, expectedRunId && status.sessionId ? { runId: expectedRunId, sessionId: status.sessionId } : undefined);
 	if (!repair) return undefined;
 	const rootError = failureDiagnostic(status.error)
 		?? failureDiagnostic(repair.error)
@@ -524,7 +526,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			&& effectiveStatus.pidNamespaceScope === observedScope
 			&& now - lastUpdate <= staleAfterMs && runnerLiveness(effectiveStatus.pid) === "alive";
 		const terminalStatus = (effectiveStatus.state === "running" || effectiveStatus.state === "queued") && !runnerStillFinishing
-			? terminalStatusFromResult(effectiveStatus, existingResultPath, now)
+			? terminalStatusFromResult(effectiveStatus, existingResultPath, now, options.expectedRunId)
 			: undefined;
 		if (terminalStatus) {
 			const currentStatus = readStatus(asyncDir);

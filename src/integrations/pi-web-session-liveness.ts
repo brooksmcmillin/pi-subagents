@@ -34,9 +34,9 @@ function resolveRegistry(): PiWebSessionLivenessRegistry | null {
 	return registry as PiWebSessionLivenessRegistry;
 }
 
-export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "retainedForegroundNestedRoutes">, route: NestedRouteInfo): boolean {
+export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "retainedForegroundNestedRoutes">, route: NestedRouteInfo, ownerExited = false): boolean {
 	const nested = projectNestedEvents(route);
-	if (!hasLiveOwnedNestedWork(route.rootRunId, nested.children)) return false;
+	if (!hasLiveOwnedNestedWork(route.rootRunId, nested.children, ownerExited)) return false;
 	state.retainedForegroundNestedRoutes ??= new Map();
 	state.retainedForegroundNestedRoutes.set(route.rootRunId, route);
 	return true;

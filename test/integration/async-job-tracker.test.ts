@@ -1370,7 +1370,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(state.asyncJobs.get("running")?.status, "running");
 	});
 
-	it("keeps active restore and stale result repair live through storage permission failures", async (t) => {
+	for (const statFailure of [false, true]) it(`keeps active restore and stale result repair live through ${statFailure ? "public stat EIO" : "storage permission failures"}`, async (t) => {
 		const asyncRoot = createTempDir("pi-async-restore-storage-");
 		const resultsDir = path.join(asyncRoot, "results");
 		const terminalDir = path.join(asyncRoot, "terminal");
@@ -1381,18 +1381,26 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const state = { ...createState(), currentSessionId: sessionId, completionOwnerId: ownerId };
 		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
 		const originalRead = fsDefault.readFileSync;
+		const originalStat = fsDefault.statSync;
 		let denyIndex = true;
 		let denyPayload = false;
 		let indexDenied = 0;
 		let payloadDenied = 0;
 		fsDefault.readFileSync = ((file, options) => {
-			if (denyIndex && String(file).includes(path.sep + "result-index" + path.sep) && path.basename(String(file)) === "terminal.json") indexDenied++;
+			if (!statFailure && denyIndex && String(file).includes(path.sep + "result-index" + path.sep) && path.basename(String(file)) === "terminal.json") indexDenied++;
 			else if (denyPayload && file === resultPath) payloadDenied++;
 			else return originalRead(file, options);
 			throw Object.assign(new Error("temporarily inaccessible result storage"), { code: "EACCES" });
 		}) as typeof fs.readFileSync;
+		if (statFailure) fsDefault.statSync = ((file, options) => {
+			if (denyIndex && file === resultFilePath(resultsDir, "terminal")) {
+				indexDenied++;
+				throw Object.assign(new Error("public result stat failed"), { code: "EIO" });
+			}
+			return originalStat(file, options);
+		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
-		t.after(() => { fsDefault.readFileSync = originalRead; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
+		t.after(() => { fsDefault.readFileSync = originalRead; fsDefault.statSync = originalStat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		writeRunningAsyncStatus(runningDir, "running", sessionId);
 		fs.mkdirSync(terminalDir, { recursive: true });
 		fs.writeFileSync(path.join(terminalDir, "status.json"), JSON.stringify({ runId: "terminal", sessionId, completionOwnerId: ownerId, state: "complete", mode: "single", startedAt: Date.now(),

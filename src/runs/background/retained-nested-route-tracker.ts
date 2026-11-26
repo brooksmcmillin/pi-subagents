@@ -81,9 +81,10 @@ export function createRetainedNestedRouteTracker(
 		poller.unref?.();
 	};
 
-	const track = (rootRunId: string): void => {
+	const track = (rootRunId: string, ownerExited = false): void => {
 		const retained = state.retainedForegroundNestedRoutes?.get(rootRunId);
 		if (!retained) return;
+		if (ownerExited) retiredOwners.add(rootRunId);
 		if (shouldUseNativeFsWatch("retained-nested-route-tracker", options.platform) && !watchers.has(rootRunId)) {
 			try {
 				const watcher = watch(retained.eventSink, () => scheduleRefresh(rootRunId));
