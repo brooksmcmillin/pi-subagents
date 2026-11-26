@@ -592,6 +592,10 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
 			if (owners || verifyMarker) {
 				const stored = readStatus(asyncDir);
+				if (verifyMarker && owners && !stored) {
+					options.onUnreadableActiveRun?.(entry, asyncDir);
+					continue;
+				}
 				if (verifyMarker && stored && stored.runId !== entry) continue;
 				if (stored && owners && !owners.has(stored.sessionId)) {
 					observeStatus?.(stored);

@@ -542,11 +542,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable"]) it(`retains late independent work ${phase}`, async (t) => {
+	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh", "after the root status disappears", "after a restored root loses status", "while root status stays unreadable", "after restored status access is denied"]) it(`retains late independent work ${phase}`, async (t) => {
 		const rootStillRunning = phase === "before the root's terminal refresh";
 		const statusDisappears = phase === "after the root status disappears";
 		const losesRestoredStatus = phase === "after a restored root loses status";
 		const unreadableRoot = phase === "while root status stays unreadable";
+		const deniedAfterRestore = phase === "after restored status access is denied";
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
 		const route = createNestedRoute("tracked-async-owner-close");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -606,6 +607,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			tracker.restoreActiveJobs(ctx);
 			assert.equal(hasLiveSubagentWork(state), true, "markerless nested work remains held during reload");
 			assert.equal(terminalNotices, noticesBeforeReload, "already delivered result does not get replayed");
+			if (deniedAfterRestore) denyStat(t).add(path.join(asyncDir, "status.json"));
 			if (losesRestoredStatus) {
 				fs.rmSync(path.join(asyncDir, "status.json"));
 				await new Promise((resolve) => setTimeout(resolve, 60));
@@ -1451,29 +1453,37 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair accepts only the matching result");
 	});
 
-	it("never repairs a same-ID status swapped to another session during discovery", (t) => {
+	for (const phase of ["initially missing", "reconciliation read", "pre-write read"]) it(`never repairs foreign same-ID status at ${phase}`, async (t) => {
 		const asyncRoot = createTempDir("pi-marker-session-swap-");
 		const runDir = path.join(asyncRoot, "swapped");
 		const statusPath = path.join(runDir, "status.json");
 		const resultsDir = path.join(asyncRoot, "results");
 		const payload = resultFilePath(resultsDir, "swapped");
 		const state = { ...createState(), currentSessionId: "parent" };
-		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir });
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
 		const stat = fsDefault.statSync;
 		let reads = 0;
 		t.after(() => { fsDefault.statSync = stat; syncBuiltinESMExports(); tracker.dispose(); removeTempDir(asyncRoot); });
 		writeRunningAsyncStatus(runDir, "swapped", "parent");
 		updateActiveRunIndex(runDir, "running");
-		writePendingAsyncResultFile(payload, { id: "swapped", sessionId: "foreign-session", success: true });
+		if (phase === "pre-write read") {
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(payload, JSON.stringify({ id: "swapped", sessionId: "parent", success: true }));
+		} else writePendingAsyncResultFile(payload, { id: "swapped", sessionId: "foreign-session", success: true });
 		fsDefault.statSync = ((file, options) => {
-			if (file === statusPath && ++reads === 2) writeRunningAsyncStatus(runDir, "swapped", "foreign-session");
+			if (file === statusPath) {
+				reads++;
+				if (phase === "initially missing" && reads === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+				if (reads === (phase === "pre-write read" ? 3 : 2)) writeRunningAsyncStatus(runDir, "swapped", "foreign-session");
+			}
 			return stat(file, options);
 		}) as typeof fs.statSync;
 		syncBuiltinESMExports();
 		tracker.restoreActiveJobs({ ...createUiContext().ctx, sessionManager: {} });
-		assert.ok(reads >= 2);
+		if (phase === "initially missing") await waitForCondition(() => reads >= 2 && !state.asyncJobs.has("swapped"), "unverified marker rejected on retry");
+		assert.ok(reads >= (phase === "pre-write read" ? 3 : 2));
 		assert.equal(state.asyncJobs.has("swapped"), false);
-		assert.equal(fs.existsSync(payload), false, "the foreign result remains pending");
+		assert.equal(fs.existsSync(payload), phase === "pre-write read", "foreign pending result was not promoted");
 		assert.ok(readActiveRunIndex(asyncRoot)?.includes("swapped"));
 		assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
 	});

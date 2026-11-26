@@ -536,6 +536,10 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			: undefined;
 		if (terminalStatus) {
 			const currentStatus = readStatus(asyncDir);
+			if (options.expectedRunId && ((status && !currentStatus) || (currentStatus
+				&& (currentStatus.runId !== options.expectedRunId || currentStatus.sessionId !== effectiveStatus.sessionId)))) {
+				return { status: null, repaired: false };
+			}
 			const currentRootError = failureDiagnostic(currentStatus?.error);
 			const currentTerminal = currentStatus?.processTerminal?.state === "observed" || currentStatus?.processTerminal?.state === "unknown"
 				? currentStatus.processTerminal

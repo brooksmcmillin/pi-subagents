@@ -124,6 +124,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// this session's until a read shows otherwise; nothing writes to it before then.
 	const unverifiedRuns = new Set<string>();
 	const restoredJobs = new WeakSet<AsyncJobState>();
+	const verifiedRootClose = new WeakSet<AsyncJobState>();
 	const supervisorNoticeTimers = new Map<string, { asyncId: string; timer: ReturnType<typeof setTimeout> }>();
 	let rootWatcher: fs.FSWatcher | undefined;
 	let nextLivenessAt = Date.now() + livenessIntervalMs;
@@ -480,7 +481,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		let ownerExited = false;
 		if (job.nestedChildren?.length && isTerminalJobStatus(job.status)) {
 			try {
-				ownerExited = rootWriterClosed(job, status === undefined ? readStatus(job.asyncDir) : status);
+				const stored = status === undefined ? readStatus(job.asyncDir) : status;
+				ownerExited = stored ? rootWriterClosed(job, stored) : verifiedRootClose.has(job);
+				if (stored) {
+					if (ownerExited) verifiedRootClose.add(job);
+					else verifiedRootClose.delete(job);
+				}
 			} catch { /* No verified closure; keep ownership live. */ }
 		}
 		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren, ownerExited) : false;
@@ -533,6 +539,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
 				if (hasRestoredNestedWork(job, pending)) return false;
+				if (pending?.pending && pending.instanceId && !options.hasDeliveredResult?.(job.asyncId)
+					&& readProcessTerminal(job.asyncDir, { runId: job.asyncId, runnerProcessInstanceId: pending.instanceId })?.state !== "observed") return false;
 				// Only a previously verified delivery obligation can survive without status.
 				if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && !options.hasDeliveredResult?.(job.asyncId)
 					&& indexedResultPayloadVisibility(resultsDir, deliverySession, job.asyncId) !== "absent") return false;
@@ -763,6 +771,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					serviceExternalJobBridgeRequests(job.asyncDir);
 				} catch (bridgeError) {
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
+				}
+			}
+			if (isStatusAccessError(error, job.asyncDir) && restoredJobs.has(job) && job.nestedRoute
+				&& terminalPublications.get(job.asyncId)?.pending === false && !options.getOwedResultRunIds?.().has(job.asyncId)) {
+				if (nestedRefreshFailed) return false;
+				refreshNestedLiveness(job, null);
+				if (!job.nestedWorkActive) {
+					forgetJob(job.asyncId);
+					return true;
 				}
 			}
 			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
@@ -1023,7 +1040,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						if (!stored || stored.runId !== job.asyncId || !ownsRun(publicationSession.id, stored.sessionId)
 							|| !isTerminalJobStatus(stored.state)) continue;
 					}
-					rootExited = Boolean(stored && rootWriterClosed(job, stored));
+					rootExited = stored ? rootWriterClosed(job, stored) : verifiedRootClose.has(job);
 					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children, rootExited);
 				} catch {
 					// The replacement can retry the exact owned route if it is temporarily unreadable.
