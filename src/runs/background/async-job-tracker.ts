@@ -48,6 +48,7 @@ interface AsyncJobTrackerOptions {
 	platform?: NodeJS.Platform;
 	onJobTerminal?: (job: AsyncJobState, publicationClosed: boolean) => void;
 	getOwedResultRunIds?: () => ReadonlySet<string>;
+	hasDeliveredResult?: (runId: string) => boolean;
 	onJobCleanup?: (asyncId: string) => void;
 	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
 	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
@@ -106,7 +107,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const externalJobBridgeRuns = new Set<string>();
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
-	type PendingPublication = { instanceId?: string; pending: true; provisional?: true };
+	type PendingPublication = { instanceId?: string; pending: true; provisional?: true; deliverySessionId?: string };
 	type PublicationObligation = PendingPublication | { pending: false };
 	const terminalPublications = new Map<string, PublicationObligation>();
 	const unverifiedPublications = new Map<string, PublicationObligation>();
@@ -247,8 +248,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const scheduleCleanup = (asyncId: string) => {
 		cancelCleanup(asyncId);
+		if (options.getOwedResultRunIds?.().has(asyncId)) return;
 		const timer = setTimeout(() => {
 			state.cleanupTimers.delete(asyncId);
+			if (options.getOwedResultRunIds?.().has(asyncId)) return;
 			closeJobWatcher(asyncId);
 			const job = state.asyncJobs.get(asyncId);
 			retainNestedLookupRoute(state, job?.nestedRoute, job?.sessionId);
@@ -503,7 +506,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 			const pending = unverifiedPublications.get(job.asyncId);
-			if (!stored || !summary || (owners && !owners.has(stored.sessionId))) {
+			const deliverySession = pending?.pending ? pending.deliverySessionId : undefined;
+			if (!stored || !summary || (owners && !owners.has(stored.sessionId)) || (deliverySession && stored.sessionId !== deliverySession)) {
+				// Only a previously verified delivery obligation can survive without status.
+				if (deliverySession && ownsRun(state.currentSessionId, deliverySession) && !options.hasDeliveredResult?.(job.asyncId)
+					&& indexedResultPayloadVisibility(resultsDir, deliverySession, job.asyncId) !== "absent") return false;
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -700,6 +707,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 							publication = { pending: false };
 							terminalPublications.set(job.asyncId, publication);
 						} else cancelCleanup(job.asyncId);
+					}
+					if (!publicationClosed && publication?.pending === false && job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
+						publicationClosed = indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) === "absent";
 					}
 					// Scan on close too: publication may have raced the payload check.
 					if (!nestedOnly && (publicationClosed || !isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending))) options.onJobTerminal?.(job, publicationClosed);
@@ -965,8 +975,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const dispose = (shutdownReason?: string) => {
 		if (shutdownReason === "reload" && publicationSession) {
 			const runs = new Map(unverifiedPublications);
-			for (const runId of options.getOwedResultRunIds?.() ?? []) if (!runs.has(runId)) runs.set(runId, { pending: true });
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
+			for (const runId of options.getOwedResultRunIds?.() ?? []) {
+				const publication = runs.get(runId);
+				const job = state.asyncJobs.get(runId);
+				runs.set(runId, { ...(publication?.pending ? publication : {}), pending: true, deliverySessionId: job?.sessionId });
+			}
 			for (const job of state.asyncJobs.values()) {
 				if (runs.has(job.asyncId) || !ownsRun(publicationSession.id, job.sessionId)) continue;
 				const route = job.nestedRoute;

@@ -1016,7 +1016,7 @@ export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSum
 		if (asyncDir && terminal(child.state)) {
 			try {
 				const status = readStatus(asyncDir);
-				if (!status || status.runId === child.id) {
+				if (status ? status.runId === child.id && (!child.sessionId || status.sessionId === child.sessionId) : !child.sessionId) {
 					const recorded = status?.processTerminal;
 					childOwnerExited = hasObservedRunnerClose(asyncDir, child.id, recorded);
 					if (recorded?.state === "pending" || recorded?.state === "observed") {

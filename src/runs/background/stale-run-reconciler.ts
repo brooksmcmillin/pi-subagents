@@ -404,6 +404,7 @@ export function reconcileNestedAsyncDescendants(route: NestedRoute, options: Rec
 		const result = reconcileAsyncRun(asyncDir, {
 			...options,
 			expectedRunId: run.id,
+			expectedSessionId: run.sessionId,
 			resultsDir: path.join(options.resultsDir ?? DIRS.results, "nested", route.rootRunId),
 		});
 		const status = result.status;

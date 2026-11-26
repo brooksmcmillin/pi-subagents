@@ -167,31 +167,32 @@ describe("retained foreground nested route tracker", () => {
 		}
 	});
 
-	it("does not promote another child's result when nested status claims the wrong ID", async () => {
+	for (const foreignSession of [false, true]) it(`does not reconcile nested status with the wrong ${foreignSession ? "session" : "run ID"}`, async () => {
 		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("mismatched-nested-root");
 		const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId);
 		const asyncDir = path.join(asyncRoot, "nested-child");
 		const results = path.join(DIRS.results, "nested", nestedRoute.rootRunId);
-		const publicPath = resultFilePath(results, "other-child");
+		const foreignId = foreignSession ? "nested-child" : "other-child";
+		const publicPath = resultFilePath(results, foreignId);
 		const pendingDir = path.join(results, "result-pending", "session-a");
 		fs.mkdirSync(asyncDir, { recursive: true });
 		writeNestedEvent(nestedRoute, {
 			type: "subagent.nested.started", ts: 100, parentRunId: nestedRoute.rootRunId,
-			child: { id: "nested-child", parentRunId: nestedRoute.rootRunId, depth: 1, path: [{ runId: nestedRoute.rootRunId }], state: "running", agent: "worker", asyncDir },
+			child: { id: "nested-child", sessionId: "owner-session", parentRunId: nestedRoute.rootRunId, depth: 1, path: [{ runId: nestedRoute.rootRunId }], state: "running", agent: "worker", asyncDir },
 		});
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
-		writePendingAsyncResultFile(publicPath, { id: "other-child", sessionId: "session-a", state: "complete", success: true, timestamp: Date.now() });
+		writePendingAsyncResultFile(publicPath, { id: foreignId, sessionId: "session-a", state: "complete", success: true, timestamp: Date.now() });
 		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
-		const writeStatus = (runId: string) => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId: "session-a", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200 }));
+		const writeStatus = (runId: string, sessionId: string) => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId, mode: "single", state: "failed", startedAt: 100, lastUpdate: 200 }));
 		try {
-			writeStatus("other-child");
+			writeStatus(foreignId, "session-a");
 			tracker.track(nestedRoute.rootRunId);
 			await new Promise((resolve) => setTimeout(resolve, 40));
 			assert.equal(projectNestedEvents(nestedRoute).children[0]?.state, "running");
-			assert.ok(fs.readdirSync(pendingDir).includes("other-child.json"));
+			assert.ok(fs.readdirSync(pendingDir).includes(`${foreignId}.json`));
 			assert.equal(fs.existsSync(publicPath), false);
-			writeStatus("nested-child");
+			writeStatus("nested-child", "owner-session");
 			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
 		} finally {
 			tracker.clear();
@@ -232,7 +233,7 @@ describe("retained foreground nested route tracker", () => {
 		const rootId = "stale-runner-root";
 		const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootId, "child");
 		const results = path.join(DIRS.results, "nested", rootId);
-		const base = { id: "child", parentRunId: rootId, depth: 1, path: [{ runId: rootId }], agent: "worker" };
+		const base = { id: "child", sessionId: "parent", parentRunId: rootId, depth: 1, path: [{ runId: rootId }], agent: "worker" };
 		const children = [{ ...base, asyncDir, state: "failed" as const, children: [{ ...base, id: "in-process", parentRunId: "child", depth: 2, state: "running" as const }] }];
 		fs.mkdirSync(asyncDir, { recursive: true });
 		fs.mkdirSync(results, { recursive: true });
@@ -249,6 +250,9 @@ describe("retained foreground nested route tracker", () => {
 			writeStatus({ ...pending, state: "observed", observedAt: 300, instances: [] });
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), true, "malformed observation cannot release the hold");
 			writeProof("current");
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ ...status, sessionId: "other", processTerminal: pending }));
+			assert.equal(hasLiveOwnedNestedWork(rootId, children), true, "foreign-session status cannot prove closure");
+			writeStatus(pending);
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), false);
 		} finally {
 			fs.rmSync(path.dirname(asyncDir), { recursive: true, force: true });

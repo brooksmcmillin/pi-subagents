@@ -78,7 +78,9 @@ const terminalBeforePublicationScript = String.raw`
 		register(value) { provider = value; return () => {}; },
 	};
 	const workflowReload = process.argv[1] === "workflow-reload";
-	const publishedReload = process.argv[1] === "published-reload";
+	const noStatusReload = process.argv[1] === "published-no-status-reload";
+	const vanishedResult = process.argv[1] === "published-vanished";
+	const publishedReload = process.argv[1] === "published-reload" || noStatusReload || vanishedResult;
 	const repeatReload = process.argv[1] === "repeat-reload" || workflowReload || publishedReload;
 	const provisionalReload = process.argv[1] === "provisional-reload";
 	const mismatchedRunningMarker = process.argv[1] === "mismatched-running-marker";
@@ -314,8 +316,10 @@ const terminalBeforePublicationScript = String.raw`
 			if (publishedReload) publishResult();
 			if (workflowReload || publishedReload) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
 			denyResult = true;
+			if (noStatusReload) fs.rmSync(path.join(asyncDir, "status.json"));
+			if (vanishedResult) fs.rmSync(resultFilePath(DIRS.results, runId));
 			assert.equal(readActiveRunIndex(DIRS.async)?.includes(runId), false);
-			for (let i = 0; i < 2; i++) {
+			for (let i = 0; i < (vanishedResult ? 0 : 2); i++) {
 				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
 				handlers.clear();
 				holds.length = 0;
@@ -333,7 +337,7 @@ const terminalBeforePublicationScript = String.raw`
 			fsDefault.readdirSync = readdir;
 			syncBuiltinESMExports();
 		}
-		if (publishedReload) {
+		if (publishedReload && !vanishedResult) {
 			ctx.isIdle = () => true;
 			rejectNextSend = false;
 			const sent = nextSend();
@@ -515,6 +519,8 @@ describe("session liveness through result delivery", () => {
 		["repeat-reload", "markerless terminal publication survives reload with an inaccessible status"],
 		["workflow-reload", "detached workflow publication survives reload with inaccessible result storage"],
 		["published-reload", "published delivery remains held on reload even when active listing fails"],
+		["published-no-status-reload", "holds an unreadable published result across reload with no status file"],
+		["published-vanished", "clears delivery debt when a previously visible result disappears without delivery"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {
