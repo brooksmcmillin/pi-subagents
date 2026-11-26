@@ -28,7 +28,7 @@ interface AsyncJobTrackerModule {
 			resultsDir?: string;
 			widgetEnabled?: boolean;
 			platform?: NodeJS.Platform;
-			onJobTerminal?: () => void;
+			onJobTerminal?: (job: unknown, publicationClosed: boolean) => void;
 			watch?: typeof fs.watch;
 			kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 			now?: () => number;
@@ -507,7 +507,8 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	for (const reloadBeforeRefresh of [false, true]) it(`retains late independent work ${reloadBeforeRefresh ? "before its first refresh" : "after it cancels terminal cleanup"}`, async () => {
+	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh"]) it(`retains late independent work ${phase}`, async () => {
+		const rootStillRunning = phase === "before the root's terminal refresh";
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
 		const route = createNestedRoute("tracked-async-owner-close");
 		const asyncDir = path.join(asyncRoot, route.rootRunId);
@@ -517,7 +518,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const resultsDir = path.join(asyncRoot, "results");
 		const resultPath = path.join(resultsDir, `${route.rootRunId}.json`);
 		let terminalNotices = 0;
-		const options = { platform: "darwin" as const, pollIntervalMs: 10, completionRetentionMs: retentionMs, resultsDir, onJobTerminal: () => terminalNotices++ };
+		const options = { platform: "darwin" as const, pollIntervalMs: 10, completionRetentionMs: retentionMs, resultsDir, onJobTerminal: (_job: unknown, closed: boolean) => { if (!closed) terminalNotices++; } };
 		let tracker = createTracker(createEventRecorder().pi, state, asyncRoot, options);
 		try {
 			fs.mkdirSync(asyncDir, { recursive: true });
@@ -528,16 +529,24 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			const proof = { version: 1, state: "observed", runId: route.rootRunId, runnerProcessInstanceId: "runner", observedAt: 200,
 				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 200, exitCode: 1, signal: null }] };
 			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
-			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", state: "failed", mode: "single", startedAt: 10, lastUpdate: 200, processTerminal: proof }));
+			const writeRoot = (state: "running" | "failed") => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", state, mode: "single", startedAt: Date.now(), lastUpdate: Date.now(), ...(state === "failed" ? { processTerminal: proof } : { pid: process.pid }) }));
+			writeRoot(rootStillRunning ? "running" : "failed");
 			tracker.restoreActiveJobs(ctx);
 			updateActiveRunIndex(asyncDir, "running");
 			fs.mkdirSync(resultsDir);
 			fs.writeFileSync(resultPath, JSON.stringify({ id: route.rootRunId, sessionId: "parent", success: false }));
 			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", completionOwnerId: "process-owner", asyncDir, agent: "owner", nestedRoute: route });
-			await waitForCondition(() => state.cleanupTimers.has(route.rootRunId), "terminal cleanup armed");
-			assert.equal(hasLiveSubagentWork(state), false, "stranded foreground activity does not hold cleanup");
+			if (rootStillRunning) {
+				await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "running", "old tracker projects running root");
+				writeRoot("failed");
+			} else {
+				await waitForCondition(() => state.cleanupTimers.has(route.rootRunId), "terminal cleanup armed");
+				assert.equal(hasLiveSubagentWork(state), false, "stranded foreground activity does not hold cleanup");
+			}
 			writeNestedEvent(route, { type: "subagent.nested.started", ts: 201, parentRunId: independent.parentRunId, child: independent });
-			if (reloadBeforeRefresh) {
+			if (rootStillRunning) {
+				assert.equal(state.asyncJobs.get(route.rootRunId)?.status, "running");
+			} else if (phase === "before its first refresh") {
 				assert.equal(hasLiveSubagentWork(state), false, "old tracker has not seen the child yet");
 			} else {
 				await waitForCondition(() => hasLiveSubagentWork(state), "late independent work observed");
@@ -545,7 +554,8 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				await new Promise((resolve) => setTimeout(resolve, retentionMs));
 				assert.equal(hasLiveSubagentWork(state), true, "independent work survives the old cleanup deadline");
 			}
-			assert.equal(terminalNotices, 1);
+			const noticesBeforeReload = rootStillRunning ? 0 : 1;
+			assert.equal(terminalNotices, noticesBeforeReload);
 			fs.rmSync(resultPath); // Result consumer has delivered and retired the payload.
 			updateActiveRunIndex(asyncDir, "failed");
 			assert.equal(readActiveRunIndex(asyncRoot)?.includes(route.rootRunId) ?? false, false);
@@ -554,7 +564,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			tracker = createTracker(createEventRecorder().pi, state, asyncRoot, options);
 			tracker.restoreActiveJobs(ctx);
 			assert.equal(hasLiveSubagentWork(state), true, "markerless nested work remains held during reload");
-			assert.equal(terminalNotices, 1, "already delivered result does not get replayed");
+			assert.equal(terminalNotices, noticesBeforeReload, "already delivered result does not get replayed");
 			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 300, parentRunId: independent.parentRunId, child: { ...independent, state: "complete" } });
 			await waitForCondition(() => !state.asyncJobs.has(route.rootRunId), "terminal job cleanup");
 			assert.equal(hasLiveSubagentWork(state), false);

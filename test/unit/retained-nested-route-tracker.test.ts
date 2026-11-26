@@ -6,8 +6,9 @@ import { afterEach, describe, it } from "node:test";
 import { retainLiveForegroundNestedRoute } from "../../src/integrations/pi-web-session-liveness.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { createRetainedNestedRouteTracker } from "../../src/runs/background/retained-nested-route-tracker.ts";
+import { resultFilePath, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import { TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { DIRS, TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 const routeRoots: string[] = [];
 
@@ -110,6 +111,39 @@ describe("retained foreground nested route tracker", () => {
 		} finally {
 			tracker.clear();
 			fs.rmSync(asyncDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not promote another child's result when nested status claims the wrong ID", async () => {
+		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
+		const nestedRoute = route("mismatched-nested-root");
+		const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId);
+		const asyncDir = path.join(asyncRoot, "nested-child");
+		const results = path.join(DIRS.results, "nested", nestedRoute.rootRunId);
+		const publicPath = resultFilePath(results, "other-child");
+		const pendingDir = path.join(results, "result-pending", "session-a");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeNestedEvent(nestedRoute, {
+			type: "subagent.nested.started", ts: 100, parentRunId: nestedRoute.rootRunId,
+			child: { id: "nested-child", parentRunId: nestedRoute.rootRunId, depth: 1, path: [{ runId: nestedRoute.rootRunId }], state: "running", agent: "worker", asyncDir },
+		});
+		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
+		writePendingAsyncResultFile(publicPath, { id: "other-child", sessionId: "session-a", state: "complete", success: true, timestamp: Date.now() });
+		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
+		const writeStatus = (runId: string) => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, sessionId: "session-a", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200 }));
+		try {
+			writeStatus("other-child");
+			tracker.track(nestedRoute.rootRunId);
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			assert.equal(projectNestedEvents(nestedRoute).children[0]?.state, "running");
+			assert.ok(fs.readdirSync(pendingDir).includes("other-child.json"));
+			assert.equal(fs.existsSync(publicPath), false);
+			writeStatus("nested-child");
+			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
+		} finally {
+			tracker.clear();
+			fs.rmSync(asyncRoot, { recursive: true, force: true });
+			fs.rmSync(results, { recursive: true, force: true });
 		}
 	});
 

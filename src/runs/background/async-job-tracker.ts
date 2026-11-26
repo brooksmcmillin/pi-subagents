@@ -942,19 +942,23 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			for (const runId of options.getOwedResultRunIds?.() ?? []) if (!runs.has(runId)) runs.set(runId, { pending: true });
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
 			for (const job of state.asyncJobs.values()) {
-				if (runs.has(job.asyncId) || !isTerminalJobStatus(job.status) || !ownsRun(publicationSession.id, job.sessionId)) continue;
+				if (runs.has(job.asyncId) || !ownsRun(publicationSession.id, job.sessionId)) continue;
 				const route = job.nestedRoute;
+				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
-				if (route?.rootRunId === job.asyncId && path.basename(job.asyncDir) === job.asyncId) {
-					try {
-						nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children,
-							readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed");
-					} catch {
-						// The replacement can retry the exact owned route if it is temporarily unreadable.
-						nestedActive = true;
+				try {
+					if (!isTerminalJobStatus(job.status)) {
+						const stored = readStatus(job.asyncDir);
+						if (!stored || stored.runId !== job.asyncId || !ownsRun(publicationSession.id, stored.sessionId)
+							|| !isTerminalJobStatus(stored.state)) continue;
 					}
+					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children,
+						readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed");
+				} catch {
+					// The replacement can retry the exact owned route if it is temporarily unreadable.
+					nestedActive = true;
 				}
-				if (nestedActive) runs.set(job.asyncId, { pending: false });
+				if (nestedActive) runs.set(job.asyncId, isTerminalJobStatus(job.status) ? { pending: false } : { pending: true, provisional: true });
 			}
 			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}

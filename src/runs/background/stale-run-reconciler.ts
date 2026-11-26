@@ -36,6 +36,7 @@ interface StartedRunMetadata {
 }
 
 interface ReconcileAsyncRunOptions {
+	expectedRunId?: string;
 	resultsDir?: string;
 	kill?: KillFn;
 	now?: () => number;
@@ -397,6 +398,7 @@ export function reconcileNestedAsyncDescendants(route: NestedRoute, options: Rec
 		if (!asyncDir) continue;
 		const result = reconcileAsyncRun(asyncDir, {
 			...options,
+			expectedRunId: run.id,
 			resultsDir: path.join(options.resultsDir ?? DIRS.results, "nested", route.rootRunId),
 		});
 		const status = result.status;
@@ -487,6 +489,7 @@ export function checkRecordedPidLiveness(recorded: RecordedPid, observation: Rec
 export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}, observeStatus?: RawDrainStatusObserver): ReconcileAsyncRunResult {
 	const now = options.now?.() ?? Date.now();
 	const status = readStatus(asyncDir);
+	if (options.expectedRunId !== undefined && status?.runId !== options.expectedRunId) return { status: null, repaired: false };
 	observeStatus?.(status);
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
