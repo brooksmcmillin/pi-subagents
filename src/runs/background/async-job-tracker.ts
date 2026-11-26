@@ -630,15 +630,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			forgetJob(job.asyncId);
 			return true;
 		};
-		let bridgeSweepAttempted = false;
-		try {
-			emitNewControlEvents(job);
-			const bridgeAlreadyRequired = externalJobBridgeRuns.has(job.asyncId) || externalJobBridgeEligibility(job.steps) === "required";
-			if (bridgeAlreadyRequired) {
-				externalJobBridgeRuns.add(job.asyncId);
-				bridgeSweepAttempted = true;
-				serviceExternalJobBridgeRequests(job.asyncDir);
-			}
+		const refreshNested = () => {
 			try {
 				if (job.nestedRoute) reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now });
 			} catch (error) {
@@ -646,6 +638,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 			refreshNestedProjection();
+		};
+		let bridgeSweepAttempted = false;
+		try {
 			const restored = restoredJobs.has(job);
 			const exact = restored || Boolean(job.sessionId);
 			const reconciliation = reconcileAsyncRun(job.asyncDir, {
@@ -667,6 +662,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
+			if (reconciliation.identityMismatch && !restored && !isTerminalJobStatus(job.status)) {
+				forgetJob(job.asyncId);
+				return true;
+			}
+			emitNewControlEvents(job);
+			const bridgeAlreadyRequired = externalJobBridgeRuns.has(job.asyncId) || externalJobBridgeEligibility(job.steps) === "required";
+			if (bridgeAlreadyRequired && !reconciliation.identityMismatch) {
+				externalJobBridgeRuns.add(job.asyncId);
+				bridgeSweepAttempted = true;
+				serviceExternalJobBridgeRequests(job.asyncDir);
+			}
+			refreshNested();
 			if (exact && !reconciliation.status && (restored || isTerminalJobStatus(job.status))) {
 				if (reconciliation.statusMissing && !isTerminalJobStatus(job.status)) {
 					if (activeRunMarkerAgeMs(job.asyncDir, options.now?.()) !== undefined) return false;
@@ -811,6 +818,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				}
 			}
 			if (isStatusAccessError(error, job.asyncDir) && job.sessionId && isTerminalJobStatus(job.status)) {
+				refreshNested();
 				return settleWithoutStatus(true);
 			}
 			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
@@ -1140,17 +1148,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
 		const saved = publicationSession && reloadPublications.get(publicationSession.manager);
 		const handoff = saved?.sessionId === state.currentSessionId ? saved : undefined;
-		const expectedSessions = new Map(handoff?.retrySessions);
-		for (const job of state.asyncJobs.values()) {
-			if (job.sessionId && job.asyncDir === path.join(asyncDirRoot, job.asyncId)) expectedSessions.set(job.asyncId, job.sessionId);
-		}
+		// Tracked jobs reconcile in refreshJob, which observes publication settlement.
+		const trackedRuns = new Set(state.asyncJobs.keys());
 		let runs: AsyncRunSummary[] = [];
 		const unreadable: Array<{ runId: string; asyncDir: string; verifiedSessionId?: string }> = [];
 		try {
 			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
 			runs = listAsyncRuns(asyncDirRoot, {
 				states: ["queued", "running"], includeTerminalPublication: true, sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId,
-				expectedRetrySessions: expectedSessions,
+				expectedRetrySessions: handoff?.retrySessions, trackedRuns,
 				onUnreadableActiveRun: (runId, asyncDir, verifiedSessionId) => unreadable.push({ runId, asyncDir, verifiedSessionId }),
 			}, observeStatus);
 		} catch (error) {

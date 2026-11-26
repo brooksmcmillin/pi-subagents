@@ -179,6 +179,7 @@ interface AsyncRunListOptions {
 	/** Receives an active run kept in the index whose status.json this process may not read. */
 	onUnreadableActiveRun?: (runId: string, asyncDir: string, verifiedSessionId?: string) => void;
 	expectedRetrySessions?: ReadonlyMap<string, string>;
+	trackedRuns?: ReadonlySet<string>;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -545,6 +546,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			const indexed = new Set<string>();
 			if (wantsActive) {
 				for (const entry of readActiveRunIndex(asyncDirRoot) ?? []) {
+					if (options.trackedRuns?.has(entry)) continue;
 					if (resolveTargetedAsyncRun(asyncDirRoot, entry).kind === "exact") {
 						indexed.add(entry);
 						activeEntries.add(entry);

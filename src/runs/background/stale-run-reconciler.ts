@@ -56,6 +56,7 @@ interface ReconcileAsyncRunOptions {
 interface ReconcileAsyncRunResult {
 	noPublication?: true;
 	statusMissing?: true;
+	identityMismatch?: true;
 	status: AsyncStatus | null;
 	repaired: boolean;
 	resultPath?: string;
@@ -498,13 +499,13 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const status = readStatus(asyncDir);
 	if (!status && options.expectedRunId !== undefined && !options.startedRun) return { status: null, repaired: false, statusMissing: true };
 	if (status && ((options.expectedRunId !== undefined && status.runId !== options.expectedRunId)
-		|| (options.expectedSessionId !== undefined && status.sessionId !== options.expectedSessionId))) return { status: null, repaired: false };
+		|| (options.expectedSessionId !== undefined && status.sessionId !== options.expectedSessionId))) return { status: null, repaired: false, identityMismatch: true };
 	observeStatus?.(status);
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
 	const rejectedReread = (current: AsyncStatus | null): ReconcileAsyncRunResult => ({
-		status: null, repaired: false, ...(current === null ? { statusMissing: true } : {}),
+		status: null, repaired: false, ...(current === null ? { statusMissing: true } : { identityMismatch: true }),
 	});
 	const mayWrite = (current: AsyncStatus | null): boolean => !options.expectedRunId || (current
 		? current.runId === options.expectedRunId && current.sessionId === effectiveStatus.sessionId

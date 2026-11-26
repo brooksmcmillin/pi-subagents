@@ -1672,6 +1672,57 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		assert.equal(hasLiveSubagentWork(state), false);
 	});
 
+	it("leaves no-publication repair of an already tracked run to its refresh", async (t) => {
+		const root = createTempDir("pi-repeat-no-publication-");
+		const asyncDir = path.join(root, "tracked");
+		const resultsDir = path.join(root, "results");
+		const output = resultFilePath(resultsDir, "tracked");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const notices: boolean[] = [];
+		let dead = false;
+		const tracker = createTracker(createEventRecorder().pi, state, root, { resultsDir, pollIntervalMs: 10, completionRetentionMs: 50,
+			kill: () => { if (dead) throw Object.assign(new Error("runner gone"), { code: "ESRCH" }); return true; },
+			onJobTerminal: (_job, closed) => notices.push(closed),
+		});
+		t.after(() => { tracker.dispose(); removeTempDir(root); });
+		writeRunningAsyncStatus(asyncDir, "tracked", "parent");
+		const statusPath = path.join(asyncDir, "status.json");
+		fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), pid: 12345 }));
+		updateActiveRunIndex(asyncDir, "running");
+		const ctx = { ...createUiContext().ctx, sessionManager: {} };
+		tracker.restoreActiveJobs(ctx);
+		assert.equal(state.asyncJobs.get("tracked")?.status, "running");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		const foreign = JSON.stringify({ id: "tracked", sessionId: "other", success: true });
+		fs.writeFileSync(output, foreign);
+		dead = true;
+		tracker.restoreActiveJobs(ctx);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "running");
+		await waitForCondition(() => notices.length > 0, "tracker settles the repair without publication");
+		assert.deepEqual(notices, [true]);
+		assert.equal(state.asyncJobs.get("tracked")?.status, "failed");
+		assert.equal(fs.readFileSync(output, "utf-8"), foreign);
+		await waitForCondition(() => !state.asyncJobs.has("tracked"), "settled run expires from tracking");
+		assert.equal(hasLiveSubagentWork(state), false);
+	});
+
+	it("detaches a locally started job when its canonical session is replaced", async (t) => {
+		const root = createTempDir("pi-local-replaced-status-");
+		const asyncDir = path.join(root, "started");
+		const statusPath = path.join(asyncDir, "status.json");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, root, { resultsDir: path.join(root, "results"), pollIntervalMs: 10 });
+		t.after(() => { tracker.dispose(); removeTempDir(root); });
+		writeRunningAsyncStatus(asyncDir, "started", "parent");
+		tracker.handleStarted({ id: "started", asyncDir, sessionId: "parent", agent: "worker" });
+		await waitForCondition(() => state.asyncJobs.get("started")?.status === "running", "local start observed");
+		writeRunningAsyncStatus(asyncDir, "started", "other");
+		const replacement = fs.readFileSync(statusPath, "utf-8");
+		await waitForCondition(() => !state.asyncJobs.has("started"), "replacement rejected by local refresh");
+		assert.equal(hasLiveSubagentWork(state), false);
+		assert.equal(fs.readFileSync(statusPath, "utf-8"), replacement);
+	});
+
 	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {
 		const asyncRoot = createTempDir("pi-live-foreign-result-");
 		const asyncDir = path.join(asyncRoot, "live");
