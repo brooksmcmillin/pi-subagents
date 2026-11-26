@@ -2887,6 +2887,8 @@ describe("result watcher", () => {
 		assert.equal(watcher.hasQueuedOwnedResults(), false, "fallback does not schedule delivery");
 		fs.writeFileSync(deniedPath, JSON.stringify({ id: "wrong-run", sessionId: "session-1", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
 		assert.equal(watcher.hasPendingResults(), false, "enumeration fallback rejects the wrong run");
+		denyEnumeration = false;
+		assert.equal(watcher.hasPendingResults(), false, "exact lookup fallback also rejects the wrong run");
 		fs.writeFileSync(deniedPath, JSON.stringify({ id: "a-denied", sessionId: "foreign", completionOwnerId: COMPLETION_OWNER_ID, success: true }));
 		assert.equal(watcher.hasPendingResults(), false, "canonical fallback still verifies ownership");
 		writeIndexedResult(deniedPath, { id: "a-denied", sessionId: "session-1", success: true, summary: "owned" });

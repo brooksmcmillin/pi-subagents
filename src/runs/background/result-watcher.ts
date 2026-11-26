@@ -798,12 +798,12 @@ export function createResultWatcher(
 		for (const runId of observed) files.add(`${runId}.json`);
 		return [...files];
 	};
-	const eligibleResultFiles = (onStorageError?: (file: string) => void, onUnreadableEntry?: (file: string) => void): string[] => {
+	const eligibleResultFiles = (onStorageError?: (file: string) => void): string[] => {
 		const files: string[] = [];
 		try {
 			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
 			const observed = observedRunIds();
-			for (const file of indexedResultCandidates(observed, onUnreadableEntry)) {
+			for (const file of indexedResultCandidates(observed, onStorageError)) {
 				stats.files += 1;
 				try {
 					const signature = resultSignature(file, observed);
@@ -821,7 +821,7 @@ export function createResultWatcher(
 		}
 		return files;
 	};
-	const isPendingOwnedResult = (file: string, canonicalOnly = false, requireFilenameMatch = false): boolean => {
+	const isPendingOwnedResult = (file: string, canonicalOnly = false): boolean => {
 		if (file !== path.basename(file) || !file.endsWith(".json")) return false;
 		let raw: string;
 		try {
@@ -833,7 +833,7 @@ export function createResultWatcher(
 			if (!canonicalOnly && isStorageAccessError(error)) return isPendingOwnedResult(file, true);
 			return !canonicalOnly && !isNotFound(error);
 		}
-		if (requireFilenameMatch) {
+		if (canonicalOnly) {
 			try {
 				const data = parseResult(raw);
 				const runId = data.runId || data.id;
@@ -856,10 +856,8 @@ export function createResultWatcher(
 	const hasPendingResults = () => {
 		if (queuedOwnedResults.size) return true;
 		const inaccessible = new Set<string>();
-		const unreadableEntries = new Set<string>();
-		const eligible = eligibleResultFiles((file) => inaccessible.add(file), (file) => unreadableEntries.add(file));
-		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => isPendingOwnedResult(file, true))
-			|| [...unreadableEntries].some((file) => isPendingOwnedResult(file, true, true));
+		const eligible = eligibleResultFiles((file) => inaccessible.add(file));
+		return eligible.some((file) => isPendingOwnedResult(file)) || [...inaccessible].some((file) => isPendingOwnedResult(file, true));
 	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		const triggerTurn = options.triggerTurn !== false;
