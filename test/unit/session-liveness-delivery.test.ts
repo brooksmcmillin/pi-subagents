@@ -24,7 +24,7 @@ const terminalBeforePublicationScript = String.raw`
 	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
 	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
-	import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+	import { readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
 	// so a terminal status is observed before the result file exists.
@@ -73,7 +73,8 @@ const terminalBeforePublicationScript = String.raw`
 		version: 1,
 		register(value) { provider = value; return () => {}; },
 	};
-	const restoredCase = process.argv[1] === "restored";
+	const repeatReload = process.argv[1] === "repeat-reload";
+	const restoredCase = process.argv[1] === "restored" || repeatReload;
 	const closedFirst = process.argv[1] === "closed-first";
 	const closedCase = process.argv[1] === "closed" || restoredCase || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
@@ -129,6 +130,38 @@ const terminalBeforePublicationScript = String.raw`
 		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
 	}
 	assert.equal(provider.isActive(), true);
+	if (repeatReload) {
+		const proof = exitProof();
+		const stat = fsDefault.statSync;
+		fsDefault.statSync = (file, ...args) => {
+			if (String(file).includes("result-pending")) throw Object.assign(new Error("temporarily inaccessible"), { code: "EACCES" });
+			return stat(file, ...args);
+		};
+		syncBuiltinESMExports();
+		try {
+			writeAtomicJson(path.join(asyncDir, "process-terminal.json"), proof);
+			writeStatus("complete", proof);
+			assert.equal(readActiveRunIndex(DIRS.async)?.includes(runId), false);
+			for (let i = 0; i < 2; i++) {
+				for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" }, ctx);
+				handlers.clear();
+				holds.length = 0;
+				registerSubagentExtension(pi);
+				for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
+				assert.deepEqual(holds, [true]);
+				assert.equal(provider.isActive(), true);
+			}
+		} finally {
+			fsDefault.statSync = stat;
+			syncBuiltinESMExports();
+		}
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
 
 	let send;
 	if (process.argv[1] === "event" || pendingCase) {
@@ -247,6 +280,7 @@ describe("session liveness through result delivery", () => {
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
+		["repeat-reload", "unresolved closed publication survives two reloads after active marker release"],
 	]) it(title, () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-delivery-"));
 		try {

@@ -372,14 +372,17 @@ export function createResultWatcher(
 		}
 	};
 
-	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string): boolean => {
+	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string, holdForDelivery = false): boolean => {
 		const inspected = inspectResult(file, knownSignature, observed);
 		if (!inspected) return false;
 		const { identity } = inspected;
 		// Missing identity stays on the normal parser path so malformed or legacy
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
-		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) return true;
+		if (ownsResult(identity.sessionId, deliveryOwnerId(identity.sessionId, identity.completionOwnerId, identity.completionOwnerProcess, identity.parentWorkflowRunId))) {
+			if (holdForDelivery && !identity.acknowledged) holdOwnedResult(file);
+			return true;
+		}
 		// Acknowledgment removes the observer index; gating on the mission binding instead
 		// re-ran mission sync for an unowned result on every scan.
 		if (identity.runId && fsApi.existsSync(missionObserverIndexPath(resultsDir, identity.runId))) return true;
@@ -407,10 +410,10 @@ export function createResultWatcher(
 		if (processing.has(file)) return;
 		let observed: ReadonlySet<string> | undefined;
 		try {
-			if (!shouldProcessResult(file)) {
+			if (!shouldProcessResult(file, undefined, undefined, true)) {
 				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
 				observed = observedRunIds();
-				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed)) return;
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed, undefined, true)) return;
 			}
 		} catch (error) {
 			if (!isAccessDenied(error)) throw error;

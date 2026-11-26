@@ -1122,7 +1122,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			supervisorChannel.dispose();
 			waitSubscriptionManager.dispose();
 			fleetStatus?.dispose();
-			disposeAsyncJobTracker();
+			disposeAsyncJobTracker(shutdownReason);
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
 			state.asyncJobs.clear();

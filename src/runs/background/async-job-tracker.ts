@@ -92,7 +92,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	resetJobs: (ctx?: ExtensionContext) => void;
 	/** `observeStatus` also sees the statuses of other sessions' runs that the listing skips. */
 	restoreActiveJobs: (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => void;
-	dispose: () => void;
+	dispose: (shutdownReason?: string) => void;
 } {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const livenessIntervalMs = options.pollIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS;
@@ -106,6 +106,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
 	const terminalPublications = new Map<string, { instanceId?: string; pending: true } | { pending: false }>();
+	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
+	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: string[] }> };
+	const reloadPublications = globals[handoffKey] ??= new WeakMap();
+	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
 	// runner, so the job keeps its last known state rather than reading as finished (#3295).
 	const unreadableStatusRuns = new Set<string>();
@@ -907,7 +912,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (!publicationVisibilityUnknown && !nestedRefreshFailed && !job?.nestedWorkActive) scheduleCleanup(asyncId);
 	};
 
-	const dispose = () => {
+	const dispose = (shutdownReason?: string) => {
+		if (shutdownReason === "reload" && publicationSession) {
+			const runs = [...terminalPublications].filter(([, publication]) => publication.pending).map(([runId]) => runId);
+			if (runs.length) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
+		}
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
 		rootWatcher?.close();
@@ -946,6 +955,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (ctx?.hasUI) state.lastUiContext = ctx;
 		state.statusProjectionSessionId = null;
 		if (!state.currentSessionId) return;
+		publicationSession = ctx && { manager: ctx.sessionManager, id: state.currentSessionId };
+		const handoff = publicationSession && reloadPublications.get(publicationSession.manager);
+		if (publicationSession) reloadPublications.delete(publicationSession.manager);
 		let runs: AsyncRunSummary[];
 		const unreadable: Array<{ runId: string; asyncDir: string }> = [];
 		try {
@@ -957,6 +969,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			return;
+		}
+		if (handoff?.sessionId === state.currentSessionId) {
+			const known = new Set(runs.map((run) => run.id));
+			for (const runId of handoff.runs) {
+				if (known.has(runId)) continue;
+				const [run] = listAsyncRuns(asyncDirRoot, { runId, exactRunId: true, sessionId: state.currentSessionId, resultsDir });
+				if (run) runs.push(run);
+			}
 		}
 		for (const run of runs) {
 			const job = summaryToJob(run);

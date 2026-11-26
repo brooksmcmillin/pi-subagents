@@ -264,14 +264,16 @@ describe("result watcher", () => {
 		}
 	});
 
-	for (const source of ["indexed scan", "native watch", "native watch retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
+	for (const source of ["indexed scan", "native watch", "native watch retry", "native payload retry"]) it(`holds a non-waking completion from ${source} through subscriber dispatch`, async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-wake-order-"));
 		const state = createState();
 		state.currentSessionId = "session-current";
 		const order: string[] = [];
 		const terminalHolds: boolean[] = [];
 		let watchEvent: fs.WatchListener<string> | undefined;
-		let denyFirstRead = source === "native watch retry";
+		const denyDiscovery = source === "native watch retry" || source === "native payload retry";
+		let resultReads = 0;
+		let payloadRetryObserved = false;
 		const reporter = registerProgramStatusReporter({ enabled: true, getJobs: () => [], getPendingRequests: () => [],
 			hasBackgroundWork: () => watcher.hasQueuedOwnedResults(), isTTY: true, env: { TERM: "xterm-256color" } });
 		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) {
@@ -287,9 +289,14 @@ describe("result watcher", () => {
 					return handle as unknown as fs.FSWatcher;
 				},
 				readFileSync: ((file, options) => {
-					if (denyFirstRead && String(file).endsWith("wake-order.json")) {
-						denyFirstRead = false;
-						throw Object.assign(new Error("transient read failure"), { code: "EACCES" });
+					if (String(file).endsWith("wake-order.json")) {
+						resultReads++;
+						if (source === "native payload retry" && resultReads === 3) {
+							payloadRetryObserved = true;
+							assert.deepEqual(terminalHolds, [true]);
+							throw Object.assign(new Error("transient payload failure"), { code: "EACCES" });
+						}
+						if (denyDiscovery && resultReads === 1) throw Object.assign(new Error("transient discovery failure"), { code: "EACCES" });
 					}
 					return fs.readFileSync(file, options);
 				}) as typeof fs.readFileSync,
@@ -305,11 +312,12 @@ describe("result watcher", () => {
 				watchEvent("rename", "wake-order.json");
 			} else watcher.primeExistingResults();
 			assert.equal(state.asyncJobs.size, 0);
-			assert.deepEqual(terminalHolds, source === "native watch retry" ? [] : [true], "hold begins when ownership is known");
+			assert.deepEqual(terminalHolds, denyDiscovery ? [] : [true], "hold begins when ownership is known");
 			assert.deepEqual(order, []);
 			assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath) && !watcher.hasQueuedOwnedResults()), true);
 			assert.deepEqual(order, ["non-waking notice", "subscriber wake", "release"]);
 			assert.deepEqual(terminalHolds, [true, false]);
+			if (source === "native payload retry") assert.equal(payloadRetryObserved, true);
 		} finally {
 			reporter.dispose();
 			watcher.stopResultWatcher();
