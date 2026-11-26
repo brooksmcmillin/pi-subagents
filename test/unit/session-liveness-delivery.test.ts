@@ -89,7 +89,8 @@ const terminalBeforePublicationScript = String.raw`
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
 	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication;
 	const statusOnlyClosure = process.argv[1] === "closed-overlay";
-	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure;
+	const indexDenied = process.argv[1] === "closed-index-denied";
+	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied;
 	const closedCase = process.argv[1] === "closed" || restoredCase || repeatReload || closedFirst;
 	const pendingCase = process.argv[1] === "pending";
 	const tui = closedCase || pendingCase;
@@ -345,10 +346,34 @@ const terminalBeforePublicationScript = String.raw`
 			fs.mkdirSync(path.dirname(mismatchedPending), { recursive: true });
 			writeAtomicJson(mismatchedPending, { id: "different-run", sessionId });
 		}
-		writeStatus("complete", closedFirst ? proof : undefined);
-		events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, closedFirst ? proof : { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
-		await observed;
-		await new Promise((resolve) => originalSetTimeout(resolve, 50));
+		const originalRead = fsDefault.readFileSync;
+		let indexReadFailed = false;
+		if (indexDenied) {
+			fsDefault.readFileSync = (file, ...args) => {
+				if (String(file).includes(path.sep + "result-index" + path.sep) && new Error().stack.includes("at refreshJob")) {
+					indexReadFailed = true;
+					throw Object.assign(new Error("result index temporarily unreadable"), { code: "EACCES" });
+				}
+				return originalRead(file, ...args);
+			};
+			syncBuiltinESMExports();
+		}
+		try {
+			writeStatus("complete", closedFirst ? proof : undefined);
+			events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, closedFirst ? proof : { version: 1, runId, runnerProcessInstanceId: runId + "-runner", state: "pending" });
+			await observed;
+			await new Promise((resolve) => originalSetTimeout(resolve, 50));
+			if (indexDenied) {
+				for (let i = 0; i < 120 && !indexReadFailed; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+				assert.equal(indexReadFailed, true);
+				assert.deepEqual(holds, [true]);
+			}
+		} finally {
+			if (indexDenied) {
+				fsDefault.readFileSync = originalRead;
+				syncBuiltinESMExports();
+			}
+		}
 		assert.equal(fs.existsSync(resultFilePath(DIRS.results, runId)), false);
 		if (!closedFirst) assert.equal(provider.isActive(), true, "an ended child stays live until its result is published");
 
@@ -414,6 +439,7 @@ describe("session liveness through result delivery", () => {
 		["closed", "releases a closed writer hold only after pending storage can confirm absence"],
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["closed-overlay", "settles with validated status-only closure and leaves a mismatched pending result untouched"],
+		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
 		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],

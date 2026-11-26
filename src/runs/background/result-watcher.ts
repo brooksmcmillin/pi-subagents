@@ -744,7 +744,7 @@ export function createResultWatcher(
 			}
 			removeDeliveredResult(file, triggerTurn, read);
 		} catch (error) {
-			if (isAccessDenied(error)) {
+			if (isAccessDenied(error) || ((error as NodeJS.ErrnoException)?.code === "EIO" && queuedOwnedResults.has(file))) {
 				reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'; will retry`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 			} else if (!isNotFound(error)) reportResultWatcherWarning(state, `Failed to process subagent result file '${resultPath}'`, error);

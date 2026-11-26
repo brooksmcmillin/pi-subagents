@@ -710,10 +710,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
 			}
-			if (isStatusAccessError(error, job.asyncDir)) {
+			const code = (error as NodeJS.ErrnoException)?.code;
+			if (isStatusAccessError(error, job.asyncDir) || code === "EACCES" || code === "EPERM") {
 				if (!unreadableStatusRuns.has(job.asyncId)) {
 					unreadableStatusRuns.add(job.asyncId);
-					console.error(`Cannot read async status for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);
+					console.error(`Cannot read async status or result storage for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);
 				}
 				return widgetRenderKey(job, widgetExpanded) !== widgetStateBefore;
 			}

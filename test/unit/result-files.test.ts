@@ -73,6 +73,23 @@ describe("result file indexes", () => {
 		}
 	});
 
+	it("does not promote an indexed pending payload for a different run over the public snapshot", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-mismatched-pending-"));
+		try {
+			const publicPath = path.join(resultsDir, "expected.json");
+			const data = { id: "expected", sessionId: "session-a", success: true };
+			writePendingAsyncResultFile(publicPath, data);
+			const pending = pendingPath(resultsDir, data.sessionId, data.id);
+			fs.writeFileSync(pending, JSON.stringify({ ...data, id: "other" }));
+			fs.writeFileSync(publicPath, JSON.stringify(data));
+			assert.equal(resultPayloadPathForSessionRun(resultsDir, data.sessionId, data.id), publicPath);
+			assert.deepEqual(JSON.parse(fs.readFileSync(publicPath, "utf-8")), data);
+			assert.equal(JSON.parse(fs.readFileSync(pending, "utf-8")).id, "other");
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("writes an indexed pending result without publishing it", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-pending-only-"));
 		const originalError = console.error;

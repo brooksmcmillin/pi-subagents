@@ -377,11 +377,13 @@ export function promotePendingResultFile(resultsDir: string, sessionId: string, 
 	if (!pendingPath) return "none";
 	const resultPath = path.join(resultsDir, file);
 	try {
+		if (!assertPendingResultPayloadMatches(pendingPath, sessionId, runId)) return "none";
 		// POSIX rename replaces the destination atomically. Deleting it first lets a
 		// losing promoter unlink the result that another promoter just published.
 		fs.renameSync(pendingPath, resultPath);
 		return existingResultFile(resultPath) ? "promoted" : "pending";
 	} catch (error) {
+		if (error instanceof SyntaxError) return "none";
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "EEXIST" || code === "EPERM" || code === "EACCES" || isUnaddressableResultCandidate(error)) {
 			const pendingExists = existingResultFile(pendingPath);
