@@ -1012,22 +1012,23 @@ export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSum
 	for (const child of children ?? []) {
 		if (!terminal(child.state) && (child.asyncDir || !ownerExited)) return true;
 		const asyncDir = resolveNestedAsyncDir(rootRunId, child);
+		let childOwnerExited = !child.asyncDir && ownerExited;
 		if (asyncDir && terminal(child.state)) {
 			try {
 				const status = readStatus(asyncDir);
-				if (status?.runId === child.id && status.processTerminal?.state === "pending") {
-					const proof = readProcessTerminal(asyncDir, { runId: child.id, runnerProcessInstanceId: status.processTerminal.runnerProcessInstanceId });
-					const visibility = status.sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), status.sessionId, child.id) : "absent";
-					if (visibility !== "present" && (visibility === "unknown" || proof?.state !== "observed")) return true;
+				if (!status || status.runId === child.id) {
+					const recorded = status?.processTerminal;
+					const proof = readProcessTerminal(asyncDir, { runId: child.id, runnerProcessInstanceId: recorded?.runnerProcessInstanceId });
+					childOwnerExited = recorded?.state === "observed" || proof?.state === "observed";
+					if (recorded?.state === "pending" || recorded?.state === "observed") {
+						const visibility = status?.sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), status.sessionId, child.id) : "absent";
+						if (visibility === "unknown" || (visibility === "absent" && !childOwnerExited)) return true;
+					}
 				}
 			} catch (error) {
 				if (isStatusAccessError(error, asyncDir)) return true;
 			}
 		}
-		if (!child.children?.length && !child.steps?.some((step) => step.children?.length)) continue;
-		const childOwnerExited = asyncDir
-			? readProcessTerminal(asyncDir, { runId: child.id })?.state === "observed"
-			: !child.asyncDir && ownerExited;
 		if (hasLiveOwnedNestedWork(rootRunId, child.children, childOwnerExited)) return true;
 		if (child.steps?.some((step) => hasLiveOwnedNestedWork(rootRunId, step.children, childOwnerExited))) return true;
 	}

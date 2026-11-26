@@ -12,6 +12,7 @@ import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-
 import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { resultFilePath, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { hasLiveSubagentWork } from "../../src/integrations/pi-web-session-liveness.ts";
@@ -1317,6 +1318,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		const ownedDir = path.join(asyncRoot, "run-owned");
 		const foreignDir = path.join(asyncRoot, "run-foreign");
 		const corruptDir = path.join(asyncRoot, "run-corrupt");
+		const mismatchDir = path.join(asyncRoot, "run-mismatch");
+		const resultsDir = path.join(asyncRoot, "results");
+		const unrelatedPayload = resultFilePath(resultsDir, "other-run");
+		const pendingDir = path.join(resultsDir, "result-pending", "session-owner");
 		const nestedRoute = createNestedRoute("run-owned");
 		const denied = denyStat(t);
 		try {
@@ -1327,22 +1332,27 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			updateActiveRunIndex(ownedDir, "running");
 			updateActiveRunIndex(foreignDir, "running");
 			updateActiveRunIndex(corruptDir, "running");
-			for (const dir of [ownedDir, foreignDir, corruptDir]) denied.add(path.join(dir, "status.json"));
+			writeRunningAsyncStatus(mismatchDir, "other-run", "session-owner");
+			updateActiveRunIndex(mismatchDir, "running");
+			writePendingAsyncResultFile(unrelatedPayload, { id: "other-run", sessionId: "session-owner", state: "complete", success: true, timestamp: Date.now() });
+			for (const dir of [ownedDir, foreignDir, corruptDir, mismatchDir]) denied.add(path.join(dir, "status.json"));
 
 			const state = createState();
 			state.currentSessionId = "session-owner";
 			const ui = createUiContext();
-			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10 });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10, resultsDir });
 			tracker.resetJobs(ui.ctx as never);
 			tracker.restoreActiveJobs(ui.ctx as never);
 
-			assert.deepEqual([...state.asyncJobs.keys()].sort(), ["run-corrupt", "run-foreign", "run-owned"]);
+			assert.deepEqual([...state.asyncJobs.keys()].sort(), ["run-corrupt", "run-foreign", "run-mismatch", "run-owned"]);
 			assert.equal(hasLiveSubagentWork(state as never), true);
 
 			denied.clear();
-			await waitForCondition(() => !state.asyncJobs.has("run-foreign") && !state.asyncJobs.has("run-corrupt") && state.asyncJobs.get("run-owned")?.agents?.[0] === "worker", "the runs to resolve by owner");
+			await waitForCondition(() => !state.asyncJobs.has("run-foreign") && !state.asyncJobs.has("run-corrupt") && !state.asyncJobs.has("run-mismatch") && state.asyncJobs.get("run-owned")?.agents?.[0] === "worker", "the runs to resolve by owner");
 			assert.equal(state.asyncJobs.get("run-owned")?.status, "running");
 			assert.equal(state.asyncJobs.get("run-owned")?.nestedRoute?.eventSink, nestedRoute.eventSink);
+			assert.ok(fs.readdirSync(pendingDir).includes("other-run.json"));
+			assert.equal(fs.existsSync(unrelatedPayload), false);
 			assert.equal(errors.filter((line) => line.includes("Dropping restored async run 'run-corrupt'") && line.includes("Failed to parse")).length, 1);
 		} finally {
 			console.error = originalError;

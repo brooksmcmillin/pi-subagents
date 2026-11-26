@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import * as fs from "node:fs";
+import fsDefault, * as fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { retainLiveForegroundNestedRoute } from "../../src/integrations/pi-web-session-liveness.ts";
 import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { createRetainedNestedRouteTracker } from "../../src/runs/background/retained-nested-route-tracker.ts";
 import { resultFilePath, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
-import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createNestedRoute, hasLiveOwnedNestedWork, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { DIRS, TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 const routeRoots: string[] = [];
@@ -100,17 +101,35 @@ describe("retained foreground nested route tracker", () => {
 		});
 		assert.equal(retainLiveForegroundNestedRoute(state, nestedRoute), true);
 		const proof = { version: 1, runId: "nested-child", runnerProcessInstanceId: "runner" };
-		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
-			runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
-			steps: [{ agent: "worker", status: "failed" }], processTerminal: { ...proof, state: "pending" },
-		}));
+		const status = { runId: "nested-child", sessionId: "writer-session", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
+			steps: [{ agent: "worker", status: "failed" }] };
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ ...status, processTerminal: { ...proof, state: "pending" } }));
 		const tracker = createRetainedNestedRouteTracker(state, { platform: "win32", pollIntervalMs: 10 });
 		try {
 			tracker.track(nestedRoute.rootRunId);
 			await waitFor(() => projectNestedEvents(nestedRoute).children[0]?.state === "failed");
 			assert.equal(state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId), true);
-			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ ...proof, state: "observed", observedAt: 300,
-				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 300, exitCode: 1, signal: null }] }));
+			const observed = { ...proof, state: "observed", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: "runner", closeObservedAt: 300, exitCode: 1, signal: null }] };
+			const originalStat = fsDefault.statSync;
+			let denied = false;
+			fsDefault.statSync = ((file, options) => {
+				if (String(file).includes(path.join("nested", nestedRoute.rootRunId, "result-pending"))) {
+					denied = true;
+					throw Object.assign(new Error("payload storage inaccessible"), { code: "EACCES" });
+				}
+				return originalStat(file, options);
+			}) as typeof fs.statSync;
+			syncBuiltinESMExports();
+			try {
+				fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(observed));
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ ...status, processTerminal: observed }));
+				await waitFor(() => denied);
+				assert.equal(state.retainedForegroundNestedRoutes?.has(nestedRoute.rootRunId), true);
+			} finally {
+				fsDefault.statSync = originalStat;
+				syncBuiltinESMExports();
+			}
 			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
 		} finally {
 			tracker.clear();
@@ -147,6 +166,30 @@ describe("retained foreground nested route tracker", () => {
 		} finally {
 			tracker.clear();
 			fs.rmSync(asyncRoot, { recursive: true, force: true });
+			fs.rmSync(results, { recursive: true, force: true });
+		}
+	});
+
+	it("does not prune foreground descendants on a different runner's close proof", () => {
+		const rootId = "stale-runner-root";
+		const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootId, "child");
+		const results = path.join(DIRS.results, "nested", rootId);
+		const base = { id: "child", parentRunId: rootId, depth: 1, path: [{ runId: rootId }], agent: "worker" };
+		const children = [{ ...base, asyncDir, state: "failed" as const, children: [{ ...base, id: "in-process", parentRunId: "child", depth: 2, state: "running" as const }] }];
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.mkdirSync(results, { recursive: true });
+		try {
+			fs.writeFileSync(resultFilePath(results, "child"), "{}");
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "child", sessionId: "parent", mode: "single", state: "failed", startedAt: 100,
+				processTerminal: { version: 1, runId: "child", runnerProcessInstanceId: "current", state: "pending" } }));
+			const writeProof = (id: string) => fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ version: 1, runId: "child", runnerProcessInstanceId: id, state: "observed", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: id, closeObservedAt: 300, exitCode: 1, signal: null }] }));
+			writeProof("previous");
+			assert.equal(hasLiveOwnedNestedWork(rootId, children), true);
+			writeProof("current");
+			assert.equal(hasLiveOwnedNestedWork(rootId, children), false);
+		} finally {
+			fs.rmSync(path.dirname(asyncDir), { recursive: true, force: true });
 			fs.rmSync(results, { recursive: true, force: true });
 		}
 	});

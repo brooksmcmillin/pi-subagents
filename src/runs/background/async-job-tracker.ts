@@ -481,19 +481,20 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const refreshJob = (job: AsyncJobState): boolean => {
-		if (unverifiedRuns.has(job.asyncId)) {
+		const verifyingIdentity = unverifiedRuns.has(job.asyncId);
+		if (verifyingIdentity) {
 			let stored: ReturnType<typeof readStatus> = null;
 			let summary: AsyncRunSummary | undefined;
 			try {
 				stored = readStatus(job.asyncDir);
-				if (stored) summary = summarizeAsyncStatus(job.asyncDir, stored);
+				if (stored?.runId === job.asyncId) summary = summarizeAsyncStatus(job.asyncDir, stored);
 			} catch (error) {
 				if (isStatusAccessError(error, job.asyncDir)) return false;
 				console.error(`[pi-subagents] Dropping restored async run '${job.asyncId}' at '${path.join(job.asyncDir, "status.json")}': ${error instanceof Error ? error.message : String(error)}.`);
 			}
 			const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 			const pending = unverifiedPublications.get(job.asyncId);
-			if (!stored || !summary || (pending && stored.runId !== job.asyncId) || (owners && !owners.has(stored.sessionId))) {
+			if (!stored || !summary || (owners && !owners.has(stored.sessionId))) {
 				forgetJob(job.asyncId);
 				return true;
 			}
@@ -552,6 +553,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			}
 			refreshNestedProjection();
 			const reconciliation = reconcileAsyncRun(job.asyncDir, {
+				expectedRunId: verifyingIdentity ? job.asyncId : undefined,
 				resultsDir,
 				kill: options.kill,
 				now: options.now,
@@ -568,6 +570,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
+			if (verifyingIdentity && !reconciliation.status) {
+				forgetJob(job.asyncId);
+				return true;
+			}
 			const status = reconciliation.status ?? readStatus(job.asyncDir);
 			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
