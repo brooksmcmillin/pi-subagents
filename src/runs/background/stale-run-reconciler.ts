@@ -494,8 +494,9 @@ export function checkRecordedPidLiveness(recorded: RecordedPid, observation: Rec
 export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}, observeStatus?: RawDrainStatusObserver): ReconcileAsyncRunResult {
 	const now = options.now?.() ?? Date.now();
 	const status = readStatus(asyncDir);
-	if ((options.expectedRunId !== undefined && status?.runId !== options.expectedRunId)
-		|| (options.expectedSessionId !== undefined && status?.sessionId !== options.expectedSessionId)) return { status: null, repaired: false };
+	if ((!status && options.expectedRunId !== undefined && !options.startedRun)
+		|| (status && ((options.expectedRunId !== undefined && status.runId !== options.expectedRunId)
+			|| (options.expectedSessionId !== undefined && status.sessionId !== options.expectedSessionId)))) return { status: null, repaired: false };
 	observeStatus?.(status);
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;

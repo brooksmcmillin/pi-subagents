@@ -47,7 +47,7 @@ interface AsyncJobTrackerOptions {
 	widgetLayout?: AsyncWidgetLayout;
 	platform?: NodeJS.Platform;
 	onJobTerminal?: (job: AsyncJobState, publicationClosed: boolean) => void;
-	getOwedResultRunIds?: () => Iterable<string>;
+	getOwedResultRunIds?: () => ReadonlySet<string>;
 	onJobCleanup?: (asyncId: string) => void;
 	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
 	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
@@ -562,14 +562,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
 			}
 			refreshNestedProjection();
-			const exact = restoredJobs.has(job);
+			const restored = restoredJobs.has(job);
+			const exact = restored || Boolean(job.sessionId);
 			const reconciliation = reconcileAsyncRun(job.asyncDir, {
 				expectedRunId: exact ? job.asyncId : undefined,
 				expectedSessionId: exact ? job.sessionId : undefined,
 				resultsDir,
 				kill: options.kill,
 				now: options.now,
-				startedRun: {
+				startedRun: restored ? undefined : {
 					runId: job.asyncId,
 					pid: job.pid,
 					sessionId: job.sessionId,
@@ -582,11 +583,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					sessionFile: job.sessionFile,
 				},
 			});
-			if (exact && !reconciliation.status) {
+			if (restored && !reconciliation.status) {
+				if (job.sessionId && options.getOwedResultRunIds?.().has(job.asyncId)) {
+					if (indexedResultPayloadVisibility(resultsDir, job.sessionId, job.asyncId) !== "absent") {
+						cancelCleanup(job.asyncId);
+						return false;
+					}
+					options.onJobTerminal?.(job, true);
+				}
 				forgetJob(job.asyncId);
 				return true;
 			}
-			const status = reconciliation.status ?? readStatus(job.asyncDir);
+			const status = reconciliation.status ?? (exact ? null : readStatus(job.asyncDir));
 			unreadableStatusRuns.delete(job.asyncId);
 			if (!bridgeAlreadyRequired) {
 				const bridgeEligibility = externalJobBridgeEligibility(status?.steps);

@@ -85,11 +85,13 @@ const terminalBeforePublicationScript = String.raw`
 	const mismatchedMarker = process.argv[1] === "mismatched-marker" || mismatchedRunningMarker;
 	const inheritedPublication = process.argv[1] === "inherited-publication";
 	const restoreDeadRun = process.argv[1] === "restore-dead-with-foreign-result";
-	const indexedAlias = process.argv[1] === "closed-index-alias";
+	const forgetRestored = process.argv[1] === "forget-restored";
+	const aliasEvent = process.argv[1] === "closed-event-alias";
+	const indexedAlias = process.argv[1] === "closed-index-alias" || aliasEvent;
 	const runSessionId = inheritedPublication ? "22222222-2222-4222-8222-222222222222" : sessionId;
 	if (inheritedPublication) recordSessionReplacement(sessionId, runSessionId);
 	const denyFirstRefresh = process.argv[1] === "restore-retry" || provisionalReload;
-	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun;
+	const restoredCase = process.argv[1] === "restored" || process.argv[1] === "repeat-reload" || denyFirstRefresh || mismatchedMarker || inheritedPublication || restoreDeadRun || forgetRestored;
 	const statusOnlyClosure = process.argv[1] === "closed-overlay";
 	const indexDenied = process.argv[1] === "closed-index-denied";
 	const closedFirst = process.argv[1] === "closed-first" || statusOnlyClosure || indexDenied || indexedAlias;
@@ -204,7 +206,7 @@ const terminalBeforePublicationScript = String.raw`
 				writeAsyncResultFile(publicPath, { id: runId, runId, sessionId, completionOwnerId, success: true, notificationDeliveredAt: Date.now() });
 				fsDefault.statSync = (file, ...args) => {
 					if (String(file) === publicPath) {
-						visibilityDenied ||= new Error().stack.includes("indexedResultPayloadVisibility");
+						visibilityDenied ||= new Error().stack.includes(aliasEvent ? "asyncCompleteHandler" : "indexedResultPayloadVisibility");
 						throw Object.assign(new Error("indexed alias temporarily inaccessible"), { code: "EACCES" });
 					}
 					return stat(file, ...args);
@@ -213,7 +215,8 @@ const terminalBeforePublicationScript = String.raw`
 				asyncDir = writeStatus("running");
 				events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
 				writeStatus("complete", exitProof());
-				events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, exitProof());
+				if (aliasEvent) events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, { id: runId, runId, sessionId, completionOwnerId, state: "complete", success: true, triggerTurn: false });
+				else events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, exitProof());
 				for (let i = 0; i < 130 && !visibilityDenied; i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 				assert.equal(visibilityDenied, true);
 				assert.deepEqual(holds, [true]);
@@ -261,6 +264,15 @@ const terminalBeforePublicationScript = String.raw`
 		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, sessionId, completionOwnerId, mode: "single", agent: "worker", asyncDir });
 	}
 	assert.equal(provider.isActive(), true);
+	if (forgetRestored) {
+		fs.rmSync(path.join(asyncDir, "status.json"));
+		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
+		assert.equal(provider.isActive(), false);
+		assert.deepEqual(holds, [true, false]);
+		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
+		process.stdout.write("ok");
+		process.exit(0);
+	}
 	if (provisionalReload) {
 		for (let i = 0; i < 130 && provider.isActive(); i++) await new Promise(resolve => originalSetTimeout(resolve, 50));
 		assert.equal(provider.isActive(), false);
@@ -490,7 +502,9 @@ describe("session liveness through result delivery", () => {
 		["closed-first", "does not strand a hold when the first terminal observation already proves writer closure"],
 		["closed-overlay", "settles with validated status-only closure and leaves a mismatched pending result untouched"],
 		["closed-index-alias", "retains a closed writer hold while its indexed public alias is inaccessible"],
+		["closed-event-alias", "retains a completion event hold while its indexed public alias is inaccessible"],
 		["restore-dead-with-foreign-result", "settles a repaired run without publication or replacing an unrelated result"],
+		["forget-restored", "settles a restored hold after status disappears with no payload"],
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],

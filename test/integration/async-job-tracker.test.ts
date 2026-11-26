@@ -1430,6 +1430,29 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		await waitForCondition(() => state.asyncJobs.get("running")?.status === "complete", "stale repair accepts only the matching result");
 	});
 
+	it("repairs a start-event job from a matching result, not unrelated cached JSON", async () => {
+		const asyncRoot = createTempDir("pi-live-foreign-result-");
+		const asyncDir = path.join(asyncRoot, "live");
+		const resultsDir = path.join(asyncRoot, "results");
+		const result = resultFilePath(resultsDir, "live");
+		const state = { ...createState(), currentSessionId: "parent" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { resultsDir, pollIntervalMs: 10 });
+		try {
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(result, JSON.stringify({ id: "live", sessionId: "other", success: true }));
+			tracker.handleStarted({ id: "live", sessionId: "parent", asyncDir, agent: "worker" });
+			await waitForCondition(() => state.asyncJobs.get("live")?.status === "running", "startup without status remains live");
+			writeRunningAsyncStatus(asyncDir, "live", "parent");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(state.asyncJobs.get("live")?.status, "running");
+			fs.writeFileSync(result, JSON.stringify({ id: "live", sessionId: "parent", success: true }));
+			await waitForCondition(() => state.asyncJobs.get("live")?.status === "complete", "exact snapshot repairs live tracked job");
+		} finally {
+			tracker.dispose();
+			removeTempDir(asyncRoot);
+		}
+	});
+
 	it("defers dead-run repair until its indexed pending result is readable", async (t) => {
 		const asyncRoot = createTempDir("pi-dead-pending-io-");
 		const resultsDir = path.join(asyncRoot, "results");
