@@ -613,6 +613,9 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
 			continue;
 		}
+		const terminalPublication = options.includeTerminalPublication && activeEntries.has(entry) && status.mode !== "workflow"
+			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
+		if (terminalPublication && !isActiveAsyncState(status.state) && status.runId !== entry) continue;
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
 			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
@@ -624,8 +627,6 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		// the nested-events directory, so deferring it for filtered-out runs keeps
 		// restoration at load from scanning that directory when no active runs
 		// match.
-		const terminalPublication = options.includeTerminalPublication && activeEntries.has(entry) && status.mode !== "workflow"
-			&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed");
 		if (allowedStates && !allowedStates.has(status.state) && !terminalPublication) continue;
 		if (owners && !owners.has(status.sessionId)) continue;
 		const nestedWarnings: string[] = [];

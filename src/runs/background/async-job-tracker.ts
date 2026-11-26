@@ -107,11 +107,12 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	// Early native failure is visible before its publisher finishes. Retain only
 	// that scoped observation, using the existing liveness sweep to renew delivery.
 	type PendingPublication = { instanceId?: string; pending: true; provisional?: true };
-	const terminalPublications = new Map<string, PendingPublication | { pending: false }>();
-	const unverifiedPublications = new Map<string, PendingPublication>();
+	type PublicationObligation = PendingPublication | { pending: false };
+	const terminalPublications = new Map<string, PublicationObligation>();
+	const unverifiedPublications = new Map<string, PublicationObligation>();
 	// Reload replaces the tracker but retains the session manager; capacity may already have released the marker.
 	const handoffKey = Symbol.for("pi-subagents.terminal-publication-handoff");
-	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, PendingPublication> }> };
+	const globals = globalThis as typeof globalThis & { [handoffKey]?: WeakMap<object, { sessionId: string; runs: Map<string, PublicationObligation> }> };
 	const reloadPublications = globals[handoffKey] ??= new WeakMap();
 	let publicationSession: { manager: object; id: string } | undefined;
 	// Runs whose status.json this process may not read. An unreadable file says nothing about the
@@ -509,7 +510,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// Become the job a normal restore would have made, but keep the placeholder's state so the
 			// refresh below sees any transition, and its cursor when restore could read events.jsonl.
 			Object.assign(job, restored, { status: job.status, controlEventCursor: job.controlEventCursor ?? restored.controlEventCursor });
-			if (pending && !pending.provisional) {
+			if (pending?.pending && !pending.provisional) {
 				const ownerId = publicationOwner(stored);
 				if (ownerId
 					&& (!pending.instanceId || pending.instanceId === stored.processTerminal?.runnerProcessInstanceId)) {
@@ -644,6 +645,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.sessionFile = status.sessionFile ?? job.sessionFile;
 				const nestedLivenessChanged = refreshNestedLiveness(job);
 				if (isTerminalJobStatus(job.status)) {
+					const nestedOnly = unverifiedPublications.get(job.asyncId)?.pending === false;
+					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false });
 					let publication = terminalPublications.get(job.asyncId);
 					if (!publication && status.mode !== "workflow" && status.runId === job.asyncId
 						&& (status.processTerminal?.state === "pending" || status.processTerminal?.state === "observed")) {
@@ -673,7 +676,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job, publicationClosed);
+					if (!nestedOnly && (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending))) options.onJobTerminal?.(job, publicationClosed);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !job.nestedWorkActive && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);
@@ -938,6 +941,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const runs = new Map(unverifiedPublications);
 			for (const runId of options.getOwedResultRunIds?.() ?? []) if (!runs.has(runId)) runs.set(runId, { pending: true });
 			for (const [runId, publication] of terminalPublications) if (publication.pending) runs.set(runId, publication);
+			for (const job of state.asyncJobs.values()) {
+				if (!runs.has(job.asyncId) && job.nestedWorkActive && isTerminalJobStatus(job.status)
+					&& ownsRun(publicationSession.id, job.sessionId)) runs.set(job.asyncId, { pending: false });
+			}
 			if (runs.size) reloadPublications.set(publicationSession.manager, { sessionId: publicationSession.id, runs });
 		}
 		if (state.poller) clearInterval(state.poller);

@@ -22,10 +22,12 @@ const terminalBeforePublicationScript = String.raw`
 	import registerSubagentExtension from "./src/extension/index.ts";
 	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
 	import { recordSessionReplacement } from "./src/shared/session-succession.ts";
-	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT } from "./src/shared/types.ts";
+	import { DIRS, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT, TEMP_ROOT_DIR } from "./src/shared/types.ts";
 	import { writeAtomicJson } from "./src/shared/atomic-json.ts";
 	import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "./src/runs/background/result-files.ts";
 	import { ACTIVE_RUN_INDEX_DIR, readActiveRunIndex, updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+	import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "./src/runs/shared/nested-events.ts";
+	import { reconcileNestedAsyncDescendants } from "./src/runs/background/stale-run-reconciler.ts";
 
 	// Use the event-driven tracker and run its short debounce timers as microtasks,
 	// so a terminal status is observed before the result file exists.
@@ -133,6 +135,15 @@ const terminalBeforePublicationScript = String.raw`
 		asyncDir = writeStatus("complete", observed, "running");
 		if (observed) writeAtomicJson(path.join(asyncDir, "process-terminal.json"), observed);
 	}
+	const unrelatedRoute = mismatchedMarker ? createNestedRoute("different-run") : undefined;
+	if (unrelatedRoute) {
+		const childDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", unrelatedRoute.rootRunId, "nested-child");
+		fs.mkdirSync(childDir, { recursive: true });
+		writeNestedEvent(unrelatedRoute, { type: "subagent.nested.started", ts: 100, parentRunId: "different-run",
+			child: { id: "nested-child", parentRunId: "different-run", depth: 1, path: [{ runId: "different-run" }], agent: "worker", state: "running", asyncDir: childDir } });
+		writeAtomicJson(path.join(childDir, "status.json"), { runId: "nested-child", mode: "single", state: "failed", startedAt: 100, lastUpdate: 200,
+			steps: [{ agent: "worker", status: "failed" }] });
+	}
 	const restoreStat = fsDefault.statSync;
 	let restoredRefreshDenied = false;
 	if (denyFirstRefresh) {
@@ -172,6 +183,9 @@ const terminalBeforePublicationScript = String.raw`
 		assert.equal(provider.isActive(), false);
 		assert.deepEqual(holds, []);
 		assert.equal(reports.some(report => report.includes("differentrun")), false);
+		assert.equal(projectNestedEvents(unrelatedRoute).children[0]?.state, "running", "unrelated route did not receive a repaired terminal event");
+		reconcileNestedAsyncDescendants(unrelatedRoute);
+		assert.equal(projectNestedEvents(unrelatedRoute).children[0]?.state, "failed", "the fixture would have been repaired if visited");
 		for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" }, ctx);
 		process.stdout.write("ok");
 		process.exit(0);
