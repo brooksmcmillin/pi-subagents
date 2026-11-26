@@ -180,12 +180,16 @@ describe("retained foreground nested route tracker", () => {
 		fs.mkdirSync(results, { recursive: true });
 		try {
 			fs.writeFileSync(resultFilePath(results, "child"), "{}");
-			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "child", sessionId: "parent", mode: "single", state: "failed", startedAt: 100,
-				processTerminal: { version: 1, runId: "child", runnerProcessInstanceId: "current", state: "pending" } }));
+			const status = { runId: "child", sessionId: "parent", mode: "single", state: "failed", startedAt: 100 };
+			const pending = { version: 1, runId: "child", runnerProcessInstanceId: "current", state: "pending" };
+			const writeStatus = (processTerminal: object) => fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ ...status, processTerminal }));
+			writeStatus(pending);
 			const writeProof = (id: string) => fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ version: 1, runId: "child", runnerProcessInstanceId: id, state: "observed", observedAt: 300,
 				instances: [{ kind: "runner", processInstanceId: id, closeObservedAt: 300, exitCode: 1, signal: null }] }));
 			writeProof("previous");
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), true);
+			writeStatus({ ...pending, state: "observed", observedAt: 300, instances: [] });
+			assert.equal(hasLiveOwnedNestedWork(rootId, children), true, "malformed observation cannot release the hold");
 			writeProof("current");
 			assert.equal(hasLiveOwnedNestedWork(rootId, children), false);
 		} finally {

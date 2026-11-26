@@ -18,7 +18,7 @@ import {
 } from "../../shared/types.ts";
 import { isSafeNestedPathId, sanitizeNestedPath, type NestedPathEntry } from "./nested-path.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { readProcessTerminal, sanitizeProcessTerminal } from "../background/process-terminal.ts";
+import { hasObservedRunnerClose, sanitizeProcessTerminal } from "../background/process-terminal.ts";
 import { isStatusAccessError, readStatus } from "../../shared/utils.ts";
 import { resultPayloadVisibility } from "../background/result-files.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
@@ -1018,8 +1018,7 @@ export function hasLiveOwnedNestedWork(rootRunId: string, children: NestedRunSum
 				const status = readStatus(asyncDir);
 				if (!status || status.runId === child.id) {
 					const recorded = status?.processTerminal;
-					const proof = readProcessTerminal(asyncDir, { runId: child.id, runnerProcessInstanceId: recorded?.runnerProcessInstanceId });
-					childOwnerExited = recorded?.state === "observed" || proof?.state === "observed";
+					childOwnerExited = hasObservedRunnerClose(asyncDir, child.id, recorded);
 					if (recorded?.state === "pending" || recorded?.state === "observed") {
 						const visibility = status?.sessionId ? resultPayloadVisibility(path.join(DIRS.results, "nested", rootRunId), status.sessionId, child.id) : "absent";
 						if (visibility === "unknown" || (visibility === "absent" && !childOwnerExited)) return true;

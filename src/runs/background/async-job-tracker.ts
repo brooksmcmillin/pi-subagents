@@ -30,7 +30,7 @@ import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
-import { readProcessTerminal } from "./process-terminal.ts";
+import { hasObservedRunnerClose, readProcessTerminal } from "./process-terminal.ts";
 import { resultPayloadVisibility } from "./result-files.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
@@ -466,10 +466,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		options.onJobCleanup?.(asyncId);
 	};
 
-	const refreshNestedLiveness = (job: AsyncJobState) => {
+	const rootWriterClosed = (job: AsyncJobState, status: ReturnType<typeof readStatus>) =>
+		(!status || status.runId === job.asyncId) && hasObservedRunnerClose(job.asyncDir, job.asyncId, status?.processTerminal);
+
+	const refreshNestedLiveness = (job: AsyncJobState, status?: ReturnType<typeof readStatus>) => {
 		const previous = job.nestedWorkActive;
-		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren,
-			isTerminalJobStatus(job.status) && readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed") : false;
+		let ownerExited = false;
+		if (job.nestedChildren?.length && isTerminalJobStatus(job.status)) {
+			try {
+				ownerExited = rootWriterClosed(job, status === undefined ? readStatus(job.asyncDir) : status);
+			} catch { /* No verified closure; keep ownership live. */ }
+		}
+		job.nestedWorkActive = job.nestedChildren?.length ? hasLiveOwnedNestedWork(job.asyncId, job.nestedChildren, ownerExited) : false;
 		if (job.nestedWorkActive) cancelCleanup(job.asyncId);
 		return job.nestedWorkActive !== previous;
 	};
@@ -649,7 +657,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.turnBudgetExceeded = status.turnBudgetExceeded ?? job.turnBudgetExceeded;
 				job.wrapUpRequested = status.wrapUpRequested ?? job.wrapUpRequested;
 				job.sessionFile = status.sessionFile ?? job.sessionFile;
-				const nestedLivenessChanged = refreshNestedLiveness(job);
+				const nestedLivenessChanged = refreshNestedLiveness(job, status);
 				if (isTerminalJobStatus(job.status)) {
 					const nestedOnly = unverifiedPublications.get(job.asyncId)?.pending === false;
 					if (nestedOnly) terminalPublications.set(job.asyncId, { pending: false });
@@ -953,13 +961,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (route?.rootRunId !== job.asyncId || path.basename(job.asyncDir) !== job.asyncId) continue;
 				let nestedActive = job.nestedWorkActive;
 				try {
+					const stored = readStatus(job.asyncDir);
 					if (!isTerminalJobStatus(job.status)) {
-						const stored = readStatus(job.asyncDir);
 						if (!stored || stored.runId !== job.asyncId || !ownsRun(publicationSession.id, stored.sessionId)
 							|| !isTerminalJobStatus(stored.state)) continue;
 					}
 					nestedActive ||= hasLiveOwnedNestedWork(job.asyncId, projectNestedEvents(route).children,
-						readProcessTerminal(job.asyncDir, { runId: job.asyncId })?.state === "observed");
+						rootWriterClosed(job, stored));
 				} catch {
 					// The replacement can retry the exact owned route if it is temporarily unreadable.
 					nestedActive = true;

@@ -637,14 +637,10 @@ export function createResultWatcher(
 			if (alreadyDelivered) {
 				if (queuedOwnedResults.delete(file)) deps.onOwnedQueueChanged?.();
 				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
-				if (!observerSucceeded) {
-					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-					return;
-				}
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (markReplacedPayload()) return;
 				deps.onResultDelivered?.(runId);
-				if (!completionPersisted) {
+				if (!observerSucceeded || !completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}

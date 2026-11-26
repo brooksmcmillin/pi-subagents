@@ -1015,14 +1015,17 @@ describe("result watcher", () => {
 			const secondState = createState();
 			secondState.currentSessionId = "session-current";
 			let queueChanges = 0;
+			const owedResults = new Set(["observer-reload"]);
 			const secondWatcher = createResultWatcher(pi, secondState, resultsDir, 60_000, {
 				observeCompletion: () => { if (++observerCalls === 2) throw new Error("observer still unavailable"); },
 				notifier: { deliver: async () => { deliveries += 1; return true; } },
 				onOwnedQueueChanged: () => queueChanges++,
+				onResultDelivered: (runId) => { owedResults.delete(runId); },
 			});
 			try {
 				secondWatcher.primeExistingResults();
 				assert.equal(await waitForPredicate(() => observerCalls === 2), true);
+				assert.equal(owedResults.size, 0, "durably accepted result settles restored delivery debt before observer recovery");
 				assert.equal(fs.existsSync(resultPath), true);
 				secondWatcher.primeExistingResults();
 				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);

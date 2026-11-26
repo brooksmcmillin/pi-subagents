@@ -508,6 +508,34 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("keeps a terminal async root's foreground child live until the current runner closes", async () => {
+		const asyncRoot = createTempDir("pi-async-root-instance-");
+		const route = createNestedRoute("tracked-current-runner");
+		const asyncDir = path.join(asyncRoot, route.rootRunId);
+		const state = { ...createState(), currentSessionId: "parent", completionOwnerId: "owner" };
+		const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { pollIntervalMs: 10 });
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			writeNestedEvent(route, { type: "subagent.nested.started", ts: 100, parentRunId: route.rootRunId,
+				child: { id: "foreground", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], agent: "worker", state: "running" } });
+			const proof = { version: 1, runId: route.rootRunId, runnerProcessInstanceId: "current" };
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: route.rootRunId, sessionId: "parent", mode: "single", state: "failed", startedAt: 100,
+				processTerminal: { ...proof, state: "pending" } }));
+			const writeClose = (id: string) => fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify({ ...proof, runnerProcessInstanceId: id, state: "observed", observedAt: 300,
+				instances: [{ kind: "runner", processInstanceId: id, closeObservedAt: 300, exitCode: 1, signal: null }] }));
+			writeClose("stale");
+			tracker.handleStarted({ id: route.rootRunId, sessionId: "parent", agent: "worker", asyncDir, nestedRoute: route });
+			await waitForCondition(() => state.asyncJobs.get(route.rootRunId)?.status === "failed", "terminal root projected");
+			assert.equal(hasLiveSubagentWork(state), true);
+			writeClose("current");
+			await waitForCondition(() => !hasLiveSubagentWork(state), "exact closure drains foreground work");
+		} finally {
+			tracker.dispose();
+			removeTempDir(asyncRoot);
+			removeTempDir(path.dirname(route.eventSink));
+		}
+	});
+
 	for (const phase of ["after it cancels terminal cleanup", "before its first refresh", "before the root's terminal refresh"]) it(`retains late independent work ${phase}`, async () => {
 		const rootStillRunning = phase === "before the root's terminal refresh";
 		const asyncRoot = createTempDir("pi-async-job-owner-close-");
