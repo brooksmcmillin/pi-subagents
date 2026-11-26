@@ -1,14 +1,15 @@
 import * as fs from "node:fs";
-import type { SubagentState } from "../../shared/types.ts";
+import type { ForegroundRunControl, SubagentState } from "../../shared/types.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { hasLiveOwnedNestedWork, projectNestedEvents } from "../shared/nested-events.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 import { reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 
 type RouteState = Pick<SubagentState, "retainedForegroundNestedRoutes">;
 type RouteSession = { manager: object; id: string };
 const reloadKey = Symbol.for("pi-subagents.foreground-route-reload");
 const globals = globalThis as typeof globalThis & {
-	[reloadKey]?: WeakMap<object, { id: string; routes: NonNullable<RouteState["retainedForegroundNestedRoutes"]> }>;
+	[reloadKey]?: WeakMap<object, { id: string; routes: NonNullable<RouteState["retainedForegroundNestedRoutes"]>; retiredOwners: Set<string> }>;
 };
 const reloadRoutes = globals[reloadKey] ??= new WeakMap();
 
@@ -31,6 +32,7 @@ export function createRetainedNestedRouteTracker(
 	const watchers = new Map<string, fs.FSWatcher>();
 	const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	let poller: ReturnType<typeof setInterval> | undefined;
+	let retiredOwners = new Set<string>();
 
 	const close = (rootRunId: string): void => {
 		watchers.get(rootRunId)?.close();
@@ -48,7 +50,8 @@ export function createRetainedNestedRouteTracker(
 		}
 		try {
 			reconcileNestedAsyncDescendants(retained);
-			if (hasLiveOwnedNestedWork(rootRunId, projectNestedEvents(retained).children)) return;
+			if (hasLiveOwnedNestedWork(rootRunId, projectNestedEvents(retained).children, retiredOwners.has(rootRunId))) return;
+			retiredOwners.delete(rootRunId);
 			state.retainedForegroundNestedRoutes?.delete(rootRunId);
 			close(rootRunId);
 			options.onRoutesChanged?.();
@@ -103,17 +106,31 @@ export function createRetainedNestedRouteTracker(
 		for (const timer of refreshTimers.values()) clearTimeout(timer);
 		refreshTimers.clear();
 		state.retainedForegroundNestedRoutes?.clear();
+		retiredOwners.clear();
 	};
 
-	const captureReloadRoutes = ({ manager, id }: RouteSession) => {
-		const routes = state.retainedForegroundNestedRoutes;
-		if (routes?.size) reloadRoutes.set(manager, { id, routes: new Map(routes) });
+	const captureReloadRoutes = ({ manager, id }: RouteSession, controls: Iterable<ForegroundRunControl> = []) => {
+		const routes = new Map(state.retainedForegroundNestedRoutes);
+		const retired = new Set(retiredOwners);
+		for (const control of controls) {
+			const route = control.nestedRoute;
+			if (!route || route.rootRunId !== control.runId || !ownsRun(id, control.sessionId)) continue;
+			try {
+				if (!hasLiveOwnedNestedWork(route.rootRunId, projectNestedEvents(route).children, true)) continue;
+			} catch {
+				// Retry the exact owned route in the replacement runtime.
+			}
+			routes.set(route.rootRunId, route);
+			retired.add(route.rootRunId);
+		}
+		if (routes.size) reloadRoutes.set(manager, { id, routes, retiredOwners: retired });
 	};
 	const restoreReloadRoutes = ({ manager, id }: RouteSession) => {
 		const handoff = reloadRoutes.get(manager);
 		reloadRoutes.delete(manager);
 		if (handoff?.id !== id) return;
 		state.retainedForegroundNestedRoutes = handoff.routes;
+		retiredOwners = handoff.retiredOwners;
 		for (const rootRunId of handoff.routes.keys()) track(rootRunId);
 	};
 	return { track, clear, captureReloadRoutes, restoreReloadRoutes };

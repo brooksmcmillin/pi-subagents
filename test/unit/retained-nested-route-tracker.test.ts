@@ -89,6 +89,29 @@ describe("retained foreground nested route tracker", () => {
 		}
 	});
 
+	it("hands off independent work before the detached foreground control exits", async () => {
+		const nestedRoute = route("detached-reload");
+		writeState(nestedRoute, "running", 100); // In-process child cannot survive the old runtime.
+		const independent = { id: "independent", parentRunId: "nested-child", depth: 2,
+			path: [{ runId: nestedRoute.rootRunId }, { runId: "nested-child" }], agent: "worker", state: "running" as const,
+			asyncDir: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", nestedRoute.rootRunId, "independent") };
+		writeNestedEvent(nestedRoute, { type: "subagent.nested.started", ts: 101, parentRunId: independent.parentRunId, child: independent });
+		const session = { manager: {}, id: "parent" };
+		const original = createRetainedNestedRouteTracker({});
+		original.captureReloadRoutes(session, [{ runId: nestedRoute.rootRunId, sessionId: session.id, mode: "single", startedAt: 0, updatedAt: 0, nestedRoute }]);
+		original.clear();
+		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
+		const replacement = createRetainedNestedRouteTracker(state, { pollIntervalMs: 10 });
+		try {
+			replacement.restoreReloadRoutes(session);
+			assert.equal(state.retainedForegroundNestedRoutes?.size, 1);
+			writeNestedEvent(nestedRoute, { type: "subagent.nested.completed", ts: 200, parentRunId: independent.parentRunId, child: { ...independent, state: "complete" } });
+			await waitFor(() => !state.retainedForegroundNestedRoutes?.size);
+		} finally {
+			replacement.clear();
+		}
+	});
+
 	it("retains a repaired terminal child until its exact writer closes", async () => {
 		const state: Pick<SubagentState, "retainedForegroundNestedRoutes"> = {};
 		const nestedRoute = route("missing-terminal-event-root");

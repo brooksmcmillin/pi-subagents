@@ -710,7 +710,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					console.error(`Failed to service external job bridge for '${job.asyncDir}':`, bridgeError);
 				}
 			}
-			if (isStorageAccessError(error)) {
+			if (isStatusAccessError(error, job.asyncDir) || isStorageAccessError(error)) {
 				if (!unreadableStatusRuns.has(job.asyncId)) {
 					unreadableStatusRuns.add(job.asyncId);
 					console.error(`Cannot read async status or result storage for '${job.asyncDir}'; keeping its last known state until it is readable:`, error);

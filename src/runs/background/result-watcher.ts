@@ -735,7 +735,11 @@ export function createResultWatcher(
 				reportResultWatcherWarning(state, `Completion observer failed for '${resultPath}'`, error);
 			}
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-			// A completion subscriber may queue a wake even if the notifier did not.
+			// A completion subscriber may queue a wake or publish a replacement.
+			if (markReplacedPayload()) {
+				deps.onResultDelivered?.(runId);
+				return;
+			}
 			markDeliverySettled(file, runId);
 			if (!observerSucceeded) {
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);

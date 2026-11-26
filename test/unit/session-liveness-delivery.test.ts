@@ -158,12 +158,13 @@ const terminalBeforePublicationScript = String.raw`
 	}
 	const restoreStat = fsDefault.statSync;
 	let restoredRefreshDenied = false;
+	let secondRestore = false;
 	if (denyFirstRefresh) {
 		fsDefault.statSync = (file, ...args) => {
 			if ((provisionalReload || !restoredRefreshDenied) && String(file) === path.join(asyncDir, "status.json")
 				&& new Error().stack.includes("at refreshJob")) {
 				restoredRefreshDenied = true;
-				throw Object.assign(new Error("first terminal refresh inaccessible"), { code: "EACCES" });
+				throw Object.assign(new Error("terminal refresh inaccessible"), { code: secondRestore ? "EIO" : "EACCES" });
 			}
 			return restoreStat(file, ...args);
 		};
@@ -179,6 +180,7 @@ const terminalBeforePublicationScript = String.raw`
 			handlers.clear();
 			holds.length = 0;
 			restoredRefreshDenied = false;
+			secondRestore = true;
 			registerSubagentExtension(pi);
 			for (const handler of handlers.get("session_start")) await handler({ reason: "reload" }, ctx);
 			assert.equal(restoredRefreshDenied, true, "second runtime probed the exact markerless status");
@@ -442,7 +444,7 @@ describe("session liveness through result delivery", () => {
 		["closed-index-denied", "holds closed writer publication during a denied result index read"],
 		["restored", "reload restores a terminal publication hold before its publisher has written any result"],
 		["restore-retry", "reload retains a terminal publication hold after the first tracker refresh fails"],
-		["provisional-reload", "second reload preserves a markerless terminal publication after first-refresh denial"],
+		["provisional-reload", "second reload preserves a markerless terminal publication through status EIO"],
 		["inherited-publication", "same-process session successor keeps an inherited terminal publication held"],
 		["mismatched-marker", "does not restore terminal status claiming a run ID different from the active marker"],
 		["mismatched-running-marker", "does not restore running status claiming a run ID different from the active marker"],

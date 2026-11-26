@@ -139,10 +139,10 @@ export function isStorageAccessError(error: unknown): boolean {
 	return [errno?.code, errno?.cause?.code].some((code) => code === "EACCES" || code === "EPERM");
 }
 
-/** A `readStatus(asyncDir)` error caused by permissions on that run's own status file, which says nothing about whether its runner is alive. */
+/** A transient I/O error on the run's own status file says nothing about whether its runner is alive. */
 export function isStatusAccessError(error: unknown, asyncDir: string): boolean {
 	const code = ((error as Error | undefined)?.cause as NodeJS.ErrnoException | undefined)?.code;
-	if (code !== "EACCES" && code !== "EPERM") return false;
+	if (code !== "EACCES" && code !== "EPERM" && code !== "EIO") return false;
 	const message = error instanceof Error ? error.message : "";
 	const quotedPath = `'${path.join(asyncDir, "status.json")}':`;
 	return message.startsWith(`Failed to inspect async status file ${quotedPath}`) || message.startsWith(`Failed to read async status file ${quotedPath}`);

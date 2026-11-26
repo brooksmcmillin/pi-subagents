@@ -1134,7 +1134,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			state.cleanupTimers.clear();
 			state.asyncJobs.clear();
 			if (shutdownReason === "reload" && runtimeEntry.sessionManager && state.currentSessionId) {
-				retainedNestedRouteTracker?.captureReloadRoutes({ manager: runtimeEntry.sessionManager, id: state.currentSessionId });
+				retainedNestedRouteTracker?.captureReloadRoutes({ manager: runtimeEntry.sessionManager, id: state.currentSessionId }, state.foregroundControls.values());
 			}
 			retainedNestedRouteTracker?.clear();
 			retainedNestedRouteTracker = undefined;
