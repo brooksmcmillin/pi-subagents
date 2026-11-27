@@ -352,7 +352,6 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "name")) changed("name");
 	if (hasKey(cfg, "package")) changed("package");
 	if (hasKey(cfg, "description")) changed("description");
-	if (hasKey(cfg, "advertise")) changed("advertise");
 	if (hasKey(cfg, "aliases")) changed("alias", "aliases");
 	if (hasKey(cfg, "systemPrompt")) changed("systemPrompt");
 	if (hasKey(cfg, "runner")) changed("runner");
@@ -412,11 +411,6 @@ function parseTools(raw: string): { tools?: string[]; mcpDirectTools?: string[] 
 }
 
 function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): string | undefined {
-	if (hasKey(cfg, "advertise")) {
-		if (cfg.advertise === "") delete target.advertise;
-		else if (typeof cfg.advertise === "boolean") target.advertise = cfg.advertise;
-		else return "config.advertise must be a boolean or empty string when provided.";
-	}
 	if (hasKey(cfg, "aliases")) {
 		if (cfg.aliases === false || cfg.aliases === "") delete target.aliases;
 		else if (typeof cfg.aliases === "string") {
@@ -1054,9 +1048,8 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 
 const formatModelSource = formatModelConfigurationSource;
 
-// User then project overrides are layered, so the override's top-level scope can name a file that did not set `model`.
-function modelOverrideFile(override: NonNullable<AgentConfig["override"]>): { scope: "user" | "project"; path: string } {
-	const scopes = override.fieldScopes?.model;
+function overrideFieldFile(override: NonNullable<AgentConfig["override"]>, field: "model" | "disabled"): { scope: "user" | "project"; path: string } {
+	const scopes = override.fieldScopes?.[field];
 	const scope = scopes?.includes("project") ? "project" : scopes?.includes("user") ? "user" : override.scope;
 	return { scope, path: override.paths?.[scope] ?? override.path };
 }
@@ -1119,7 +1112,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 			lines.push(`Thinking: ${effectiveThinking ?? "default"}`);
 			if (agent.override) {
 				lines.push("Override file:");
-				lines.push(`  ${modelOverrideFile(agent.override).path}`);
+				lines.push(`  ${overrideFieldFile(agent.override, "model").path}`);
 			}
 			if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 				lines.push("Requested model setting:");
@@ -1138,7 +1131,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		lines.push(`  thinking: ${effectiveThinking ?? "default"}`);
 		if (agent.override) {
 			lines.push("  override file:");
-			lines.push(`    ${modelOverrideFile(agent.override).path}`);
+			lines.push(`    ${overrideFieldFile(agent.override, "model").path}`);
 		}
 		if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 			lines.push("  requested model setting:");
@@ -1369,7 +1362,8 @@ function handleDisable(params: ManagementParams, ctx: ManagementContext): AgentT
 		ctx.onAgentsChanged?.();
 		return result(`Disabled agent '${runtimeName}' via ${scope} settings override at ${settingsPath}. It is now hidden from runtime discovery and { action: "list" }.`);
 	}
-	return result(`Wrote a disabled override for '${runtimeName}' at ${settingsPath}, but the agent is still enabled. A higher-precedence ${after?.override?.scope ?? "project"} override is likely winning. Try agentScope: '${after?.override?.scope ?? "project"}'.`, true);
+	const winningScope = after?.override ? overrideFieldFile(after.override, "disabled").scope : "project";
+	return result(`Wrote a disabled override for '${runtimeName}' at ${settingsPath}, but the agent is still enabled. A higher-precedence ${winningScope} override is likely winning. Try agentScope: '${winningScope}'.`, true);
 }
 
 function handleEnable(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
@@ -1395,8 +1389,9 @@ function handleEnable(params: ManagementParams, ctx: ManagementContext): AgentTo
 		if (removed) return result(`Enabled agent '${runtimeName}' (removed disabled override at ${settingsPath}).`);
 		return result(`Agent '${runtimeName}' is already enabled.`);
 	}
-	if (after?.override?.scope && after.override.scope !== scope) {
-		return result(`Agent '${runtimeName}' is still disabled via a ${after.override.scope} scope override at ${after.override.path}. Specify agentScope: '${after.override.scope}' to enable it.`, true);
+	const disabledFile = after?.override ? overrideFieldFile(after.override, "disabled") : undefined;
+	if (disabledFile && disabledFile.scope !== scope) {
+		return result(`Agent '${runtimeName}' is still disabled via a ${disabledFile.scope} scope override at ${disabledFile.path}. Specify agentScope: '${disabledFile.scope}' to enable it.`, true);
 	}
 	return result(`Agent '${runtimeName}' is still disabled after removing the ${scope} disabled override. It may be hidden via subagents.disableBuiltins in ${after?.override?.scope ?? scope} settings at ${after?.override?.path ?? settingsPath}.`, true);
 }

@@ -5,7 +5,7 @@ import type { HerdrRunIdentity } from "./herdr-placed-run.ts";
 import { HERDR_PI_MODE_ENV, HERDR_PI_RUN_ENV, HERDR_PI_RUNTIME_DIR_ENV } from "./herdr-pi-protocol.ts";
 import { localMachineAccess } from "./local-machine-access.ts";
 import { createPlacedRuntimeDir, hashedRuntimeDirName, PlacedRunOwner, removePlacedRuntimeDir } from "./placed-run-owner.ts";
-import { herdrPaneAllocationKey, withHerdrPaneAllocationLock, type PlacementAgentKind, type PlacementBridgeIdentity, type PlacementEvidenceProof, type PlacementMachineAccess, type PlacementOwnedPane, type PlacementPaneHost, type PlacementPromptOptions, type PlacementReconnectCheck, type PlacementRunState, type PlacementStartOptions } from "./placement-host.ts";
+import { herdrPaneAllocationKey, withHerdrPaneAllocationLock, type PlacementAgentKind, type PlacementBridgeIdentity, type PlacementEvidenceProof, type PlacementMachineAccess, type PlacementOwnedPane, type PlacementOwnedRun, type PlacementPaneHost, type PlacementPromptOptions, type PlacementReconnectCheck, type PlacementRunState, type PlacementStartOptions } from "./placement-host.ts";
 
 type HerdrPlacementMachine = HerdrMachineReference | HerdrLocalMachineReference;
 
@@ -77,8 +77,8 @@ async function startHerdrAgent(connection: HerdrForwardedConnection, owned: Plac
 	const started = parseHerdrAgent(response, "agent_started"), terminalId = idOf(started, "terminal_id"), paneId = idOf(started, "pane_id"); if (paneId !== owned.paneId) throw new Error("Herdr started the native agent in an unexpected pane."); return { terminalId, paneId };
 }
 
-async function closeOwnedHerdrPane(connection: HerdrForwardedConnection, owned: PlacementOwnedPane, terminalId: string | undefined, agentName: string | undefined): Promise<void> {
-	let closed = false; if (terminalId && agentName) { const current = parseHerdrAgent(await connection.client.call<Record<string, unknown>>("agent.get", { target: agentName }), "agent_info"); if (ownsHerdrPane(current, terminalId, owned.paneId)) { await connection.client.call("pane.close", { pane_id: owned.paneId }); closed = true; } } if (!closed) { const snapshot = parseHerdrSessionSnapshot(await connection.client.call<Record<string, unknown>>("session.snapshot")); const occupants = snapshotAgents(snapshot).filter((agent) => agent.pane_id === owned.paneId); if (occupants.length !== 0) throw new Error("Refusing cleanup because startup pane ownership is uncertain."); await connection.client.call("pane.close", { pane_id: owned.paneId }); }
+async function closeOwnedHerdrPane(connection: HerdrForwardedConnection, owned: PlacementOwnedPane, run: PlacementOwnedRun): Promise<void> {
+	let closed = false; if (run.terminalId && run.agentName) { const current = parseHerdrAgent(await connection.client.call<Record<string, unknown>>("agent.get", { target: run.agentName }), "agent_info"); if (ownsHerdrPane(current, run.terminalId, owned.paneId)) { await connection.client.call("pane.close", { pane_id: owned.paneId }); closed = true; } } if (!closed) { const snapshot = parseHerdrSessionSnapshot(await connection.client.call<Record<string, unknown>>("session.snapshot")); const occupants = snapshotAgents(snapshot).filter((agent) => agent.pane_id === owned.paneId); if (occupants.length !== 0) throw new Error("Refusing cleanup because startup pane ownership is uncertain."); await connection.client.call("pane.close", { pane_id: owned.paneId }); }
 }
 
 /** Herdr pane host: Herdr RPC over the Herdr socket, SSH-forwarded for a saved machine and direct for `local`. Ownership is the Herdr terminal_id/pane_id pair; run state comes from agent_status. */
@@ -88,10 +88,19 @@ export const herdrPaneHost = {
 	async launch(connection, machine, runId, runtimeDir, request, onPane, options) { const owned = await provisionHerdrOwnedPane(connection, asHerdrMachine(machine), runId, runtimeDir, request.environment); await onPane(owned); const { terminalId } = await startHerdrAgent(connection, owned, request.kind, request.name, request.args, options); return { owned, terminalId }; },
 	async prompt(connection, identity, text, options: PlacementPromptOptions = {}) {
 		// Herdr registers a started agent's name asynchronously, so a prompt right after start can be refused; a refused prompt was not delivered.
-		const clock = options.clock ?? { now: () => Date.now(), wait: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }, deadline = clock.now() + (options.timeoutMs ?? 5_000), pollMs = options.pollMs ?? 100;
+		const clock = options.clock ?? { now: () => Date.now(), wait: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }, deadline = clock.now() + (options.timeoutMs ?? 20_000), pollMs = options.pollMs ?? 100;
 		for (;;) {
 			try { await connection.client.call("agent.prompt", { target: identity.agentName, text }); return; }
-			catch (error) { if (!(error instanceof Error) || !error.message.includes("is not an active named agent") || clock.now() >= deadline) throw error; await clock.wait(Math.min(pollMs, deadline - clock.now())); if (options.stopped?.()) throw new Error("Remote Pi prompt was not sent because the run was stopped.", { cause: error }); }
+			catch (error) {
+				if (!(error instanceof Error) || !error.message.includes("is not an active named agent") || clock.now() >= deadline) throw error;
+				const remainingMs = deadline - clock.now();
+				// Over RPC, agent.start returns with launch_pending and Herdr refuses prompts until the agent is observed ready; agent.wait blocks until then.
+				// A failed wait (older Herdr, name not registered yet, wait timeout) falls back to polling; the refusal stays the error reported at the deadline.
+				try { await connection.client.call("agent.wait", { target: identity.agentName, until: ["idle", "done"], timeout_ms: remainingMs }, remainingMs + 5_000); } catch {}
+				// agent.wait returns at once for an idle agent that Herdr still holds as launch-pending, so always pause before the next prompt.
+				await clock.wait(Math.min(pollMs, Math.max(0, deadline - clock.now())));
+				if (options.stopped?.()) throw new Error("Remote Pi prompt was not sent because the run was stopped.", { cause: error });
+			}
 		}
 	},
 	subscribe(connection, paneId, listener, onDisconnect) { return connection.client.subscribe(herdrStatusSubscriptions(paneId), listener, onDisconnect); },

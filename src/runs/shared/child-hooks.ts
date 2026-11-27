@@ -1,9 +1,7 @@
 import { listBackgroundWorkProviders } from "../../api/background-work.ts";
 import { ReadonlyDrainObservation } from "./readonly-drain-observation.ts";
 import registerFanoutChildSubagentExtension, { createChildSafeState } from "../../extension/fanout-child.ts";
-import registerSubagentFastModeExtension from "./fast-mode-extension.ts";
 import registerSubagentPromptRuntime, { registerSubagentPromptBoundary } from "./subagent-prompt-runtime.ts";
-import { structuredOutputValidatorReady } from "./structured-output.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { ChildHookExtension, ChildSessionLaunch } from "./child-session.ts";
@@ -11,7 +9,7 @@ import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { projectRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 
 type OwnedCapture = Required<Pick<ChildRuntimeConfig, "toolDiagnostic" | "runtimeAcknowledgements">>;
-type PromptProof = { config: ChildRuntimeConfig; snapshot: string; factories?: ChildHookExtension["factory"][]; observeNext?: ReadonlyDrainObservation; observation?: ReadonlyDrainObservation; capture?: OwnedCapture; reporting?: { launch: ChildSessionLaunch; callback: ChildSessionLaunch["onExtensionError"] } };
+type PromptProof = { config: ChildRuntimeConfig; snapshot: string; factories?: ChildHookExtension["factory"][]; observeNext?: ReadonlyDrainObservation; observation?: ReadonlyDrainObservation; capture?: OwnedCapture };
 const promptProofs = new WeakMap<ChildHookExtension["factory"], PromptProof>();
 
 function ownedProof(hooks: ChildHookExtension[]): PromptProof | undefined {
@@ -19,21 +17,11 @@ function ownedProof(hooks: ChildHookExtension[]): PromptProof | undefined {
 	return proof?.factories?.length === hooks.length && proof.factories.every((factory, index) => hooks[index]?.factory === factory) ? proof : undefined;
 }
 
-/** The host's mandatory transcript reporting, owned by the existing hook certificate. */
+/** The host's mandatory transcript reporting. */
 export function withChildSessionErrorReporting(session: Omit<ChildSessionLaunch, "onExtensionError">, transcriptWriter: ChildTranscriptWriter | undefined): ChildSessionLaunch {
-	const launch: ChildSessionLaunch = { ...session, onExtensionError: (error) => {
+	return { ...session, onExtensionError: (error) => {
 		transcriptWriter?.writeStderrLine(`Extension error (${error.extensionPath}, ${error.event}): ${error.error instanceof Error ? error.error.message : String(error.error)}`);
 	} };
-	const proof = ownedProof(launch.hooks);
-	if (proof?.capture && proof.config === launch.runtime) proof.reporting = { launch, callback: launch.onExtensionError };
-	return launch;
-}
-
-export function isReadonlyChildSessionReporting(launch: ChildSessionLaunch): boolean {
-	const proof = ownedProof(launch.hooks);
-	const descriptor = Object.getOwnPropertyDescriptor(launch, "onExtensionError");
-	if (descriptor && (!descriptor.enumerable || !("value" in descriptor))) return false;
-	return proof?.reporting ? proof.reporting.launch === launch && proof.reporting.callback === descriptor?.value : !descriptor && !("onExtensionError" in launch);
 }
 
 /** Admit only own enumerable data: inspecting descriptors must not invoke getters. */
@@ -55,12 +43,10 @@ function readonlyConfig(config: ChildRuntimeConfig, capture?: OwnedCapture): str
 	const keys = dataKeys(config);
 	if (!keys) return undefined;
 	if (capture && (config.toolDiagnostic !== capture.toolDiagnostic || config.runtimeAcknowledgements !== capture.runtimeAcknowledgements)) return undefined;
-	const waitKeys = dataKeys(config.waitTool);
-	if (!waitKeys || waitKeys.some((key) => key !== "enabled")) return undefined;
-	if (config.fast !== false || config.fanoutChild !== false || config.waitTool.enabled !== false) return undefined;
+	if (config.fast !== false || config.fanoutChild !== false) return undefined;
 	for (const key of keys) {
 		const value = Object.getOwnPropertyDescriptor(config, key)!.value;
-		if (["fast", "fanoutChild", "waitTool"].includes(key)) continue;
+		if (["fast", "fanoutChild"].includes(key)) continue;
 		if (capture && (key === "toolDiagnostic" || key === "runtimeAcknowledgements")) continue;
 		if (capture && key === "requiredTools" && Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype) {
 			const descriptors = Object.getOwnPropertyDescriptors(value);
@@ -85,15 +71,6 @@ function noBackgroundProviders(): boolean {
 	} catch { return false; }
 }
 
-/** Internal proof of the captured closure/config, not its caller-controlled display name. */
-export function isReadonlyChildHookProfile(hooks: ChildHookExtension[], config: ChildRuntimeConfig): boolean {
-	const proof = ownedProof(hooks);
-	if (!proof) return false;
-	const valid = proof.config === config && readonlyConfig(config, proof.capture) === proof.snapshot && noBackgroundProviders();
-	if (!valid) proof.observation?.deny();
-	return valid && (proof.observation?.check() ?? true);
-}
-
 /** Arm just the next installation; ordinary installations retain the original API/handlers. */
 export function observeReadonlyChildHookDrain(hooks: ChildHookExtension[], enabled: boolean, sessionFile: string): void {
 	const proof = ownedProof(hooks);
@@ -113,8 +90,7 @@ export function captureReadonlyChildDrain(hooks: ChildHookExtension[]): (() => b
 
 /**
  * The child-side hooks pi-subagents installs in every child, keyed off the
- * launch config. The registrations live in `subagent-prompt-runtime.ts`,
- * `fast-mode-extension.ts`, and `fanout-child.ts`.
+ * launch config. The registrations live in `subagent-prompt-runtime.ts` and `fanout-child.ts`.
  */
 export function createChildHooks(config: ChildRuntimeConfig): ChildHookExtension[] {
 	return childHooks(config);
@@ -159,12 +135,8 @@ function childHooks(config: ChildRuntimeConfig, capture?: OwnedCapture, holdFina
 				proof.observeNext = undefined;
 				registerSubagentPromptRuntime(pi, runtime, proof.observation);
 			}
-			// Pi awaits extension factories, so structured_output's synchronous prepareArguments has its
-			// validator before the model can call it.
-			if (runtime.structuredOutput) return structuredOutputValidatorReady();
 		} },
 	];
-	if (config.fast) hooks.push({ name: "pi-subagents:fast-mode", factory: (pi) => registerSubagentFastModeExtension(pi) });
 	if (config.fanoutChild) hooks.push({ name: "pi-subagents:fanout-child", factory: (pi) => registerFanoutChildSubagentExtension(pi, runtime) });
 	hooks.push({ name: "pi-subagents:prompt-boundary", factory: (pi) => registerSubagentPromptBoundary(pi, runtime) });
 	if (proof) {

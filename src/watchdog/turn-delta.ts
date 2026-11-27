@@ -1,5 +1,5 @@
+import { liftArgsFields } from "../extension/subagent-options.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "./types.ts";
-import { waitToolName } from "../shared/wait-tool-name.ts";
 
 type MessageLike = {
 	role?: string;
@@ -174,12 +174,10 @@ export function formatWatchdogOrchestrationActivity(event: unknown): string {
 	const sections: string[] = [];
 	for (const call of turn.message.content) {
 		if (call?.type !== "toolCall" || typeof call.id !== "string") continue;
-		const args = call.arguments;
-		if (!args || typeof args !== "object") continue;
-		const eligible = call.name === waitToolName()
-			|| (call.name === "subagent_supervisor" && ["pending", "list", "reply"].includes(args.action))
-			|| (call.name === "subagent" && (["status", "resume", "interrupt", "steer", "stop"].includes(args.action)
-				|| (args.action === undefined && (typeof args.agent === "string" || args.workflow !== undefined))));
+		if (!call.arguments || typeof call.arguments !== "object") continue;
+		const args = liftArgsFields(call.arguments);
+		const eligible = call.name === "subagent" && ((typeof args.action === "string" && ["status", "resume", "interrupt", "steer", "stop", "wait", "reply"].includes(args.action))
+			|| (args.action === undefined && (typeof args.agent === "string" || args.workflow !== undefined)));
 		if (!eligible) continue;
 		const result = turn.toolResults.find((value) => {
 			const result = value as { role?: string; toolCallId?: string; toolName?: string };
@@ -188,4 +186,22 @@ export function formatWatchdogOrchestrationActivity(event: unknown): string {
 		if (result) sections.push(formatToolCall(call.name, args), formatWatchdogReviewMessage(result) ?? "");
 	}
 	return sections.join("\n\n");
+}
+
+/** A supervisor reply arrives as a tool result, never as a user prompt, so scope alone never records it. */
+export function formatWatchdogSupervisorReplies(event: unknown): string[] {
+	const turn = event as { type?: string; message?: { content?: unknown }; toolResults?: unknown[] } | undefined;
+	if (turn?.type !== "turn_end" || !Array.isArray(turn.message?.content) || !Array.isArray(turn.toolResults)) return [];
+	const entries: string[] = [];
+	for (const call of turn.message.content) {
+		if (call?.type !== "toolCall" || call.name !== "contact_supervisor" || typeof call.id !== "string") continue;
+		const args = call.arguments;
+		if (!args || typeof args !== "object" || !["need_decision", "interview_request"].includes(args.reason)) continue;
+		const result = turn.toolResults.find((value) => {
+			const result = value as { role?: string; toolCallId?: string; toolName?: string; isError?: boolean; error?: unknown };
+			return result?.role === "toolResult" && result.toolCallId === call.id && result.toolName === call.name && result.isError !== true && !result.error;
+		});
+		if (result) entries.push([formatToolCall(call.name, args), formatWatchdogReviewMessage(result) ?? ""].join("\n\n"));
+	}
+	return entries;
 }

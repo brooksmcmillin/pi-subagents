@@ -15,7 +15,7 @@ import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import { normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
-import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal.ts";
+import { readProcessTerminal, sanitizeProcessTerminal, unobservedRunnerExitPath } from "./process-terminal.ts";
 import { readWorkflowTerminalProof } from "./workflow-terminal-proof.ts";
 import { formatWaitSubscriptions } from "./wait-subscriptions.ts";
 import { resolveAsyncRunLocation } from "./async-resume.ts";
@@ -39,7 +39,7 @@ import { capSummaryOutputs } from "../shared/single-output.ts";
 import { formatParallelHandoffLines } from "../shared/kept-branch-text.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 import { foregroundChildStateLabel } from "../foreground/foreground-history.ts";
-import { waitToolName } from "../../shared/wait-tool-name.ts";
+import { waitForRunText } from "../../shared/wait-call.ts";
 
 /** A step whose structured output has a path line needs only a short inline preview. */
 const STRUCTURED_PREVIEW_WITH_PATH_CHARS = 500;
@@ -162,6 +162,7 @@ function formatRunLifecycleDebug(input: { status: AsyncStatus; asyncDir: string;
 		`Status file: ${path.join(asyncDir, "status.json")}`,
 		status.workflowReceiptPath ? `Workflow receipt: ${status.workflowReceiptPath}` : undefined,
 		`Process terminal file: ${path.join(asyncDir, "process-terminal.json")}`,
+		`Unobserved runner exit file: ${unobservedRunnerExitPath(asyncDir)}`,
 		`Session: ${status.sessionId ?? "unknown"}`,
 		`State: ${status.state}`,
 		`Mode: ${status.mode}`,
@@ -205,7 +206,7 @@ function formatResumeGuidance(runId: string | undefined, children: Array<{ agent
 	const resumableWorkflowChildren = workflowChildren.filter(({ child }) => !(child.status === "paused" && child.activityState === "needs_attention"));
 	if (workflowChildren.length > 0) {
 		return [
-			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
+			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then ${waitForRunText(String(child.runId))}. Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
 			...resumableWorkflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`),
 		].join("\n");
 	}
@@ -305,7 +306,7 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	const detached = run.children.some((child) => child.status === "detached");
 	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
 	if (detached) {
-		lines.push(`Recovery: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+		lines.push(`Recovery: reply to the supervisor request first, then ${waitForRunText(run.runId)}; do not resume or launch a replacement while any child remains detached.`);
 	} else if (resumable) {
 		lines.push(run.children.length === 1
 			? `Revive: subagent({ action: "resume", id: "${run.runId}", message: "..." })`

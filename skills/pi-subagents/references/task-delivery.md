@@ -136,7 +136,7 @@ only for a concrete missing contract. Do not treat this table as a reading list.
 | Trigger | Reference / section |
 | --- | --- |
 | Multiple tasks, repositories, independently testable seams, overlapping owners, writer waves or managed isolation | [Multi-lane orchestration](multi-lane-orchestration.md); for managed allocation also [Worktree isolation](../../../docs/workflows.md#worktree-isolation) |
-| Custom roles, model tiers, unfamiliar prompt design | [Prompting and roles](prompting-and-roles.md) |
+| Custom roles, model tiers, unfamiliar prompt design | [Agent profiles](../../../docs/agents.md) and [Models](../../../docs/models.md) |
 | Resume/replacement, setup failure, report mismatch, non-native wait, fork or external runner | [Execution controls](execution-controls.md): relevant recovery, retained-child, async, fork or external-profile section |
 | Review fanout, disputed findings or unresolved gate failure | [Review and validation](review-and-validation.md) |
 | New API field, typed gates/output schema, runtime acceptance or disabled workflow scripts | [Tool reference](../../../docs/tool-reference.md), [Workflows](../../../docs/workflows.md) or [Configuration](../../../docs/configuration.md), matching section only |

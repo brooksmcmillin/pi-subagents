@@ -50,7 +50,7 @@ rl.on("close", () => { record("closed"); process.exit(0); });
 		hooks: [], noSkills: true, noContextFiles: true,
 		tools: ["read", ...["status", "node", "explore"].map((name) => `mcp__selected__${name}`)],
 		builtinMcpTools: ["status", "node", "explore"].map((name) => ({ name: `mcp__selected__${name}`, selector: `selected/${name}` })),
-		runtime: { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false } as ChildSessionLaunch["runtime"],
+		runtime: { fanoutChild: false, depth: 1, fast: false } as ChildSessionLaunch["runtime"],
 	};
 	const audit = () => fs.existsSync(auditPath) ? fs.readFileSync(auditPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { pid: number; mode: string; event: string }) : [];
 	const configure = (delay: number, mode = "selected", unselected = false) => {
@@ -144,6 +144,6 @@ rl.on("close", () => { record("closed"); process.exit(0); });
 	} finally {
 		if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
-		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 	}
 });

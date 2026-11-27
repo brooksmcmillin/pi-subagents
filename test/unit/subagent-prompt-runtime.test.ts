@@ -8,7 +8,7 @@ import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { convertResponsesMessages, convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { specialistSchema, threatFamilies } from "../fixtures/structured-review/specialist-schema.ts";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
-import { createEventBus } from "../support/helpers.ts";
+import { createEventBus, guideTaughtEntries as taughtEntries } from "../support/helpers.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
 import { clearStructuredOutputCaptures } from "../../src/runs/shared/structured-output.ts";
 import { getAgentDir } from "../../src/shared/utils.ts";
@@ -38,7 +38,7 @@ import registerSubagentPromptRuntime, {
 } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 
 function childConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRuntimeConfig {
-	return { fanoutChild: false, depth: 1, waitTool: { enabled: true }, fast: false, ...overrides };
+	return { fanoutChild: false, depth: 1, fast: false, ...overrides };
 }
 
 function registerChild(ctx: unknown, config: ChildRuntimeConfig) {
@@ -64,7 +64,7 @@ it("does not skip drain for in-process child sessions when hasUI is true", async
 			children: [{ agent: "reviewer", index: 0, status: "detached", updatedAt: 1 }],
 		}]]),
 	} as SubagentState;
-	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "reviewer-ui-session" } };
+	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "reviewer-ui-session", buildContextEntries: () => [] } };
 	const { emit, wake } = registerChild(ctx, childConfig({ runtimeState, holdFinalDrain: (value) => { held.push(value); } }));
 	await emit("session_start");
 	let settled = false;
@@ -89,7 +89,7 @@ it("reads a late-installed owner barrier for each final drain and balances the h
 		}]]),
 	} as SubagentState;
 	const config = childConfig({ runtimeState, holdFinalDrain: (value) => { held.push(value); } });
-	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "fanout-owner-session" } };
+	const ctx = { hasUI: true, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "fanout-owner-session", buildContextEntries: () => [] } };
 	const { emit, wake } = registerChild(ctx, config);
 	await emit("session_start");
 	let pending = true;
@@ -117,7 +117,7 @@ it("keeps a file-backed child's final drain waiting for provider work keyed by i
 		listActiveWork: () => active ? [{ id: "job", sessionId: "child-session-id" }] : [],
 	});
 	try {
-		const ctx = { hasUI: false, sessionManager: { getSessionFile: () => "/sessions/child.jsonl", getSessionId: () => "child-session-id" } };
+		const ctx = { hasUI: false, sessionManager: { getSessionFile: () => "/sessions/child.jsonl", getSessionId: () => "child-session-id", buildContextEntries: () => [] } };
 		const { emit, wake } = registerChild(ctx, childConfig());
 		await emit("session_start");
 		let settled = false;
@@ -148,11 +148,11 @@ it("does not grant nested wait access for an invalid inherited route", async (t)
 	registerSubagentPromptRuntime({
 		on: () => {}, registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool),
 	} as never, childConfig({ runtimeState: { currentSessionId: "owner" } as SubagentState, nestedRoute: { ...route, capabilityToken: "invalid" } }));
-	const result = await tools.get("bg_wait")!.execute("wait", { id: runId, timeoutMs: 1 });
+	const result = await tools.get("subagent")!.execute("wait", { action: "wait", id: runId, timeoutMs: 1 }, undefined, undefined, { sessionManager: { buildContextEntries: taughtEntries } });
 	assert.match(result.content[0].text, /No active run matched/);
 });
 
-it("registered child bg_wait discovers nested personas and agent_end drains the same scope", async () => {
+it("a child's subagent wait discovers nested personas and agent_end drains the same scope", async () => {
 	const route = createNestedRoute(randomUUID());
 	const runId = randomUUID();
 	const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId);
@@ -163,7 +163,7 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 	const events = createEventBus();
 	const tools = new Map<string, { execute: Function }>();
 	const held: boolean[] = [];
-	const ctx = { hasUI: false, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "nested-child-session" } };
+	const ctx = { hasUI: false, sessionManager: { getSessionFile: () => sessionId, getSessionId: () => "nested-child-session", buildContextEntries: taughtEntries } };
 	const emit = async (event: string) => { for (const fn of handlers.get(event) ?? []) await fn({}, ctx); };
 	const writeStatus = (state: "running" | "complete") => {
 		fs.mkdirSync(asyncDir, { recursive: true });
@@ -179,11 +179,11 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 			on: (event: string, fn: Function) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
 			registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool),
 			events,
-		} as never, childConfig({ fanoutChild: true, nestedRoute: route, holdFinalDrain: (value) => { held.push(value); } }));
+		} as never, childConfig({ nestedRoute: route, holdFinalDrain: (value) => { held.push(value); } }));
 		await emit("session_start");
 		writeStatus("running");
-		const wait = tools.get("bg_wait")!;
-		const timed = await wait.execute("wait", { id: runId, timeoutMs: 1 }, undefined, undefined, ctx);
+		const wait = tools.get("subagent")!;
+		const timed = await wait.execute("wait", { action: "wait", id: runId, timeoutMs: 1 }, undefined, undefined, ctx);
 		assert.deepEqual(timed.details.wait?.activeRunIds, [runId], "registered wait must discover its nested persona");
 
 		let settled = false;
@@ -197,7 +197,7 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, undefined);
 		await draining;
 		assert.deepEqual(held, [true, false]);
-		const terminal = await wait.execute("collect", { id: runId }, undefined, undefined, ctx);
+		const terminal = await wait.execute("collect", { action: "wait", id: runId }, undefined, undefined, ctx);
 		assert.equal(terminal.details.completions?.[0]?.runId, runId);
 		assert.ok(terminal.content.some((part: { text?: string }) => part.text?.includes(resultPath)), "model receives a readable result reference, not details alone");
 		assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf8")).results[0].output, "PERSONA_EVIDENCE");
@@ -208,7 +208,7 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 	}
 });
 
-it("fanout child bg_wait yields to a descendant's supervisor request while the awaited run is still running", async () => {
+it("fanout child subagent wait yields to a descendant's supervisor request while the awaited run is still running", async () => {
 	const route = createNestedRoute(randomUUID());
 	const runId = randomUUID();
 	const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId);
@@ -222,7 +222,7 @@ it("fanout child bg_wait yields to a descendant's supervisor request while the a
 	const tools = new Map<string, { execute: Function }>();
 	const ctx = {
 		cwd: process.cwd(), hasUI: false, isIdle: () => false,
-		sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => ownerSessionId, getEntries: () => [] },
+		sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => ownerSessionId, getEntries: () => [], buildContextEntries: taughtEntries },
 	};
 	// SAFETY: this fixture supplies the registration/event APIs both child hooks use; other calls are inert.
 	const pi = new Proxy({
@@ -241,13 +241,12 @@ it("fanout child bg_wait yields to a descendant's supervisor request while the a
 			startedAt: Date.now(), lastUpdate: Date.now(), steps: [{ agent: "worker", status: "running" }],
 		}));
 		updateActiveRunIndex(asyncDir, "running");
-		// Real hook order: the prompt runtime registers bg_wait before fanout-child installs the supervisor channel.
 		for (const hook of createChildHooks(childConfig({ fanoutChild: true, nestedRoute: route }))) hook.factory(pi);
 		for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, ctx);
 		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, asyncDir, sessionId: sessionFile, agents: ["worker"] });
 
 		const startedAt = Date.now();
-		const waiting = tools.get("bg_wait")!.execute("wait", { id: runId, timeoutMs: 3000 }, new AbortController().signal, undefined, ctx);
+		const waiting = tools.get("subagent")!.execute("wait", { action: "wait", id: runId, timeoutMs: 3000 }, new AbortController().signal, undefined, ctx);
 		await new Promise((resolve) => setTimeout(resolve, 25));
 		ensureSupervisorChannelDir(channelDir);
 		fs.writeFileSync(path.join(channelDir, "requests", `${requestId}.json`), JSON.stringify({
@@ -258,7 +257,7 @@ it("fanout child bg_wait yields to a descendant's supervisor request while the a
 
 		const result = await waiting;
 		assert.deepEqual(result.details.wait, { reason: "supervisor_request", timedOut: false, activeRunIds: [runId], activeProviderItems: [] });
-		assert.ok(Date.now() - startedAt < 2500, "bg_wait did not yield before its window elapsed");
+		assert.ok(Date.now() - startedAt < 2500, "wait did not yield before its window elapsed");
 		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")).state, "running");
 	} finally {
 		for (const fn of handlers.get("session_shutdown") ?? []) await fn({}, ctx);
@@ -1044,7 +1043,7 @@ describe("subagent prompt runtime", () => {
 		const subagentResult = { role: "toolResult", toolName: "subagent", content: "OK" };
 		const subagentCall = { role: "assistant", content: [{ type: "toolCall", name: "subagent", input: { agent: "delegate" } }] };
 		const instruction = { role: "custom", customType: "subagent-orchestration-instructions", content: "Subagent orchestration is enabled." };
-		assert.deepEqual(stripParentOnlySubagentMessages([user, subagentCall, subagentResult, instruction], { preserveFanoutToolHistory: true }), [user, subagentCall, subagentResult]);
+		assert.deepEqual(stripParentOnlySubagentMessages([user, subagentCall, subagentResult, instruction], { ownSubagentHistorySince: 0 }), [user, subagentCall, subagentResult]);
 	});
 
 	it("defers native supervisor registration until runtime events and respects installed pi-intercom tools", async () => {
@@ -1061,10 +1060,10 @@ describe("subagent prompt runtime", () => {
 			},
 		} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(tool: { name: string }): void }, supervisorConfig());
 
-		assert.deepEqual(registered, ["bg_wait"]);
+		assert.deepEqual(registered, ["subagent"]);
 		handlers.get("session_start")?.({});
 		await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
-		assert.deepEqual(registered, ["bg_wait"]);
+		assert.deepEqual(registered, ["subagent"]);
 	});
 
 	it("does not satisfy strict allowlists with native generic intercom", () => {
@@ -1088,12 +1087,12 @@ describe("subagent prompt runtime", () => {
 			}));
 
 			handlers.get("session_start")?.({});
-			assert.deepEqual(registered, ["bg_wait", "contact_supervisor"]);
+			assert.deepEqual(registered, ["subagent", "contact_supervisor"]);
 			assert.throws(() => handlers.get("agent_start")?.({}), /requested unavailable child tools: read, grep, find, ls, bash, edit, write, intercom/);
 			assert.deepEqual(diagnostics, [{
 				agent: "scout",
 				required: ["read", "grep", "find", "ls", "bash", "edit", "write", "intercom"],
-				available: ["bg_wait", "contact_supervisor"],
+				available: ["subagent", "contact_supervisor"],
 				missing: ["read", "grep", "find", "ls", "bash", "edit", "write", "intercom"],
 			}]);
 		}
@@ -1190,7 +1189,7 @@ describe("subagent prompt runtime", () => {
 		handlers.get("session_start")?.({});
 		await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
 
-		assert.deepEqual(registered, ["bg_wait", "contact_supervisor"]);
+		assert.deepEqual(registered, ["subagent", "contact_supervisor"]);
 	});
 
 	it("registers only native supervisor tools at runtime when pi-intercom is absent", async () => {
@@ -1209,10 +1208,10 @@ describe("subagent prompt runtime", () => {
 			} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(tool: { name: string }): void }, supervisorConfig());
 
 			handlers.get("session_start")?.({});
-			assert.deepEqual(registered, ["bg_wait", "contact_supervisor"]);
+			assert.deepEqual(registered, ["subagent", "contact_supervisor"]);
 
 			await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
-			assert.deepEqual(registered, ["bg_wait", "contact_supervisor"]);
+			assert.deepEqual(registered, ["subagent", "contact_supervisor"]);
 		}
 	});
 
@@ -1345,7 +1344,7 @@ describe("subagent prompt runtime", () => {
 		assert.equal(handlers[0]!({ systemPrompt: finalized!.systemPrompt }), undefined);
 	});
 
-	it("strips subagent history without moving Pi's system messages", async () => {
+	it("strips parent-only messages and keeps the child's own subagent history without moving Pi's system messages", async () => {
 		const handlers = new Map<string, Function[]>();
 		registerSubagentPromptRuntime({
 			on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
@@ -1357,11 +1356,12 @@ describe("subagent prompt runtime", () => {
 		const task = { role: "user", content: "Task", timestamp: 1 };
 		const call = { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "subagent", arguments: {} }], timestamp: 2 };
 		const result = { role: "toolResult", toolCallId: "call_1", toolName: "subagent", content: [], isError: false, timestamp: 3 };
+		const notice = { role: "custom", customType: "subagent-notify", content: "done", display: false, timestamp: 3 };
 		// A mid-conversation system message must stay where it is, or the cached prefix ends at the tools.
 		const sectionUpdate = { role: "system", content: "", sections: { time: "Now: 10:00" }, timestamp: 4 };
 		const next = { role: "user", content: "Continue", timestamp: 5 };
 
-		assert.deepEqual(await runner.emitContext([leading, task, call, result, sectionUpdate, next] as never), [leading, task, sectionUpdate, next]);
+		assert.deepEqual(await runner.emitContext([leading, task, call, result, notice, sectionUpdate, next] as never), [leading, task, call, result, sectionUpdate, next]);
 	});
 
 	it("filters parent-only artifacts from polluted fork context while preserving ordinary history", () => {
@@ -1383,7 +1383,7 @@ describe("subagent prompt runtime", () => {
 		const otherCustom = { role: "custom", customType: "other", content: "keep" };
 
 		assert.deepEqual(contextHandler?.({ messages: [priorParentTurn, instruction, slashResult, subagentCall, subagentResult, watchdogWarning, childWatchdogWarning, otherCustom, currentTask] }), {
-			messages: [priorParentTurn, otherCustom, currentTask],
+			messages: [priorParentTurn, subagentCall, subagentResult, otherCustom, currentTask],
 		});
 	});
 

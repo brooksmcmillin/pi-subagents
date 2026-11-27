@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import {
 	DEFAULT_FAST_TOOL_TIMEOUT_MS,
 	DEFAULT_FAST_TOOL_TIMEOUT_TOOLS,
-	TOOL_TIMEOUT_ALLOWLIST,
+	TOOL_TIMEOUT_EXEMPT_TOOLS,
 	TOOL_TIMEOUT_ENV,
 	defaultToolTimeoutMs,
 	effectiveToolTimeoutMs,
@@ -77,14 +77,14 @@ describe("effectiveToolTimeoutMs", () => {
 	});
 
 	it("never applies a tool timeout to blocking coordination tools", () => {
-		for (const tool of ["contact_supervisor", "intercom", "bg_wait"]) {
+		for (const tool of ["contact_supervisor", "intercom", "subagent"]) {
 			assert.equal(isToolTimeoutExempt(tool), true, `${tool} must be exempt`);
 			assert.equal(effectiveToolTimeoutMs(tool, 1234), undefined);
 			assert.equal(effectiveToolTimeoutMs(tool, undefined), undefined);
 		}
 		assert.equal(isToolTimeoutExempt("bash"), false);
 		assert.equal(isToolTimeoutExempt(undefined), false);
-		assert.deepEqual([...TOOL_TIMEOUT_ALLOWLIST].sort(), ["bg_wait", "contact_supervisor", "intercom"]);
+		assert.deepEqual([...TOOL_TIMEOUT_EXEMPT_TOOLS].sort(), ["contact_supervisor", "intercom", "subagent"]);
 	});
 });
 

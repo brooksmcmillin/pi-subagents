@@ -1170,10 +1170,10 @@ syncBuiltinESMExports();
 			shareEnabled: false,
 			maxSubagentDepth: 2,
 		};
-		const startedEvent = (id: string): { task?: string; goal?: string } => {
+		const startedEvent = (id: string): { task?: string; goal?: string; description?: string } => {
 			const event = emitted.find((entry) => entry.channel === SUBAGENT_ASYNC_STARTED_EVENT && (entry.data as { id?: string }).id === id);
 			assert.ok(event, `missing async-started event for ${id}`);
-			return event.data as { task?: string; goal?: string };
+			return event.data as { task?: string; goal?: string; description?: string };
 		};
 		mockPi.onCall({ output: "single done" });
 		const singleId = `async-handoff-single-${Date.now().toString(36)}`;
@@ -1188,10 +1188,11 @@ syncBuiltinESMExports();
 		});
 		assert.match(singleResult.content[0]?.text ?? "", /Async: worker \[/);
 		assert.match(singleResult.content[0]?.text ?? "", /Do not run sleep timers or polling loops/);
-		assert.match(singleResult.content[0]?.text ?? "", /Use bg_wait only/i);
+		assert.match(singleResult.content[0]?.text ?? "", /Use subagent\(\{ action: "wait" \}\) only/i);
 		assert.match(singleResult.content[0]?.text ?? "", /non-interactive run: Pi auto-drains current-session subagent work at agent_end/);
 		assert.equal(startedEvent(singleId).task, "[prompt redacted]");
 		assert.equal(startedEvent(singleId).goal, "[prompt redacted]");
+		assert.equal(startedEvent(singleId).description, "Test agent: worker");
 		await waitForAsyncResultFile(singleId, 30_000);
 
 		mockPi.onCall({ output: "interactive done" });
@@ -1203,8 +1204,8 @@ syncBuiltinESMExports();
 			...commonParams,
 			ctx: { ...commonParams.ctx, interactive: true },
 		});
-		assert.match(interactiveResult.content[0]?.text ?? "", /Return control now: native completion wakes you/);
-		assert.doesNotMatch(interactiveResult.content[0]?.text ?? "", /bg_wait\(\{ id:/);
+		assert.match(interactiveResult.content[0]?.text ?? "", /Completion wakes you; keep working or end your turn/);
+		assert.doesNotMatch(interactiveResult.content[0]?.text ?? "", /subagent\(\{ action: "wait", id:/);
 		assert.doesNotMatch(interactiveResult.content[0]?.text ?? "", /auto-drain/);
 		await waitForAsyncResultFile(interactiveId, 30_000);
 
@@ -1219,8 +1220,9 @@ syncBuiltinESMExports();
 		});
 		assert.match(parallelResult.content[0]?.text ?? "", /Async parallel:/);
 		assert.match(parallelResult.content[0]?.text ?? "", /Do not run sleep timers or polling loops/);
-		assert.match(parallelResult.content[0]?.text ?? "", /Use bg_wait only/i);
+		assert.match(parallelResult.content[0]?.text ?? "", /Use subagent\(\{ action: "wait" \}\) only/i);
 		assert.equal(startedEvent(parallelId).goal, "[prompt redacted]");
+		assert.equal(startedEvent(parallelId).description, "Test agent: worker");
 		const parallelResultPath = await waitForAsyncResultFile(parallelId, 10_000);
 		const parallelPayload = JSON.parse(fs.readFileSync(parallelResultPath, "utf-8")) as { agent?: string; mode?: string };
 		assert.equal(parallelPayload.mode, "parallel");
@@ -1712,6 +1714,48 @@ syncBuiltinESMExports();
 		assert.equal(payload.success, true);
 		assert.deepEqual(finalStatus.steps?.map((step) => step.agent), ["producer", "reviewer", "reviewer", "consumer"]);
 		assert.deepEqual(finalStatus.parallelGroups, [{ start: 1, count: 2, stepIndex: 1 }]);
+	});
+
+	it("async chains read each running step's own tool budget after a dynamic fanout group expands", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const releaseReview = path.join(tempDir, "release-review");
+		const releaseConsumer = path.join(tempDir, "release-consumer");
+		const heldBashCall = (releasePath: string, text: string) => ({ steps: [
+			{ jsonl: [events.toolStart("bash", { command: "ls" })] },
+			{ waitForPath: releasePath, jsonl: [events.toolEnd("bash"), events.toolResult("bash", "ok"), events.assistantMessage(text)] },
+		] });
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		mockPi.onCall(heldBashCall(releaseReview, "review-a"));
+		mockPi.onCall({ output: "review-b" });
+		mockPi.onCall(heldBashCall(releaseConsumer, "used reviews"));
+		const id = `async-dynamic-budget-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}" },
+					collect: { as: "reviews" },
+					concurrency: 1,
+				},
+				{ agent: "consumer", task: "Use {outputs.reviews}", toolBudget: { hard: 5 } },
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-budget" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const reviewing = await waitForAsyncState(id, (status) => status.steps?.[1]?.status === "running" && status.steps[1].toolCount === 1);
+		assert.equal(reviewing.steps?.[1]?.toolBudget, undefined);
+		fs.writeFileSync(releaseReview, "");
+		const consuming = await waitForAsyncState(id, (status) => status.steps?.[3]?.status === "running" && status.steps[3].toolCount === 1);
+		assert.deepEqual(consuming.steps?.map((step) => step.agent), ["producer", "reviewer", "reviewer", "consumer"]);
+		assert.equal(consuming.steps?.[3]?.toolBudget?.toolCount, 1);
+		assert.equal(consuming.steps?.[3]?.currentTool, "bash");
+		fs.writeFileSync(releaseConsumer, "");
+		await waitForAsyncResultFile(id, 10_000);
 	});
 
 	it("async chains expand dynamic fanout and persist collected output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

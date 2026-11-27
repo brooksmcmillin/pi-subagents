@@ -75,7 +75,7 @@ const terminalBeforePublicationScript = String.raw`
 	const ctx = {
 		cwd: process.cwd(), hasUI: false, model: undefined, isIdle() { return false; },
 		ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
-		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
+		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; }, buildContextEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
 	};
 	const nextSend = () => new Promise((resolve, reject) => {
@@ -176,7 +176,7 @@ describe("session liveness through result delivery", () => {
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 			assert.equal(result.stdout, "ok");
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 		}
 	});
 
@@ -243,7 +243,7 @@ describe("session liveness through result delivery", () => {
 			delete (globalThis as Record<PropertyKey, unknown>)[registryKey];
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 		}
 	});
 
@@ -331,7 +331,7 @@ describe("session liveness through result delivery", () => {
 			else globals[registryKey] = previousRegistry;
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 		}
 	});
 });

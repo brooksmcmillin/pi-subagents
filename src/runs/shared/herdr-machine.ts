@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExternalProcessStatus, HerdrLocalMachineReference, HerdrMachineReference, PlacementMachineReference } from "../../shared/types.ts";
+import type { ExternalProcessStatus, HerdrCoreLocalMachineReference, HerdrLocalMachineReference, HerdrMachineReference, PlacementMachineReference } from "../../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../../shared/utils.ts";
-import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS, type CodeOwnedExternalCliAdapterId } from "./external-cli-contract.ts";
+import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS } from "./external-cli-contract.ts";
 import type { runExternalCli } from "./external-cli-runner.ts";
 import { herdrLocalEnv, parseHerdrEndpoint } from "./herdr-connection.ts";
 import { REX_LOCAL_MACHINE, resolveLocalLaunchCwd, resolveRexLocalPlacement } from "./rex-machine.ts";
@@ -23,8 +23,6 @@ const HERDR_MACHINE_LIST_TIMEOUT_MS = 7_500;
 const MAX_HERDR_MACHINE_LIST_BYTES = 1024 * 1024;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/u;
 const SUPPORTED_MACHINE_ADAPTERS = new Set<string>(CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS);
-/** The local ssh process gets only what ssh itself needs; remote runs use the machine's own credentials. */
-export const HERDR_SSH_ENV_ALLOWLIST = ["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK"] as const;
 
 type RunExternalCliInput = Parameters<typeof runExternalCli>[0];
 
@@ -56,11 +54,12 @@ export interface ResolveHerdrMachinePlacementInput {
 	/** Test seam: settings entry instead of reading settings files. */
 	settings?: MachineSettingsEntry;
 	herdrBin?: string;
+	hcBin?: string;
 }
 
 export interface HerdrMachinePlacement extends MachinePlacement { machine: HerdrMachineReference }
 
-/** A resolved `machine` value: a Herdr saved machine, a Rex SSH host, or the reserved `local` (a new tab of the Herdr or Rex session this Pi runs in). */
+/** A resolved `machine` value: a Herdr saved machine, a Rex SSH host, or the reserved `local` (a child of the Herdr, Herdr Core or Rex terminal this Pi runs in). */
 export interface MachinePlacement {
 	machine: PlacementMachineReference;
 	/** Opt-in `subagents.machines.<name>.env`, exported in front of the remote command. */
@@ -265,19 +264,33 @@ function resolveHerdrLocalPlacement(input: { cwd: string; stepCwd?: string; env:
 	return { provider: "herdr", id: REX_LOCAL_MACHINE, socket: endpoint.socket, ...(endpoint.session ? { session: endpoint.session } : {}), cwd: resolveLocalLaunchCwd(input.cwd, input.stepCwd) };
 }
 
-/** `local` resolves to a new tab of the terminal this Pi runs in (Herdr, else Rex); a name with a `rex` entry in user settings to a Rex pane on that SSH host; any other value to a Herdr saved machine. */
+function resolveHerdrCoreLocalPlacement(input: { cwd: string; stepCwd?: string; env: NodeJS.ProcessEnv; hcBin?: string }): HerdrCoreLocalMachineReference {
+	if (process.platform === "win32") throw new Error("Machine 'local' runs the child in a Herdr Core terminal, which is not supported on Windows.");
+	const terminal = input.env.HC_TERMINAL_ID?.trim();
+	const socket = input.env.HC_TERMINAL_SOCKET?.trim();
+	if (!terminal || !socket || !path.isAbsolute(socket)) throw new Error("Machine 'local' needs HC_TERMINAL_ID and an absolute HC_TERMINAL_SOCKET from Herdr Core.");
+	const bin = input.hcBin ?? "hc";
+	const result = spawnSync(bin, ["--json", "get", terminal], { env: input.env, encoding: "utf-8", maxBuffer: MAX_HERDR_MACHINE_LIST_BYTES, timeout: HERDR_MACHINE_LIST_TIMEOUT_MS, windowsHide: true });
+	if (result.error) throw new Error((result.error as NodeJS.ErrnoException).code === "ENOENT" ? `Machine 'local' needs the Herdr Core CLI, but '${bin}' was not found on PATH.` : `Failed to run hc get ${terminal}: ${result.error.message}`, { cause: result.error });
+	if (result.status !== 0) throw new Error(`Machine 'local' could not confirm this Pi's Herdr Core terminal ${terminal}: ${(result.stderr || result.stdout).trim().slice(0, 512)}`);
+	let found: { address?: unknown; state?: unknown } | null;
+	try { found = JSON.parse(result.stdout); } catch (error) { throw new Error(`Machine 'local' received malformed terminal data from Herdr Core for ${terminal}.`, { cause: error }); }
+	if (found?.address !== terminal || found.state !== "live") throw new Error(`Herdr Core did not confirm live parent terminal ${terminal}.`);
+	return { provider: "herdr-core", id: REX_LOCAL_MACHINE, socket, parentTerminal: terminal, cwd: resolveLocalLaunchCwd(input.cwd, input.stepCwd) };
+}
+
+/** `local` resolves to a child of the terminal this Pi runs in (a new tab in Herdr or Rex, a headless terminal in Herdr Core); a name with a `rex` entry in user settings to a Rex pane on that SSH host; any other value to a Herdr saved machine. */
 export function resolveMachinePlacement(input: ResolveHerdrMachinePlacementInput): MachinePlacement {
 	const requested = validateMachineName(input.machine);
 	const settings = input.settings ?? readMachineSettings(input.cwd, [requested]);
 	if (requested === REX_LOCAL_MACHINE) {
-		if (settings?.rex) throw new Error("Machine 'local' is reserved for a new tab on this machine; give the Rex SSH host in subagents.machines.local.rex another name.");
+		if (settings?.rex) throw new Error("Machine 'local' is reserved for this machine; give the Rex SSH host in subagents.machines.local.rex another name.");
 		const env = input.env ?? process.env;
-		// A Herdr pane sets both; when Herdr runs inside a Rex tab its panes also inherit REX_SESSION, and the Herdr pane is where this Pi is drawn.
+		// Herdr panes and Herdr Core terminals can inherit REX_SESSION; the runtime that directly owns this Pi wins over Rex.
 		if (env.HERDR_ENV === "1" && env.HERDR_PANE_ID?.trim()) return { machine: resolveHerdrLocalPlacement({ cwd: input.cwd, stepCwd: input.stepCwd, env, herdrBin: input.herdrBin }) };
+		if (env.HC_TERMINAL_ID?.trim()) return { machine: resolveHerdrCoreLocalPlacement({ cwd: input.cwd, stepCwd: input.stepCwd, env, hcBin: input.hcBin }) };
 		if (env.REX_SESSION?.trim()) return { machine: resolveRexLocalPlacement({ cwd: input.cwd, stepCwd: input.stepCwd, env }) };
-		// Herdr Core (`hc`, the Herdr app's terminal server) is a different product from the herdr multiplexer, with a different CLI and protocol.
-		const core = env.HC_TERMINAL_ID?.trim() ? " It runs in a Herdr Core terminal (HC_TERMINAL_ID), which machine 'local' does not support." : "";
-		throw new Error(`Machine 'local' opens the child in a new tab of the terminal this Pi runs in, but this Pi is running in neither Herdr (HERDR_ENV=1 with HERDR_PANE_ID) nor Rex (REX_SESSION).${core}`);
+		throw new Error("Machine 'local' opens the child in the terminal this Pi runs in, but this Pi is running in neither Herdr (HERDR_ENV=1 with HERDR_PANE_ID), Herdr Core (HC_TERMINAL_ID), nor Rex (REX_SESSION).");
 	}
 	if (settings?.rex) return { machine: { provider: "rex", id: requested, target: settings.rex.ssh, cwd: validateRemoteCwd(remoteMachineCwd(input.stepCwd, settings.cwd, requested), requested) } };
 	return resolveHerdrMachinePlacement(input);
@@ -301,7 +314,7 @@ export function formatHerdrMachineRunnerUnsupported(input: {
 	if (rex) {
 		if (input.runnerType !== undefined && input.runnerType !== "pi") return `Agent '${input.agentName}' requested machine '${name}', but ${local ? "machine 'local' runs" : "Rex supports"} native Pi children only. Remove the machine or use a native Pi agent.`;
 		if (input.worktree === true) return `Agent '${input.agentName}' requested machine '${name}', but managed worktrees cannot be combined with machine placement.`;
-		if (process.platform === "win32") return `Machine '${name}' runs the child in ${local ? "a Herdr or Rex pane" : "a Rex pane"}, which is not supported on Windows.`;
+		if (process.platform === "win32") return `Machine '${name}' runs the child in ${local ? "a Herdr, Herdr Core or Rex terminal" : "a Rex pane"}, which is not supported on Windows.`;
 		return undefined;
 	}
 	if (input.runnerType !== undefined && input.runnerType !== "pi" && input.runnerType !== "external-cli") {

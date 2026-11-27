@@ -10,6 +10,7 @@ import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts
 import { discoverAgents, discoverAgentsAll, inspectAgentDefinitionDirectory, type AgentConfig } from "../../src/agents/agents.ts";
 import { parseFrontmatter, parseFrontmatterList, parseUnquotedList } from "../../src/agents/frontmatter.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { runSync } from "../../src/runs/foreground/execution.ts";
 import { applyThinkingSuffix } from "../../src/runs/shared/child-tool-plan.ts";
 import { THINKING_LEVELS } from "../../src/shared/model-info.ts";
 
@@ -524,31 +525,6 @@ body`);
 		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
 		assert.deepEqual(worker.skillPath, ["./skills", "../shared-skills"]);
 		assert.match(serializeAgent(worker), /^skillPath: \.\/skills, \.\.\/shared-skills$/m);
-	}));
-});
-
-describe("agent advertise frontmatter", () => {
-	it("parses and serializes explicit prompt advertisement", () => withTempHome(() => {
-		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-advertised-agent-"));
-		tempDirs.push(project);
-		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
-name: worker
-description: Worker
-advertise: true
----
-body`);
-
-		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
-		assert.equal(worker.advertise, true);
-		assert.match(serializeAgent(worker), /^advertise: true$/m);
-	}));
-
-	it("rejects non-boolean advertise values", () => withTempHome(() => {
-		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-invalid-advertise-"));
-		tempDirs.push(project);
-		writeAgent(path.join(project, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\nadvertise: yes\n---\nbody");
-
-		assert.match(discoverAgents(project, "project").agentDiagnostics?.[0]?.error ?? "", /invalid advertise frontmatter; expected true or false/);
 	}));
 });
 
@@ -1879,7 +1855,7 @@ Do work
 		assert.equal(worker?.extraFields?.fast, undefined);
 	});
 
-	it("adds the fast extension only for native OpenAI-Codex models", () => {
+	it("plans Fast without inferring the adapter from the model string", () => {
 		const launch = {
 			host: "parent" as const,
 			cwd: process.cwd(),
@@ -1891,12 +1867,25 @@ Do work
 			childIndex: 0,
 			fast: true,
 		};
-		const allowed = buildInProcessChildLaunch({ ...launch, model: "openai-codex/gpt-6-sol:low" });
+		const planned = buildInProcessChildLaunch({ ...launch, model: "fixture/synthetic-model:low" });
 
-		assert.ok(allowed.toolPlan.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fast-mode-extension.ts")));
-		assert.deepEqual(allowed.session.hooks.map((hook) => hook.name), ["pi-subagents:prompt-runtime", "pi-subagents:fast-mode", "pi-subagents:prompt-boundary"]);
-		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "anthropic/claude-sonnet-4" }), /fast mode supports only/);
-		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "openai/gpt-6-sol" }), /fast mode supports only/);
+		assert.equal(planned.session.runtime.fast, true);
+	});
+
+	it("refuses a foreground Fast launch before the child session is created when the registry shows another adapter", async () => {
+		const worker: AgentConfig = { name: "worker", description: "worker", systemPrompt: "", systemPromptMode: "replace", inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, source: "project", filePath: "worker.md", model: "anthropic/claude-sonnet-4", tools: ["read"] };
+		let created = 0;
+		const factory = { async create(): Promise<never> { created++; throw new Error("session opened"); }, async dispose() {}, async disposeForParent() {} };
+		const outcome = await runSync(process.cwd(), [worker], "worker", "task", {
+			runId: "fast-foreground",
+			childSessionFactory: factory,
+			fast: true,
+			acceptance: false,
+			availableModels: [{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", api: "anthropic-messages" }],
+		}).then((result) => result.error ?? "", (error: unknown) => error instanceof Error ? error.message : String(error));
+
+		assert.equal(created, 0);
+		assert.match(outcome, /Cannot forward fast mode: 'anthropic\/claude-sonnet-4' uses 'anthropic-messages'/);
 	});
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents",
-  "version": "0.89.0",
+  "version": "0.90.0",
   "private": true,
   "description": "Pi extension for single-agent delegation and scripted multi-agent workflows",
   "author": "Nico Bailon",
@@ -62,12 +62,11 @@
     "build:pkg": "node scripts/build-package.mjs",
     "pack:pkg": "npm run build:pkg && npm pack ./dist-pkg",
     "typecheck": "tsc --noEmit",
-    "check:budgets": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/subagent-guide.test.ts test/unit/disabled-features.test.ts && npm run test:smoke:tool-activation",
-    "check:workflow-guidance": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/pi-subagents-skill-coverage.test.ts test/unit/schemas.test.ts test/unit/subagent-options.test.ts test/unit/tool-description.test.ts test/unit/workflow-scripts-feature.test.ts test/unit/workflow-launch-task.test.ts",
+    "check:budgets": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/subagent-guide.test.ts test/unit/disabled-features.test.ts test/unit/guided-tool.test.ts",
+    "check:workflow-guidance": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/guided-tool.test.ts test/unit/schemas.test.ts test/unit/subagent-options.test.ts test/unit/workflow-scripts-feature.test.ts test/unit/workflow-launch-task.test.ts",
     "test": "npm run test:unit",
     "test:unit": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/*.test.ts",
     "test:integration": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/*.test.ts",
-    "test:smoke:tool-activation": "node --experimental-strip-types --test test/smoke/tool-activation.test.ts",
     "test:all": "npm run test:unit && npm run test:integration"
   },
   "pi": {

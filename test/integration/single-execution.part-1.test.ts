@@ -35,7 +35,7 @@ import {
 	type SubagentDelegationResponse,
 	type SubagentDelegationStarted,
 } from "../../src/api/delegation.ts";
-import { CHAIN_RUNS_DIR, DIRS, INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT, TEMP_ARTIFACTS_DIR, type AsyncStatus, type ChildWatchdogProgress, type ControlEvent, type SubagentState } from "../../src/shared/types.ts";
+import { CHAIN_RUNS_DIR, DIRS, INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT, TEMP_ARTIFACTS_DIR, type AsyncStatus, type ChildWatchdogProgress, type ControlEvent, type SubagentLifecycleEvent, type SubagentState } from "../../src/shared/types.ts";
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 import { removeResultIndex, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
@@ -992,7 +992,7 @@ Answer only from the supplied synthetic text.
 
 		const pending = executor.execute(
 			"user-detach-guidance",
-			{ agent: "echo", task: "Keep working", async: false },
+			{ agent: "echo", task: "Keep working", label: "Keep the fix going", async: false },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),
@@ -1003,15 +1003,16 @@ Answer only from the supplied synthetic text.
 			control = state.lastForegroundControlId ? state.foregroundControls.get(state.lastForegroundControlId) : undefined;
 		}
 		assert.ok(control?.detach, "foreground detach control should become available");
+		assert.equal(control.activeChildren?.get(0)?.description, "Keep the fix going", "the Fleet row reads the launch label");
 		assert.equal(control.detach(), true);
 
 		const result = await pending;
 		const text = result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
 		assert.equal(result.details.results[0]?.detachedReason, "user request");
 		assert.match(text, /Detached at user request/);
-		assert.match(text, /bg_wait\(\{ id: "[^"]+", nonBlocking: true \}\)/);
-		assert.doesNotMatch(text, /intercom coordination|supervisor request|Wait with bg_wait/);
-		assert.doesNotMatch(text, /bg_wait\(\{ id: "[^"]+" \}\)/);
+		assert.match(text, /subagent\(\{ action: "wait", id: "[^"]+", nonBlocking: true \}\)/);
+		assert.doesNotMatch(text, /intercom coordination|supervisor request|Wait with subagent/);
+		assert.doesNotMatch(text, /subagent\(\{ action: "wait", id: "[^"]+" \}\)/);
 
 		let terminalChild = state.foregroundRuns?.get(control.runId)?.children[0];
 		for (let attempt = 0; attempt < 250 && terminalChild?.status !== "completed"; attempt++) {
@@ -1020,6 +1021,66 @@ Answer only from the supplied synthetic text.
 		}
 		assert.equal(terminalChild?.status, "completed", "detached child should reach its terminal callback before teardown");
 		assert.equal(terminalChild.finalOutput, "completed after user detach");
+	});
+
+	it("emits task:subagent:lifecycle for a foreground run that completes and for one that fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const bus = createEventBus();
+		const lifecycle: SubagentLifecycleEvent[] = [];
+		// SAFETY: only the executor emits on this channel, and it always sends a SubagentLifecycleEvent.
+		bus.on("task:subagent:lifecycle", (payload) => lifecycle.push(payload as SubagentLifecycleEvent));
+		const state: SubagentState = {
+			baseCwd: tempDir,
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
+		const executor = createSubagentExecutor!({
+			pi: { events: bus, getSessionName: () => undefined },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, ".pi/subagents", "sessions"),
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("echo")] }),
+			allowMutatingManagementActions: true,
+		});
+
+		mockPi.onCall({ matchArgIncludes: "Secret task A", output: "A done" });
+		await executor.execute("lifecycle-ok", { agent: "echo", task: "Secret task A", async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.deepEqual(lifecycle.map((event) => event.status), ["started", "completed"]);
+		const [started, completed] = lifecycle;
+		assert.ok(started!.id);
+		assert.equal(completed!.id, started!.id);
+		for (const event of lifecycle) {
+			assert.equal(event.agent, "echo");
+			assert.equal(event.description, "Test agent: echo");
+			assert.equal(event.mode, "foreground");
+			assert.doesNotMatch(JSON.stringify(event), /Secret task/);
+		}
+		assert.equal(completed!.success, true);
+
+		lifecycle.length = 0;
+		mockPi.onCall({ matchArgIncludes: "Secret task B", stderr: "child failed", exitCode: 1 });
+		await executor.execute("lifecycle-fail", { agent: "echo", task: "Secret task B", label: "Validate sanitizer tests", async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.deepEqual(lifecycle.map(({ status, description }) => ({ status, description })), [{ status: "started", description: "Validate sanitizer tests" }, { status: "failed", description: "Validate sanitizer tests" }]);
+		assert.equal(lifecycle[1]!.id, lifecycle[0]!.id);
+		assert.equal(lifecycle[1]!.success, false);
+
+		// An agentContract run keeps exitCode 0 when acceptance rejects, so the tool result and the saved run report success.
+		lifecycle.length = 0;
+		mockPi.onCall({ matchArgIncludes: "Secret task C", output: "C done" });
+		const contractResult = await executor.execute("lifecycle-contract-rejected", {
+			agent: "echo",
+			task: "Secret task C",
+			async: false,
+			agentContract: { version: 1 },
+			acceptance: { level: "verified", verify: [{ id: "fails", command: `${JSON.stringify(process.execPath)} -e "process.exit(1)"` }] },
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(contractResult.details?.results[0]?.acceptance?.status, "rejected");
+		assert.notEqual(contractResult.isError, true);
+		assert.deepEqual(lifecycle.map((event) => event.status), ["started", "completed"]);
 	});
 
 	it("rejects action='single' with execution fields", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1375,6 +1436,28 @@ Answer only from the supplied synthetic text.
 		);
 		assert.equal(result.isError, undefined, result.content[0]?.text ?? "parallel workflow failed");
 		assert.equal(result.details.workflow?.resource?.name, "parallel");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("runs the built-in parallel workflow's tasks one at a time under a top-level globalConcurrencyLimit", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const release = path.join(tempDir, "serial-parallel.release");
+		mockPi.onCall({ waitForPath: release, output: "Serial child completed" });
+		const running = makeExecutor([makeAgent("reviewer"), makeAgent("scout")]).executePublic(
+			"named-parallel-serial",
+			{ workflow: "parallel", globalConcurrencyLimit: 1, args: { tasks: [{ agent: "reviewer", task: "Review src/api" }, { agent: "scout", task: "Map the tests" }] }, async: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		let settled = false;
+		void running.finally(() => { settled = true; });
+		for (const deadline = Date.now() + 10_000; mockPi.callCount() < 1 && !settled && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 20));
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		const concurrent = mockPi.callCount();
+		fs.writeFileSync(release, "go");
+		const result = await running;
+		assert.equal(concurrent, 1, "the second child waits while the first holds the only slot");
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "parallel workflow failed");
 		assert.equal(mockPi.callCount(), 2);
 	});
 
@@ -1779,6 +1862,21 @@ Answer only from the supplied synthetic text.
 		const scriptText = await executor.executePublic("script-text", { workflow: "return 1", async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 		assert.equal(scriptText.isError, true);
 		assert.match(scriptText.content[0]?.text ?? "", /options\.script.*omit workflow/);
+		assert.match(missing.content[0]?.text ?? "", /pass the source in options\.script/);
+
+		const multiLine = `const r = await runs.run("scan", { agent: "echo", task: "Read /Users/someone/repo/src/index.ts" });\nreturn r.output;`;
+		const multiLineText = await executor.executePublic("multi-line-script-text", { workflow: multiLine, async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(multiLineText.isError, true);
+		assert.match(multiLineText.content[0]?.text ?? "", /line breaks, so it is script text, not a file path.*pass the source in options\.script/);
+		assert.doesNotMatch(multiLineText.content[0]?.text ?? "", /Failed to read workflow script|ENOENT|ENAMETOOLONG/);
+
+		const resourceCtx = makeMinimalCtx(tempDir);
+		const registration = registerWorkflowResource({ sessionId: resourceCtx.sessionManager.getSessionId(), definition: { name: "test.nl", version: 1, resolve: () => ({ script: "return 'resource ok'" }) } });
+		try {
+			const trailing = await makeExecutor([makeAgent("echo")]).executePublic("trailing-newline-resource", { workflow: "test.nl\n", async: false }, new AbortController().signal, undefined, resourceCtx);
+			assert.equal(trailing.isError, undefined, trailing.content[0]?.text);
+			assert.match(trailing.content[0]?.text ?? "", /resource ok/);
+		} finally { registration.dispose(); }
 		assert.doesNotMatch(empty.content[0]?.text ?? "", /validation failed|valid JavaScript/);
 		assert.equal(mockPi.callCount(), 0);
 	});
@@ -1997,7 +2095,7 @@ Answer only from the supplied synthetic text.
 		assert.deepEqual(statusResult.details.preflight, { version: 1, coverage: "complete", lanes: [{ key: "work", mode: "mutation", claims: ["src/work.ts"], expectedOutput: "child report" }] });
 		assert.equal(status.steps?.length, 1);
 		assert.deepEqual(status.steps?.map(({ agent, sessionName, label, phase, workflowKey }) => ({ agent, sessionName, label, phase, workflowKey })), [
-			{ agent: "echo", sessionName: "echo: Async work", label: "Run async child", phase: "Execution", workflowKey: "work" },
+			{ agent: "echo", sessionName: "echo: Run async child", label: "Run async child", phase: "Execution", workflowKey: "work" },
 		]);
 		assert.ok(status.steps?.every((step) => step.parentWorkflowRunId === workflowRunId));
 		assert.equal(status.steps?.[0]?.async, true);
@@ -2028,7 +2126,7 @@ Answer only from the supplied synthetic text.
 		assert.equal(persistedResult.agent, "workflow");
 		assert.equal(persistedResult.cwd, workflowCwd);
 		assert.deepEqual(persistedResult.results?.map(({ agent, sessionName, workflowKey }) => ({ agent, sessionName, workflowKey })), [
-			{ agent: "echo", sessionName: "echo: Async work", workflowKey: "work" },
+			{ agent: "echo", sessionName: "echo: Run async child", workflowKey: "work" },
 		]);
 		assert.deepEqual(persistedResult.results?.[0]?.usage, { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, turns: 1 });
 		assert.equal(readCall().runtime?.steerInbox, undefined, "in-process workflow children are steered through their session, not a file inbox");

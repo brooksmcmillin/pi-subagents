@@ -1,6 +1,6 @@
 # Pi Subagents: Constraints And Recipes
 
-This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
+This file is a detailed reference for the compact task-delivery recipe.
 
 ## Important Constraints
 
@@ -50,7 +50,7 @@ This reference keeps cross-cutting policy and failure handling. Load the matchin
 | Need | Read |
 | --- | --- |
 | Execution syntax, lifecycle, async/wait, missions, controls, watchdog, or worktrees | [`references/execution-controls.md`](execution-controls.md) |
-| Role choice, prompt contracts, review/research/cleanup techniques, or model tiering | [`references/prompting-and-roles.md`](prompting-and-roles.md) |
+| Role choice, prompt contracts, review/research/cleanup techniques, or model tiering | [Agent profiles](../../../docs/agents.md) and [Models](../../../docs/models.md) |
 | Fresh review, validation, gate failures, finding disposition, and final delivery checks | [`references/review-and-validation.md`](review-and-validation.md) |
 | Independent lanes, repositories, worktrees, and handoffs | [`references/multi-lane-orchestration.md`](multi-lane-orchestration.md) |
 | Agent management, file authoring, prompt integration, or RPC | [`references/management-authoring-rpc.md`](management-authoring-rpc.md) |

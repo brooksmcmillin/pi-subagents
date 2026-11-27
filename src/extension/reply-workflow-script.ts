@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isUnsetPlaceholder, liftArgsFields } from "./subagent-options.ts";
 
 const WORKFLOW_FENCE = /^```(?:js|javascript) workflow[ \t]*$/;
 const PLAIN_JS_FENCE = /^```(?:js|javascript)[ \t]*$/;
@@ -42,9 +43,20 @@ function earlierTurnHasJsBlock(branch: ReturnType<ExtensionContext["sessionManag
 	return false;
 }
 
+/** Whether flattenSubagentToolOptions will read this call's options.script, which it does after dropping "null" placeholders. */
+function hasOptionsScript(options: unknown): boolean {
+	if (typeof options !== "object" || options === null || Array.isArray(options)) return false;
+	const script = (options as Record<string, unknown>).script;
+	return script !== undefined && !isUnsetPlaceholder(script);
+}
+
 function scriptFromReply(content: AssistantMessage["content"], earlierBlock: () => boolean): ReplyWorkflowScript {
-	const replyCalls = content.filter((block) => block.type === "toolCall" && block.name === "subagent"
-		&& (block.arguments?.workflow === true || block.arguments?.workflow === "true")).length;
+	// A call that also passes options.script runs that script, not the reply's block (#3320).
+	const replyCalls = content.filter((block) => {
+		if (block.type !== "toolCall" || block.name !== "subagent") return false;
+		const call = liftArgsFields(block.arguments ?? {});
+		return (call.workflow === true || call.workflow === "true") && !hasOptionsScript(call.options);
+	}).length;
 	if (replyCalls > 1) return { error: `This reply has ${replyCalls} subagent calls with workflow: true; a reply can carry only one. Pass other scripts as workflow file paths.` };
 	if (!content.some((block) => block.type === "text")) {
 		if (earlierBlock()) return { error: "The assistant message that issued this call has no text. A ```js block is in an earlier message of this turn, but workflow: true reads only the message that issues the call. Pass that script's source as options: { script: \"...\" } and remove the workflow field entirely; do not pass both workflow and options.script. Preserve the call's other fields and options." };

@@ -5,7 +5,6 @@ How to compose subagents: the recommended pattern, packaged prompt shortcuts, sc
 ## Recommended orchestration pattern
 
 For ordinary operator-authorized task delivery, start with the
-[pi-subagents skill](../skills/pi-subagents/SKILL.md) and its
 [compact task-delivery recipe](../skills/pi-subagents/references/task-delivery.md).
 Load advanced references only when their trigger applies; this full catalog is
 not a prerequisite for a worker/reviewer pair. The recipe preserves authority,
@@ -23,9 +22,9 @@ A background child awaited by an `async: false` workflow cannot receive a superv
 
 Child-safety boundaries are enforced at runtime:
 
-- Child sessions do not receive the bundled `pi-subagents` skill.
+- Fresh (non-fork) child sessions never receive a skill named `pi-subagents`; a fork keeps the parent's prompt, skills included.
 - Child context filtering removes parent-only subagent artifacts (hidden orchestration-instruction messages, slash/status/control messages, and `subagent` tool-call/tool-result history) while preserving ordinary prose and unrelated tool calls/results. A forked child sends the history it inherited exactly as the parent sent it, so its first request can reuse the parent's prompt cache; it still cannot run `subagent`.
-- By default, children do not register the `subagent` tool and receive boundary instructions that they are not the parent orchestrator and must not propose or run subagents.
+- By default, a child's `subagent` tool can only wait for its own background work, and the child receives boundary instructions that it is not the parent orchestrator and must not propose or run subagents.
 - The explicit exception is an agent whose resolved builtin `tools` includes `subagent`; that child gets a child-safe `subagent` tool for the fanout work the parent assigned, still bounded by `maxSubagentDepth`.
 
 ### Failed lane recovery and execution-mode boundaries
@@ -56,7 +55,7 @@ Starting Pi in a folder where another session's subagent runs were cut off by it
 
 The completion notice of a workflow stopped by a Pi exit or a runtime replacement has one line right after `Workflow run: <id>` that says what happens next: `Auto-resumed as <new id>.`, `Resumed as <new id>.` (resumed by id), `Relaunched as <new id>.` (relaunched with the same script or `options.reuseFrom`), `Not auto-resumed: <reason>.` followed by the way to continue by hand, or, when nothing continues it, `Resume by hand: subagent({ action: "resume", id: "<id>" })` (or the `options.reuseFrom` form when its launch cannot be resumed by id).
 
-After `/new`, `/resume`, or a fork in the same Pi process, the new session owns the async runs of the session it replaced, and of the sessions that one replaced. It can list, `bg_wait` on, steer, stop, and resume them, receives their completion notices, and answers their children's pending supervisor requests. Over RPC, a host can steer, interrupt, stop, resume, and inspect them, and sees them in the fleet and `subagent-async` snapshots. Startup and other Pi processes inherit nothing; `/reload` adds nothing new but keeps what the session already inherited. A replaced session that starts again (pi-web reopening it) takes its runs back. To relaunch a stopped workflow instead of controlling its children one by one, use `options.reuseFrom`.
+After `/new`, `/resume`, or a fork in the same Pi process, the new session owns the async runs of the session it replaced, and of the sessions that one replaced. It can list, wait on, steer, stop, and resume them, receives their completion notices, and answers their children's pending supervisor requests. Over RPC, a host can steer, interrupt, stop, resume, and inspect them, and sees them in the fleet and `subagent-async` snapshots. Startup and other Pi processes inherit nothing; `/reload` adds nothing new but keeps what the session already inherited. A replaced session that starts again (pi-web reopening it) takes its runs back. To relaunch a stopped workflow instead of controlling its children one by one, use `options.reuseFrom`.
 
 Once the Pi process that started a background single, parallel, or chain run has exited, the run is reported once to a Pi window that has its session open, whether it finished while Pi was closed or finishes later. A workflow's children are reported through their workflow.
 
@@ -97,7 +96,7 @@ For inline source, prefer `subagent({ options: { script: "return await runs.run(
 Alternatively, the `workflow` field selects the script source:
 
 - `workflow: true` runs the one ```` ```js workflow ```` fenced block written in the same assistant reply as the `subagent` call. The script is plain text in the reply, so it needs no JSON string escaping. A reply can carry exactly one such block and one `workflow: true` call; zero or several blocks fail. A reply with no tagged block may instead carry exactly one plain ```` ```js ```` block, which then runs. A line containing only ```` ``` ```` (three or more backticks, optionally followed by spaces or tabs) ends the block, so keep Markdown fences inside quoted strings.
-- A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file.
+- A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file. A string with line breaks is script text and is refused without reading any file; pass script source as `options.script` instead.
 - Any other string, such as `workflow: "review"`, is a [named workflow resource](#named-workflow-resources-for-permission-extensions). The string `"true"` is read as `workflow: true`, because some MCP clients send the boolean as a string.
 
 `workflow: true` works only from a model tool call. Slash commands, RPC, and schedules pass scripts through their own inputs. For standalone script snippets below, pass just the JavaScript source as `options.script` and omit `workflow`, even where the example uses a `js workflow` label.
@@ -242,7 +241,7 @@ subagent({ workflow: "parallel", args: { tasks: [{ agent: "reviewer", task: "Rev
 
 The host resolves the name and validates bounded plain-JSON `args` before starting the workflow. Resource provenance is recorded in workflow details and receipts for downstream permission/policy checks. Resource authority is not caller-supplied: `runs.host` is available only when the resolved resource explicitly grants the requested host key and command. Reply-block (`workflow: true`) and file-path scripts remain raw, unknown-provenance inputs, so their `runs.host` calls are unavailable through the public execution boundary. Named resources cannot be combined with `agent` or `task`; the package ships the `review`, `run-ci` and `parallel` resources. Trusted extensions can register policy-owned workflows through the [workflow resource API](extension-api.md#trusted-workflow-resources).
 
-`parallel` runs independent children together without writing a script: `args.tasks` is a list of `{ agent, task, cwd?, model? }` items, the children run in one `runs.all` batch, and the result lists each child's output in order. `cwd` and `model` are optional per child and apply to that child only, as they do on a `runs.all` item, so one call can fan out across several repositories or mix models. A failed child fails the workflow. Use a workflow script when steps depend on each other.
+`parallel` runs independent children together without writing a script: `args.tasks` is a list of `{ agent, task, cwd?, model?, label? }` items, the children run in one `runs.all` batch, and the result lists each child's output in order. `cwd` and `model` are optional per child and apply to that child only, as they do on a `runs.all` item, so one call can fan out across several repositories or mix models. A failed child fails the workflow. Use a workflow script when steps depend on each other.
 
 ### Approving workflow children in permission extensions
 
@@ -325,7 +324,7 @@ return patch.output;
 
 ### Parallel sequential lanes
 
-For a bounded set of independent chains, `runs.lanes(...)` removes the mechanical loop that would otherwise connect each lane's stages. It is a helper inside a workflow script, not a new top-level `subagent` execution mode:
+For a bounded set of independent chains, `runs.lanes(...)` removes the mechanical loop that would otherwise connect each lane's stages. It is a helper inside a workflow script, not a new top-level `subagent` execution mode. Run the block below with `subagent({ workflow: true })` in the same reply, or pass its source as `options.script`; script rules are in `workflows/scripted-workflows`. Each stage is its own run with the background deadline rules of [`timeoutMs`](configuration.md#timeoutms); set `timeoutMs` on a stage to bound it, or on the workflow call to bound the whole workflow.
 
 ```js workflow
 const board = await runs.lanes([
@@ -635,7 +634,7 @@ Inspect the handoff before reconciliation; cleanup still requires fresh checks.
 
 ## Supervisor coordination (child asks parent)
 
-Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent_supervisor({ action: "reply" })` path natively. A session that has `subagent` also declares `contact_supervisor`, so a forked child's tools match its parent's; there it only returns an error saying the session has no supervisor. Generic `intercom` remains available only when an explicitly loaded external provider supplies it.
+Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent({ action: "reply" })` path natively. A session that has `subagent` also declares `contact_supervisor`, so a forked child's tools match its parent's; there it only returns an error saying the session has no supervisor. Generic `intercom` remains available only when an explicitly loaded external provider supplies it.
 
 Use it for work where the child might need a decision instead of guessing:
 
@@ -655,15 +654,15 @@ The child uses one dedicated coordination tool, `contact_supervisor`, with a `re
 
 Children should not ask for clarification when the only conflict is review-only/no-edit versus progress-writing or artifact-writing instructions; no-edit wins.
 
-The parent replies with `subagent_supervisor({ action: "reply", replyTo, message })` or checks pending requests with `subagent_supervisor({ action: "pending" })`. Supervisor messages are scoped to the exact Pi session id that spawned the child. A second Pi session in the same repository does not receive those requests.
+The parent sees waiting questions in `subagent({ action: "status" })` and answers with `subagent({ action: "reply", replyTo, message })`. Supervisor messages are scoped to the exact Pi session id that spawned the child. A second Pi session in the same repository does not receive those requests.
 
-A nested coordinator needs both directions of coordination. If its agent declares an explicit `tools` allowlist, include `subagent_supervisor` to answer its own children, alongside `subagent` for delegation and `contact_supervisor` for asking its parent:
+A nested coordinator needs both directions of coordination. If its agent declares an explicit `tools` allowlist, include `subagent` to delegate and answer its own children, and `contact_supervisor` to ask its parent:
 
 ```yaml
-tools: read, subagent, contact_supervisor, subagent_supervisor
+tools: read, subagent, contact_supervisor
 ```
 
-For A → B → C, C's request belongs to B, not A. B can escalate a separate question to A with `contact_supervisor`, then answer C using C's original `replyTo` request id. A's reply to B does not resolve C's request, and steering is not a substitute for replying. Only fanout-authorized children get the downward supervisor provider; explicit tool exclusions and capability ceilings still apply, and ordinary leaves do not gain delegation or reply tools. Requesting `subagent_supervisor` without fanout authorization fails at launch with an actionable error. A coordinator that excludes the reply tool does not start downward supervision or receive prompts to use it. Explicitly selected native coordination tools survive host-builtin filtering because their providers are child runtime hooks, not host builtins.
+For A → B → C, C's request belongs to B, not A. B can escalate a separate question to A with `contact_supervisor`, then answer C using C's original `replyTo` request id. A's reply to B does not resolve C's request, and steering is not a substitute for replying. Only fanout-authorized children can launch and answer their own children; explicit tool exclusions and capability ceilings still apply, and ordinary leaves do not gain delegation or reply authority. Explicitly selected native coordination tools survive host-builtin filtering because their providers are child runtime hooks, not host builtins.
 
 Child-side routine completion handoffs are not expected. If a child appears stalled, needs-attention notices show up in the parent session with useful next actions, such as checking `subagent({ action: "status" })`, interrupting the run, or nudging the child.
 
