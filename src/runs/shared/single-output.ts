@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import type { OutputMode, PlacementMachineReference, SavedOutputReference } from "../../shared/types.ts";
+import type { AcceptanceRole, OutputMode, PlacementMachineReference, SavedOutputReference } from "../../shared/types.ts";
 import { editsLocalDisk } from "./rex-machine.ts";
 
 const READ_ONLY_OUTPUT_TOOLS = new Set([
@@ -130,6 +130,7 @@ export function resolveSingleOutputPath(
 interface OutputInstructionCapabilities {
 	tools?: string[];
 	mcpDirectTools?: string[];
+	acceptanceRole?: AcceptanceRole;
 }
 
 export function requestedOutputPathFromTask(task: string): string | undefined {
@@ -160,7 +161,7 @@ export function injectSingleOutputInstruction(task: string, outputPath: string |
 			`The runtime will persist it to exactly this path: ${outputPath}`,
 			"Use a separate scratch file for drafts. Corrections after submission require a new run and output path.",
 		].join("\n")
-		: !remote && (!capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools))
+		: !remote && (!capabilities || (capabilities.acceptanceRole !== "read-only" && hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools)))
 		? [
 			`Write your findings to exactly this path: ${outputPath}`,
 			!capabilities?.tools || capabilities.tools.includes("write")

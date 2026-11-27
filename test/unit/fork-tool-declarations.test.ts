@@ -225,7 +225,7 @@ describe("a forked child session", () => {
 			return message;
 		}));
 		const { session, capture } = buildInProcessChildLaunch({
-			host: "parent", cwd: root, childAgentName: "worker", childIndex: 0, sessionEnabled: true, sessionFile: options.sessionFile, waitToolEnabled: false,
+			host: "parent", cwd: root, childAgentName: "worker", childIndex: 0, sessionEnabled: true, sessionFile: options.sessionFile,
 			model: "probe/local", systemPrompt: "Role instructions.", systemPromptMode: "append", tools: options.tools,
 			...(options.forkCacheKey ? { forkCacheKey: options.forkCacheKey } : {}),
 			...options.launch,
@@ -430,7 +430,7 @@ describe("a child's context handler", () => {
 			on: (name: string, handler: (event: unknown, ctx?: unknown) => unknown) => handlers.set(name, handler),
 			registerTool: () => {},
 			events: { on: () => () => {} },
-		} as never, { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false, ...config });
+		} as never, { fanoutChild: false, depth: 1, fast: false, ...config });
 		const ctx = { model: { api: "anthropic-messages" }, sessionManager: { getHeader: () => ({ id: "fork", timestamp: new Date(FORKED_AT).toISOString() }), buildSessionProjection: () => ({ messages: [] }) } };
 		return (messages: unknown[]) => (handlers.get("context_with_system")!({ messages }, ctx) as { messages: unknown[] } | undefined)?.messages ?? messages;
 	};
@@ -438,18 +438,19 @@ describe("a child's context handler", () => {
 	const call = (timestamp: number) => ({ role: "assistant", content: [{ type: "toolCall", id: `call_${timestamp}`, name: "subagent", arguments: {} }], timestamp });
 	const result = (timestamp: number) => ({ role: "toolResult", toolCallId: `call_${timestamp}`, toolName: "subagent", content: [], isError: false, timestamp });
 
-	it("in a fork, strips only what the child itself added after the fork", () => {
+	it("in a fork, keeps the inherited history and the child's own subagent calls, and strips parent-only messages", () => {
 		const inherited = [user(10), notice(20), call(30), result(40), call(50)];
 		const own = [user(FORKED_AT + 1), notice(FORKED_AT + 2), call(FORKED_AT + 3), result(FORKED_AT + 4)];
 
-		assert.deepEqual(contextHandler({ forkCacheKey: "pi-fork:test" })([...inherited, ...own]), [...inherited, own[0]]);
+		assert.deepEqual(contextHandler({ forkCacheKey: "pi-fork:test" })([...inherited, ...own]), [...inherited, own[0], own[2], own[3]]);
 	});
 
-	it("outside a fork, strips parent-only messages and subagent history as before, fanout or not", () => {
-		const messages = [user(10), notice(20), call(30), result(40)];
+	it("keeps a non-fanout child's own subagent wait call and result, and strips the parent's subagent history and parent-only messages, fanout or not", () => {
+		const wait = { role: "assistant", content: [{ type: "toolCall", id: "call_wait", name: "subagent", arguments: { action: "wait", id: "r-1" } }], timestamp: FORKED_AT + 3 };
+		const waited = { role: "toolResult", toolCallId: "call_wait", toolName: "subagent", content: [{ type: "text", text: "Result [r-1]: /tmp/r-1.json" }], isError: false, timestamp: FORKED_AT + 4 };
+		const messages = [user(10), notice(20), call(30), result(40), user(FORKED_AT + 1), notice(FORKED_AT + 2), wait, waited];
 
-		assert.deepEqual(contextHandler({})(messages), stripParentOnlySubagentMessages(messages));
-		assert.deepEqual(contextHandler({})(messages), [messages[0]]);
-		assert.deepEqual(contextHandler({ fanoutChild: true })(messages), [messages[0], messages[2], messages[3]]);
+		assert.deepEqual(contextHandler({})(messages), [messages[0], messages[4], wait, waited]);
+		assert.deepEqual(contextHandler({ fanoutChild: true })(messages), [messages[0], messages[4], wait, waited]);
 	});
 });

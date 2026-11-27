@@ -11,7 +11,7 @@ import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } f
 import { buildEffectiveSystemPrompt } from "../runs/shared/effective-system-prompt.ts";
 import { normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
-import { resolveEffectiveThinking } from "../shared/model-info.ts";
+import { findModelInfo, resolveEffectiveThinking } from "../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type IntercomBridgeConfig, type IntercomBridgeMode, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
@@ -23,12 +23,12 @@ import { loadConfig } from "../extension/config.ts";
 import { applyIntercomBridgeToAgent, resolveIntercomBridge, validateIntercomBridgeConfig } from "../intercom/intercom-bridge.ts";
 import { AGENT_DEFINITION_PROJECTION_VERSION, resolveLaunchBinding, stableJsonDigest } from "../shared/launch-contract.ts";
 import { DIRS, TEMP_ROOT_DIR } from "../shared/types.ts";
-import { processTerminalCandidatePath, processTerminalPath } from "../runs/background/process-terminal.ts";
+import { processTerminalCandidatePath, processTerminalPath, unobservedRunnerExitPath } from "../runs/background/process-terminal.ts";
 import { resultFilePath } from "../runs/background/result-files.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 import { assertRequiredChildExtensionsAdmitted, resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
-import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
+import { assertJsonSchemaObject } from "../shared/types.ts";
 
 // v4 exposes the effective structured-output schema and its selection source.
 export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 4 as const;
@@ -180,6 +180,7 @@ export interface SubagentLaunchContractRoots {
 		eventsPath: string;
 		processTerminalPath: string;
 		processTerminalCandidatePath: string;
+		unobservedRunnerExitPath: string;
 	};
 }
 
@@ -412,6 +413,9 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (externalRunner && behavior.outputSchema) {
 		return { ok: false, code: "unsupported_mode", message: `Agent '${agent.name}' uses runner.type='${agent.runner?.type}' and does not support: structured output.`, diagnostics };
 	}
+	if (externalRunner && (input.fast ?? agent.fast) === true) {
+		return { ok: false, code: "unsupported_mode", message: `Agent '${agent.name}' uses runner.type='${agent.runner?.type}' and does not support fast mode.`, diagnostics };
+	}
 	const availableModels = input.availableModels === undefined ? undefined : normalizeAvailableModels(input.availableModels);
 	const preferredProvider = agent.modelProvider ?? input.preferredProvider ?? input.parentModel?.provider;
 	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel, input.scopedModelIds);
@@ -492,7 +496,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: Boolean(behavior.outputSchema),
 			fast,
-			model,
+			modelInfo: findModelInfo(model, availableModels, preferredProvider),
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
@@ -605,6 +609,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 				eventsPath: path.join(lifecycleAsyncDir, "events.jsonl"),
 				processTerminalPath: processTerminalPath(lifecycleAsyncDir),
 				processTerminalCandidatePath: processTerminalCandidatePath(lifecycleAsyncDir),
+				unobservedRunnerExitPath: unobservedRunnerExitPath(lifecycleAsyncDir),
 			},
 		},
 		protocol: {

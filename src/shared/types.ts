@@ -29,6 +29,12 @@ export type AcceptanceRole = "read-only" | "writer";
 
 export type JsonSchemaObject = Record<string, unknown>;
 
+export function assertJsonSchemaObject(schema: unknown, label = "outputSchema"): asserts schema is JsonSchemaObject {
+	if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+		throw new Error(`${label} must be a JSON Schema object.`);
+	}
+}
+
 export interface ChainOutputMapEntry {
 	text: string;
 	structured?: unknown;
@@ -344,6 +350,7 @@ export interface ResolvedControlConfig {
 	failedToolAttemptsBeforeAttention: number;
 	notifyOn: ControlEventType[];
 	notifyChannels: ControlNotificationChannel[];
+	checkInAfterMs?: number;
 }
 
 /**
@@ -365,16 +372,6 @@ export interface CompletionBatchConfig {
 	stragglerWindowMs?: number;
 }
 
-export interface WaitToolConfigObject {
-	enabled?: boolean;
-	/** Default blocking window for bg_wait calls that omit timeoutMs. */
-	defaultTimeoutMs?: number;
-	/** Registers the wait tool under this name instead of bg_wait, e.g. when another extension uses bg_wait. */
-	name?: string;
-}
-
-export type WaitToolConfig = boolean | WaitToolConfigObject;
-
 export interface ControlEvent {
 	type: ControlEventType;
 	from?: ActivityState;
@@ -386,7 +383,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold" | "check_in";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
@@ -1418,10 +1415,6 @@ export interface WaitCompletionChild {
 	timeoutRecovery?: TimeoutRecoveryProjection;
 }
 
-/**
- * Terminal completion observed for a run a bg_wait call covered. Carries run
- * identity and the artifact trail; output text stays in the tool result content.
- */
 export interface WaitCompletion {
 	runId: string;
 	workflowReceiptPath?: string;
@@ -1457,11 +1450,29 @@ export interface AgentCapabilityRow {
 	extensions?: { names?: string[]; subagentOnly?: string[]; skills?: string[] };
 }
 
+export interface GuideSummary {
+	tokens: number;
+	launch: string[];
+	manage: string[];
+	agents: string[];
+	again?: boolean;
+	attached?: boolean;
+}
+
+export interface GuideTopicView {
+	title: string;
+	lead: string;
+}
+
 export interface Details {
 	/** An immutable amendment, never a replacement source-run result. */
 	reportCorrection?: import("../runs/shared/report-correction.ts").ReportCorrection;
 	commands?: import("../runs/shared/child-commands.ts").ChildCommandSnapshot[];
 	mode: SubagentResultMode | "management";
+	taught?: string[];
+	guide?: GuideSummary;
+	heldLaunch?: string;
+	guideTopic?: GuideTopicView;
 	workflowReceiptPath?: string;
 	runId?: string;
 	/** Host tool-call id retained when it differs from the internal run id. */
@@ -1471,12 +1482,6 @@ export interface Details {
 	results: SingleResult[];
 	workflowChildren?: WorkflowChildSummary;
 	workflowTerminalProof?: WorkflowTerminalProof;
-	/**
-	 * Terminal completion payloads for runs this bg_wait call observed
-	 * finishing. Async completions travel as result files that are consumed and
-	 * deleted after text delivery, so without this field their run and artifact
-	 * identity never reaches tool_result details.
-	 */
 	completions?: WaitCompletion[];
 	wait?: {
 		reason: "window_elapsed";
@@ -1754,6 +1759,8 @@ export interface AsyncStartedEvent {
 	completionOwnerId?: string;
 	mode?: SubagentRunMode;
 	agent?: string;
+	/** Launch label when set, else the agent's description or name; never the task prompt. */
+	description?: string;
 	agents?: string[];
 	/** Redacted prompt marker for the first child task; workflow roots may omit this field. */
 	task?: string;
@@ -1839,8 +1846,16 @@ export interface HerdrLocalMachineReference {
 	cwd: string;
 }
 
+export interface HerdrCoreLocalMachineReference {
+	provider: "herdr-core";
+	id: "local";
+	socket: string;
+	parentTerminal: string;
+	cwd: string;
+}
+
 /** Where a placed native Pi child runs. A reference without `target` is on this machine. */
-export type PlacementMachineReference = HerdrMachineReference | HerdrLocalMachineReference | RexMachineReference;
+export type PlacementMachineReference = HerdrMachineReference | HerdrLocalMachineReference | HerdrCoreLocalMachineReference | RexMachineReference;
 
 export interface ExternalCliMachineStatus extends HerdrMachineReference {
 	remoteGit?: HerdrRemoteGitStatus;
@@ -2520,6 +2535,18 @@ export interface RequiredRunnerLauncher {
 export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 export const SUBAGENT_PROCESS_TERMINAL_EVENT = "subagent:process-terminal";
 export const SUBAGENT_FOREGROUND_COMPLETE_EVENT = "subagent:foreground-complete";
+/** Generic lifecycle for a foreground child, so hosts can track runs that never emit `subagent:async-*`. Payload has no prompt text. */
+export const TASK_SUBAGENT_LIFECYCLE_EVENT = "task:subagent:lifecycle";
+export interface SubagentLifecycleEvent {
+	id: string;
+	status: "started" | "completed" | "failed" | "aborted";
+	agent: string;
+	description: string;
+	success?: boolean;
+	mode: "foreground";
+	parentWorkflowRunId?: string;
+	workflowKey?: string;
+}
 export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
 export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 export const SUBAGENT_STEERING_NOTICE_EVENT = "subagent:steering-notice";
@@ -2582,6 +2609,8 @@ export interface RunSyncOptions {
 	remoteReads?: string[] | false;
 	/** Original cwd input retained for launch diagnostics. */
 	requestedCwd?: string;
+	/** Launch or workflow child label; names the child session instead of the task excerpt. */
+	label?: string;
 	signal?: AbortSignal;
 	/** Report a child ended by `signal` as stopped; set for workflow children, whose signal is the workflow's. */
 	abortedAsStopped?: boolean;
@@ -2624,16 +2653,12 @@ export interface RunSyncOptions {
 	outputClaimPath?: string;
 	outputMode?: OutputMode;
 	maxSubagentDepth?: number;
-	/** Effective parent wait-tool setting propagated to the child runtime. */
-	waitToolEnabled?: boolean;
-	/** Effective parent default wait window propagated to the child runtime. */
-	waitToolDefaultTimeoutMs?: number;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	nestedRoute?: NestedRouteInfo;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
-	/** Opt into priority service tier for supported native OpenAI-Codex launches. */
+	/** Request the configured OpenAI service tier on compatible native adapters. */
 	fast?: boolean;
 	/** The override came from the running parent session, not configuration. */
 	modelOverrideFromParent?: boolean;
@@ -2705,8 +2730,6 @@ export interface ProactiveSkillSubagentsConfig {
 	preferredAgent?: string;
 }
 
-export type ToolDescriptionMode = "full" | "compact" | "custom";
-export type ToolActivationMode = "auto" | "dynamic" | "eager";
 export type InlineToolDisplay = "rich" | "summary";
 
 export interface ScheduledRunsConfig {
@@ -2718,6 +2741,7 @@ export interface ScheduledRunsConfig {
 
 export type FleetViewPlacement = "aboveEditor" | "belowEditor";
 export type AsyncWidgetLayout = "adaptive" | "rows";
+export type FastServiceTier = "priority" | "ultrafast";
 
 export const FLEET_KEYBINDING_ACTIONS = [
 	"close",
@@ -2787,16 +2811,14 @@ export interface ExtensionConfig {
 	asyncWidgetLayout?: AsyncWidgetLayout;
 	/** Report subagent run state to the terminal with OSC 7501. Defaults to true. */
 	programStatus?: boolean;
+	/** OpenAI `service_tier` that `fast: true` requests on compatible native adapters. Defaults to "priority". */
+	fastServiceTier?: FastServiceTier;
 	/** Add a short `active_subagents` system prompt section listing this session's active background runs. Defaults to false. */
 	activeRunsPrompt?: boolean;
 	/** Exact provider/model candidates mapped to operator-declared equivalent response IDs. Empty arrays add no accepted IDs. */
 	modelResponseAliases?: Record<string, string[]>;
 	/** Named argv prefixes for background runners; agents select one with `launcher: <name>`. User config only. */
 	runnerLaunchers?: Record<string, string[]>;
-	/** Tool description variant registered for the parent-facing subagent tool. Defaults to split metadata. */
-	toolDescriptionMode?: ToolDescriptionMode;
-	/** How a new parent session offers the subagent tool. Defaults to auto. */
-	toolActivation?: ToolActivationMode;
 	/** Keep a resumed session on the pi-subagents tool definitions and prompt text it already declared. Defaults to true. */
 	pinToolDeclarations?: boolean;
 	/** Register the pi-subagents slash commands and the foreground-detach shortcut. Defaults to true. */
@@ -2810,7 +2832,6 @@ export interface ExtensionConfig {
 	/** Experimental observer: mirror each native subagent's progress into a new Orca tab. */
 	orcaProgressTabs?: OrcaProgressTabsConfig;
 	forceTopLevelAsync?: boolean;
-	waitTool?: WaitToolConfig;
 	defaultSessionDir?: string;
 	singleRunOutputBaseDir?: string;
 	maxSubagentDepth?: number;
@@ -2825,12 +2846,10 @@ export interface ExtensionConfig {
 	/** Global cap on simultaneously-running subagent tasks within a single run. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	/**
-	 * Global default runtime deadline in milliseconds. It replaces the built-in
-	 * 30-minute backstop for single, parallel, and chain launches (foreground, plus
-	 * plain single-agent async runs) when neither the call (`timeoutMs`/`maxRuntimeMs`)
-	 * nor the selected agent provides a timeout. Explicit call values and agent
-	 * frontmatter defaults still win. Composite async runs (chain/parallel/workflow)
-	 * stay unbounded at the top level by design — their children are bounded individually.
+	 * Global default runtime deadline in milliseconds, used when neither the call
+	 * (`timeoutMs`/`maxRuntimeMs`) nor the selected agent provides a timeout. It applies
+	 * to foreground launches, background single-agent runs and resumes, and each child of
+	 * an async composite; the composite itself stays unbounded at the top level.
 	 * Must be a positive integer; invalid values are ignored.
 	 */
 	timeoutMs?: number;
@@ -2987,7 +3006,7 @@ export const POLL_INTERVAL_MS = 250;
 export const WIDGET_ANIMATION_INTERVAL_MS = 1000;
 export const MAX_WIDGET_JOBS = 4;
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
-export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "validate", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "worktree.cleanup", "lane.status", "lane.recordMerge", "lane.recordSupersession", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.command", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "report.correct", "steer", "stop", "command.status", "command.yield", "command.cancel", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
+export const SUBAGENT_ACTIONS = ["list", "get", "models", "children.list", "guide", "validate", "create", "update", "delete", "eject", "disable", "enable", "reset", "mission.create", "mission.list", "mission.show", "mission.update", "mission.resolve-decision", "mission.attach-run", "mission.close", "worktree.discard", "worktree.cleanup", "lane.status", "lane.recordMerge", "lane.recordSupersession", "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.command", "inspector.status", "inspector.close", "project.open", "project.status", "project.close", "status", "debug.run", "grant-spawn-budget", "interrupt", "resume", "report.correct", "steer", "stop", "wait", "reply", "command.status", "command.yield", "command.cancel", "dismiss", "doctor", "watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"] as const;
 
 export const DEFAULT_FORK_PREAMBLE =
 	"You are a delegated subagent running from a fork of the parent session. " +

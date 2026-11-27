@@ -13,7 +13,7 @@ import type { InProcessChildLaunch } from "../../src/runs/shared/child-launch.ts
 const launch = { capture: { finalDrainHeld: () => false, toolDiagnostic: () => undefined }, session: {
 	cwd: process.cwd(), storage: { kind: "memory" }, extensionPaths: [], ambientExtensions: false,
 	hooks: [], noSkills: true, noContextFiles: true,
-	runtime: { fanoutChild: false, fast: false, depth: 1, waitTool: { enabled: false } },
+	runtime: { fanoutChild: false, fast: false, depth: 1 },
 } } as InProcessChildLaunch;
 
 async function runForegroundFixture(task: string, options: Parameters<typeof runSync>[4]) {

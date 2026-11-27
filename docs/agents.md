@@ -243,7 +243,7 @@ You can override selected agent fields without copying the whole agent. Override
 }
 ```
 
-Supported override fields: `description`, `advertise`, `machine`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
+Supported override fields: `description`, `machine`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
 
 `launcher` is not a supported override field, and an override that sets it is rejected. To run a builtin under a launcher, copy it into a user agent file (for example with `eject`) and set `launcher` there.
 
@@ -269,7 +269,7 @@ A custom agent file that shadows a bundled agent replaces the bundled definition
 
 Native Pi and the six code-owned Claude Code, Codex, and Cursor profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). Herdr owns each visible agent process in a fresh no-focus pane; SSH is used only as bounded transport for Herdr RPC and ownership checks. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
 
-For a pane on this machine you don't need a saved machine: run Pi inside Herdr and use `machine: "local"`. This means the herdr terminal multiplexer; terminals of Herdr Core (`hc`, the Herdr app's terminal server) are not supported.
+For this machine you don't need a saved machine: run Pi inside Herdr, Rex or Herdr Core and use `machine: "local"`. Herdr here means the herdr terminal multiplexer; Herdr Core (`hc`, the Herdr app's terminal server) is a different product with its own CLI and protocol. Herdr and Rex give the child a background tab; Herdr Core gives it a headless child terminal.
 
 `machine` is a top-level frontmatter key, a settings override (`subagents.agentOverrides.<agent>.machine`, project beats user, `false` clears a pin), and a launch option on the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. The launch option wins. Placement survives `subagent({ action: "disable" })`, `reset`, and model profile switches.
 
@@ -290,15 +290,17 @@ Placed external profiles are one-shot and stop-only: they cannot steer, resume, 
 
 pi-subagents never clones, pulls, or checks out on the machine. Generic `external-cli` commands and managed worktrees are rejected before launch; saved-machine placement accepts native Pi and only the six code-owned external profiles.
 
-## Running a Pi child in a new tab on this machine (Rex or Herdr)
+## Running a Pi child on this machine (Rex, Herdr or Herdr Core)
 
-`machine: "local"` runs a native Pi child as a visible Pi in a new background tab of the terminal this Pi runs in, labeled `subagent-<run id tail>`. Inside Rex, that is a tab in your Rex session. Inside a Herdr pane (`HERDR_ENV=1` and `HERDR_PANE_ID` set), it is a tab in your own Herdr session, reached over the local Herdr socket with no saved machine and no SSH. When both are set (Herdr running inside a Rex tab), Herdr wins, because the Herdr pane is where Pi is drawn. Outside both, or when the Rex or Herdr server does not confirm this Pi's session or pane, the launch fails before anything starts. `local` is reserved and never looks in the Herdr catalog. It works wherever `machine` works: frontmatter, settings overrides, the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps.
+`machine: "local"` runs a native Pi child in the terminal this Pi runs in. Inside Rex, that is a background tab in your Rex session, labeled `subagent-<run id tail>`. Inside a Herdr pane (`HERDR_ENV=1` and `HERDR_PANE_ID` set), it is a background tab with the same label in your own Herdr session, reached over the local Herdr socket with no saved machine and no SSH. Inside a Herdr Core terminal (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` set), it is a headless child terminal parented to this Pi's terminal, which the Herdr app shows in its agent tree; use `terminal.peek` to look at it without changing the layout, or `terminal.keep` to give it a tab or split. Children without `machine: "local"` stay in-process or use the normal background runner; Herdr Core placement is never automatic.
 
-The parent drives the child through the same bridge as a Herdr-placed Pi: prompt, steer, follow-up, abort, `contact_supervisor`, and results. The child Pi loads pi-subagents from its own extensions, so it must be installed at the same version. `cwd` is a directory on this machine; a relative path joins the launch directory. In Herdr, the tab opens in the `pi-subagents-…` workspace pi-subagents made for that directory if there is one, else in the one workspace with a pane in that directory, else in a new no-focus `pi-subagents-…` workspace. In Rex, pi-subagents finds `rex` in `$REX_BIN_DIR`, then on `PATH`, then in the Rex server app; in Herdr, it runs `herdr` from `$HERDR_BIN` or `PATH`.
+When more than one is set, Herdr wins, then Herdr Core, then Rex: a Herdr pane or Herdr Core terminal started inside a Rex tab inherits `REX_SESSION`, and the terminal this Pi is drawn in wins. Outside all three, or when the Rex, Herdr or Herdr Core server does not confirm this Pi's session, pane or terminal, the launch fails before anything starts. `local` is reserved and never looks in the Herdr catalog. It works wherever `machine` works: frontmatter, settings overrides, the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps.
 
-A finished child keeps its tab open, with the idle Pi, until you close it; an aborted or stopped child's tab is closed. Limits: native Pi only (Claude Code, Codex, Cursor, and generic `external-cli` agents are rejected), fresh context only, and the same restrictions as a Herdr-placed Pi (no local extension paths, process environment, nested delegation, permission rules, tool budgets, or `outputSchema`).
+The parent drives the child through the same bridge as a Herdr-placed Pi: prompt, steer, follow-up, abort, `contact_supervisor`, and results. The child Pi loads pi-subagents from its own extensions, so it must be installed at the same version. `cwd` is a directory on this machine; a relative path joins the launch directory. In Herdr, the tab opens in the `pi-subagents-…` workspace pi-subagents made for that directory if there is one, else in the one workspace with a pane in that directory, else in a new no-focus `pi-subagents-…` workspace. In Rex, pi-subagents finds `rex` in `$REX_BIN_DIR`, then on `PATH`, then in the Rex server app; in Herdr, it runs `herdr` from `$HERDR_BIN` or `PATH`; in Herdr Core, it runs `hc` from `PATH`. Rex and Herdr Core start the child with the same Pi command pi-subagents spawns elsewhere, which `PI_SUBAGENT_PI_BINARY` overrides.
 
-A `local` child edits this machine's disk, so in either terminal it gets the same local cwd check, Git evidence and output-file handling as a child without `machine`.
+In Herdr and Rex, a finished child keeps its tab open, with the idle Pi, until you close it; an aborted or stopped child's tab is closed. A Herdr Core child has no tab, so its Pi is ended when the run is disposed, finished or not; its finished terminal record stays readable with `hc get`/`hc read` until Herdr Core removes it. Limits, the same in all three: native Pi only (Claude Code, Codex, Cursor, and generic `external-cli` agents are rejected), fresh context only, and the same restrictions as a Herdr-placed Pi (no local extension paths, process environment, nested delegation, permission rules, tool budgets, `outputSchema`, or Fast).
+
+A `local` child edits this machine's disk, so in all three it gets the same local cwd check, Git evidence and output-file handling as a child without `machine`.
 
 ## Running a Pi child in a Rex pane on another Mac
 
@@ -388,15 +390,9 @@ Some sandboxes, such as nono's broker mode, start the runner in a separate proce
 - A launcher controls where the child runs, not where its output goes. Results, transcripts, and files the child writes in shared directories are visible to the parent as usual.
 - A launcher that submits the work elsewhere and returns immediately is not supported, because the runner must keep running and share files with the parent. For runs on another machine, use `machine:` with Herdr.
 
-## Parent prompt discovery
+## Parent discovery
 
-Set `advertise: true` in a specialist's agent file frontmatter for parent-prompt discovery, or in `subagents.agentOverrides.<name>.advertise` when the definition must stay untouched. When the `subagent` tool is active, pi-subagents adds an agent-owned catalog of names and descriptions to the parent system prompt. Disabled agents and agents excluded by the current capability ceiling are omitted. Advertisement is not supported through runtime registration.
-
-Advertisement is opt-in discovery, not automatic routing. The catalog is sorted by name and limited to 16 agents and 12,288 total rendered UTF-8 bytes, including XML escaping, instructions, and omission counts. Descriptions are capped at 512 UTF-8 bytes before escaping. Entries that cannot fit are omitted; canonical agent names are never truncated. The parent does not need a `list` call before launching an advertised agent: a launch that names an unknown or disabled agent fails with the available agents, and an external CLI agent's runner is checked by preflight when it launches.
-
-The file catalog snapshot refreshes at session start/reload and after extension-owned agent-management mutations. External file or settings edits require `/reload`; ordinary turns do not poll the filesystem. Tool availability and capability-ceiling filtering are checked in memory on every prompt. A failed management-triggered refresh withdraws the catalog until a successful refresh, without changing the persisted mutation's result.
-
-The catalog is sent as Pi's `advertised_subagents` prompt section. When it changes mid-session, Pi appends it as a small system message instead of changing the system prompt, so the provider prompt cache is kept. This only works if no other loaded extension returns a replacement `systemPrompt` from `before_agent_start`; in that case Pi folds section changes back into the system prompt and the cache is lost for that request. A resumed session keeps the catalog introduction it already recorded, so a pi-subagents upgrade that rewords the introduction does not change the section; the entries always reflect the current agents.
+Every enabled agent appears in the guide, the `subagent` tool's first reply in a session, with a short summary from its description; an `<agent>-writer` variant shares its base agent's line. A launch that names an unknown or disabled agent fails with the available agents, and `subagent({ action: "list" })` lists them.
 
 ## Prompt assembly
 
@@ -426,7 +422,6 @@ name: scout
 # Optional: registers this as code-analysis.scout while preserving name: scout
 package: code-analysis
 description: Fast codebase recon
-advertise: true
 aliases: explorer, code-scout
 tools: read, grep, find, ls, bash, mcp:chrome-devtools
 excludeTools: bash
@@ -470,7 +465,6 @@ Field notes:
 | Field | Notes |
 | ------- | ------- |
 | `package` | Optional package identifier. A file with `name: scout` and `package: code-analysis` registers as `code-analysis.scout`; serialization keeps `name` and `package` separate. |
-| `advertise` | Set `true` to include this agent's name and description in the parent system prompt when the `subagent` tool is active. Defaults to `false`. |
 | `aliases` | Optional comma-separated or block-list names that resolve to this agent for selection and explicit `agent` and task inputs. Runtime status, persistence, and config still use the canonical `name`. Exact canonical names take precedence over aliases, and alias collisions between distinct canonical agents fail as ambiguous. |
 | `tools` | Strict child tool allowlist. Named extension tools must also have their provider loaded. `mcp:` entries select direct MCP tools from `pi-mcp-adapter` when it is installed, and from Pi's built-in MCP otherwise. |
 | `excludeTools` | Optional child tool deny-list applied after normal tool resolution. With an explicit `tools` allowlist, matching names are removed; when `tools` is omitted, the names are excluded from the child session's default tool set. Unknown names are ignored by Pi without making the agent definition invalid. |
@@ -493,9 +487,9 @@ Field notes:
 | `async` | Default a single-agent launch to background (`true`) or foreground (`false`) when the call omits `async`. Explicit call values and `forceTopLevelAsync` win. |
 | `launcher` | Name of a [`runnerLaunchers`](configuration.md#runnerlaunchers) entry that wraps this agent's background runner, such as a sandbox command. Names only; the command itself is defined in user config. See [Sandboxing background children with a launcher](#sandboxing-background-children-with-a-launcher). |
 | `timeoutMs` | Positive integer default runtime deadline in milliseconds for single-agent launches. Foreground launches use 30 minutes when neither the call nor agent provides a timeout; explicit `timeoutMs`/`maxRuntimeMs` and agent defaults win. |
-| `toolTimeoutMs` | Optional positive integer hard per-tool-call deadline in milliseconds. An explicit call value wins, then this agent default, global `toolTimeoutMs`, and `PI_SUBAGENT_TOOL_TIMEOUT_MS`. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It does not extend the run-level deadline; `contact_supervisor`, `intercom`, and `bg_wait` are exempt. |
+| `toolTimeoutMs` | Optional positive integer hard per-tool-call deadline in milliseconds. An explicit call value wins, then this agent default, global `toolTimeoutMs`, and `PI_SUBAGENT_TOOL_TIMEOUT_MS`. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It does not extend the run-level deadline; `contact_supervisor`, `intercom`, and `subagent` are exempt. |
 | `acceptance` | Acceptance default for single-agent launches. Use a scalar level such as `checked` or an inline/block YAML map such as `{ level: "none", reason: "lightweight lookup" }`. Explicit call values win; chain and parallel acceptance remains task/step configuration. |
-| `acceptanceRole` | Optional `read-only` or `writer` role for automatic acceptance inference. When omitted, automatic acceptance uses lightweight attestation; task wording and agent names do not escalate it. This does not grant or revoke tools. |
+| `acceptanceRole` | Optional `read-only` or `writer` role for automatic acceptance inference. When omitted, automatic acceptance uses lightweight attestation; task wording and agent names do not escalate it. This does not grant or revoke tools. With `output`, a `read-only` child is told to return the artifact in its final reply for the runtime to save, instead of writing the file itself. |
 | `mutationTools` | Comma-separated extension tool names treated as mutating activity for runtime diagnostics, long-running-tool status, and timeout recovery. This is diagnostic only and never determines successful completion. List and load each tool through `tools` and its extension provider as usual. |
 | `interactive` | Parsed for compatibility but not currently enforced. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent's children. |
@@ -672,17 +666,3 @@ If an agent has an explicit `tools` allowlist and resolved skills, `read` is add
 Missing skills do not fail execution. The result summary shows a warning.
 
 Agent-local `skillPath` candidates never enter Pi's parent/global skills catalog. Pair `inheritSkills: false` with explicit `skills` and `skillPath` when a child should receive only its selected private skills.
-
-## The bundled pi-subagents skill
-
-The package bundles a `pi-subagents` skill that is automatically available to the parent agent when the extension is installed. Availability is not automatic routing or permission to delegate: the parent works directly unless the operator requests delegation in the current request or through applicable user/project instructions. Once authorized, use the smallest bounded child or workflow whose evidence, independent review, specialization, parallelism, or isolation benefit earns its overhead. It is for the orchestrating parent only: fresh child subagents never receive it, and a child's own context is filtered to strip parent-only orchestration instructions. A forked child is the exception: it keeps the history, system prompt, and tool declarations it inherited as the parent sent them, so it sees this skill in the parent's skills list and the parent's subagent catalog. It receives its own instructions, including its subagent boundary, in its task message, and its first request reuses the parent's prompt cache (see [fork context details](tool-reference.md#fork-context-details)).
-
-What it covers:
-
-- **Calls**: the common `subagent` calls, workflow script and resume shapes, and async waiting rules.
-- **Delegation rules**: when to delegate at all, what every child brief contains, one writer per worktree, fresh or forked context, and what to do when a lane fails.
-- **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command: parallel review, review loop, parallel research, gather-context-and-clarify, parallel cleanup, and oracle consultation.
-- **Orchestration**: splitting work into lanes, review loops, finding disposition, and gate-failure triage.
-- **Lookups**: which `guide` section answers each rarer question, so the skill does not copy this reference.
-
-If you are writing an agent that has been asked to orchestrate subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.

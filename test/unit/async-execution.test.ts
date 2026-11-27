@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildAsyncRunnerSteps, assertClaudeCodeOverrideIsLocal, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
+import { buildAsyncRunnerSteps, assertClaudeCodeOverrideIsLocal, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEvent, executeAsyncSingle, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
-import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
+import { DEFAULT_ARTIFACT_CONFIG, SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
@@ -82,10 +82,10 @@ describe("async runner execution", () => {
 	it("resolves machine 'local' to the parent's Rex session at the async step call site", { skip: process.platform === "win32" ? "Rex placement is POSIX-only" : undefined }, (t) => {
 		const bin = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rex-bin-")));
 		fs.writeFileSync(path.join(bin, "rex"), "#!/bin/sh\ncase \"$*\" in *\" session inspect session:parent-1 \"*) echo '{\"session_id\":\"session:parent-1\"}';; *) exit 9;; esac\n", { mode: 0o755 });
-		const names = ["REX_BIN_DIR", "REX_SESSION", "REX_SERVER", "HERDR_BIN", "HERDR_ENV", "HERDR_PANE_ID"] as const, previous = names.map((name) => process.env[name]);
+		const names = ["REX_BIN_DIR", "REX_SESSION", "REX_SERVER", "HERDR_BIN", "HERDR_ENV", "HERDR_PANE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET"] as const, previous = names.map((name) => process.env[name]);
 		Object.assign(process.env, { REX_BIN_DIR: bin, REX_SESSION: "session:parent-1", REX_SERVER: "unix:///tmp/parent-rex.sock", HERDR_BIN: path.join(bin, "no-herdr") });
-		// Run from a Herdr pane, `local` would resolve to Herdr.
-		delete process.env.HERDR_ENV; delete process.env.HERDR_PANE_ID;
+		// Run from a Herdr pane or a Herdr Core terminal, `local` would resolve there.
+		delete process.env.HERDR_ENV; delete process.env.HERDR_PANE_ID; delete process.env.HC_TERMINAL_ID; delete process.env.HC_TERMINAL_SOCKET;
 		t.after(() => {
 			names.forEach((name, index) => { const value = previous[index]; if (value === undefined) delete process.env[name]; else process.env[name] = value; });
 			fs.rmSync(bin, { recursive: true, force: true });
@@ -167,15 +167,15 @@ describe("async runner execution", () => {
 	it("formats interactive yield and headless auto-drain guidance separately", () => {
 		const interactive = formatAsyncStartedMessage("Async: worker [interactive]", true);
 		assert.match(interactive, /^Async: worker \[interactive\]\n/);
-		assert.match(interactive, /Return control now: native completion wakes you, so do not sleep, poll, or call bg_wait for it\./);
+		assert.match(interactive, /Completion wakes you; keep working or end your turn\. Do not sleep or poll for it\./);
 		assert.match(interactive, /subagent\(\{ action: "status", id: "\.\.\." \}\)/);
 		assert.ok(interactive.length <= 400, `interactive receipt is ${interactive.length} chars`);
-		assert.doesNotMatch(interactive, /bg_wait\(\{ id:/i);
+		assert.doesNotMatch(interactive, /action: "wait"/);
 		assert.doesNotMatch(interactive, /auto-drains current-session background work/i);
 
 		const headless = formatAsyncStartedMessage("Async: worker [headless]", false);
 		assert.match(headless, /non-interactive run.*auto-drains current-session subagent work at agent_end/i);
-		assert.match(headless, /use bg_wait only for results this turn needs from work without native notification/i);
+		assert.match(headless, /use subagent\(\{ action: "wait" \}\) only when this turn needs the result/i);
 		assert.equal(headless.split("\n").length, 3);
 		assert.doesNotMatch(headless, /nonBlocking: true/);
 		assert.doesNotMatch(headless, /By default, return control to the user/i);
@@ -203,14 +203,12 @@ describe("async runner execution", () => {
 			ctx,
 			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
 			maxSubagentDepth: 2,
-			waitToolEnabled: false,
 			toolBudget: { hard: 3, block: ["find"] },
 			configToolBudget: { hard: 5, block: ["ls"] },
 		});
 
 		assert.ok("steps" in result, "expected successful step build");
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 3, block: ["find"] });
-		assert.equal(result.steps[0]?.waitToolEnabled, false);
 		assert.deepEqual(result.steps[1]?.toolBudget, { hard: 2, block: ["grep"] });
 	});
 	it("rejects unavailable configured and launch models before producing runner steps", () => {
@@ -288,6 +286,37 @@ describe("async runner execution", () => {
 		const parallel = result.steps[1];
 		assert.ok(parallel && "parallel" in parallel && Array.isArray(parallel.parallel));
 		assert.deepEqual(parallel.parallel.map((step) => step.timeoutMs), [DEFAULT_ASYNC_TIMEOUT_MS, 7_000]);
+	});
+
+	it("gives async children no default deadline in an interactive session, keeping agent-level deadlines", () => {
+		const result = buildAsyncRunnerSteps("interactive-timeout-run", {
+			chain: [{ parallel: [{ agent: "default-worker", task: "default" }, { agent: "custom-worker", task: "custom" }] }],
+			agents: [agent("default-worker"), { ...agent("custom-worker"), defaultTimeoutMs: 7_000 }],
+			ctx: { ...ctx, interactive: true },
+			asyncDir: path.join(process.cwd(), ".tmp-async-timeout-test"),
+			maxSubagentDepth: 2,
+		});
+		assert.ok("steps" in result, "expected successful step build");
+		const parallel = result.steps[0];
+		assert.ok(parallel && "parallel" in parallel && Array.isArray(parallel.parallel));
+		assert.deepEqual(parallel.parallel.map((step) => step.timeoutMs), [undefined, 7_000]);
+	});
+
+	it("bounds async children with config timeoutMs when their agent sets none, in any session", () => {
+		for (const interactive of [true, false]) {
+			const result = buildAsyncRunnerSteps("config-timeout-run", {
+				chain: [{ parallel: [{ agent: "default-worker", task: "default" }, { agent: "custom-worker", task: "custom" }] }],
+				agents: [agent("default-worker"), { ...agent("custom-worker"), defaultTimeoutMs: 7_000 }],
+				ctx: { ...ctx, interactive },
+				asyncDir: path.join(process.cwd(), ".tmp-async-timeout-test"),
+				maxSubagentDepth: 2,
+				configTimeoutMs: 5_400_000,
+			});
+			assert.ok("steps" in result, "expected successful step build");
+			const parallel = result.steps[0];
+			assert.ok(parallel && "parallel" in parallel && Array.isArray(parallel.parallel));
+			assert.deepEqual(parallel.parallel.map((step) => step.timeoutMs), [5_400_000, 7_000]);
+		}
 	});
 
 	it("uses agent tool budget before config default when no run override exists", () => {
@@ -372,6 +401,30 @@ describe("async runner execution", () => {
 
 		assert.ok("steps" in result, "expected successful step build");
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 5, block: ["ls"] });
+	});
+
+	it("refuses Fast before spawning when the registry shows the model on another adapter", () => {
+		const availableModels = [{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", api: "anthropic-messages" }];
+		const worker = { ...agent("worker"), model: "anthropic/claude-sonnet-4" };
+		const refusal = /Cannot forward fast mode: 'anthropic\/claude-sonnet-4' uses 'anthropic-messages'/;
+		assert.throws(() => executeAsyncSingle("fast-single", {
+			agent: worker.name,
+			agentConfig: worker,
+			task: "task",
+			fast: true,
+			ctx: { ...ctx, pi: { events: { emit() {} } } as unknown as ExtensionAPI },
+			artifactConfig: { ...DEFAULT_ARTIFACT_CONFIG, enabled: false },
+			shareEnabled: false,
+			availableModels,
+		}), refusal);
+		assert.throws(() => buildAsyncRunnerSteps("fast-chain", {
+			chain: [{ agent: "worker", task: "task", fast: true }],
+			agents: [worker],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-fast"),
+			maxSubagentDepth: 1,
+			availableModels,
+		}), refusal);
 	});
 });
 

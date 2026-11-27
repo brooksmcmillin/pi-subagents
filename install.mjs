@@ -105,7 +105,6 @@ installDependencies();
 console.log(`
 The extension is now available in pi. Tools added:
   • subagent - Delegate tasks to agents and inspect run status
-  • bg_wait - Wait for background/provider/detached work without native completion notifications
 
 Documentation: ${EXTENSION_DIR}/README.md
 `);

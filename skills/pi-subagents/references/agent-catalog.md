@@ -1,6 +1,6 @@
 # Pi Subagents: Agent Catalog
 
-This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
+This file is a detailed reference for the compact task-delivery recipe.
 Read it only after the parent has decided to delegate work to a subagent. The
 catalog and the agent-selection guidance below are not useful before that
 decision, and loading them earlier just to "check" wastes context for sessions

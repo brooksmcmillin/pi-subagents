@@ -8,7 +8,7 @@ import { runWorkflowScript } from "../../src/workflows/scripted-workflow.ts";
 const recipePath = "skills/pi-subagents/references/task-delivery.md";
 const read = (path: string) => readFileSync(resolve(path), "utf8").replace(/\r\n/g, "\n");
 const recipe = read(recipePath);
-const skill = read("skills/pi-subagents/SKILL.md");
+const route = read("docs/workflows.md").split("## Recommended orchestration pattern\n")[1].split("\n## ")[0];
 const extractScript = (text: string) => text.match(/^```js\n([\s\S]*?)\n```$/m)?.[1];
 const script = extractScript(recipe);
 assert.ok(script, "recipe must include the executable two-stage example");
@@ -27,9 +27,8 @@ for (const [name, newline] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
 
 // Prose guards and fake launches prove documentation composition, not model compliance.
 test("compact route is discoverable without unconditional broad reference loading", () => {
-	assert.match(skill, /Compact task delivery.*references\/task-delivery.md/);
-	assert.match(skill, /Do not preload the broad references/);
-	assert.doesNotMatch(skill, /For an authorized complex delegated workflow, read/);
+	assert.match(route, /compact task-delivery recipe/);
+	assert.match(route, /Load advanced references only when their trigger applies/);
 	for (const file of ["docs/workflows.md", "prompts/review-loop.md"]) {
 		assert.match(read(file), /task-delivery.md/);
 	}
@@ -57,7 +56,7 @@ test("mandatory contracts survive the compact route", () => {
 });
 
 test("simple-path reference payload stays below 25000 characters", (t) => {
-	const chars = [...skill].length + [...recipe].length;
+	const chars = [...route].length + [...recipe].length;
 	const baseline = 149_000; // Approximate observed historical references, not total session tokens.
 	t.diagnostic(JSON.stringify({ characters: chars, observedBaseline: baseline,
 		reductionPercent: Number((100 * (1 - chars / baseline)).toFixed(1)) }));

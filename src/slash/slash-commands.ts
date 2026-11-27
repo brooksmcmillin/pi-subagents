@@ -46,12 +46,11 @@ import {
 	SLASH_SUBAGENT_STARTED_EVENT,
 	SLASH_SUBAGENT_UPDATE_EVENT,
 	DIRS,
-	type Details,
 	type FleetKeybindingsConfig,
 	type SingleResult,
 	type SubagentState,
 } from "../shared/types.ts";
-import { waitToolName } from "../shared/wait-tool-name.ts";
+import { waitCall } from "../shared/wait-call.ts";
 
 interface InlineConfig {
 	output?: string | false;
@@ -777,7 +776,7 @@ export function registerSlashCommands(
 			ctx.ui.notify(`Foreground run ${control.runId} is not currently detachable.`, "info");
 			return;
 		}
-		sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or ${waitToolName()}({ id: ${JSON.stringify(control.runId)} }) to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
+		sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or ${waitCall(`id: ${JSON.stringify(control.runId)}`)} to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
 	};
 
 	pi.registerCommand("subagents-detach", {

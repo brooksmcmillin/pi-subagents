@@ -57,7 +57,7 @@ async function startParent(config: Record<string, unknown> = {}): Promise<Parent
 
 async function callSubagent(parent: Parent, args: Record<string, unknown>): Promise<void> {
 	await parent.session.waitForIdle();
-	parent.replies.push(args, "ok");
+	parent.replies.push({}, args, "ok");
 	await parent.session.prompt("go");
 }
 
@@ -82,7 +82,7 @@ after(async () => {
 	}
 	mockPi.uninstall();
 	if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
-	fs.rmSync(root, { recursive: true, force: true });
+	fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 it("a task a tool_call handler sets on subagent_launch is what the workflow child receives", { timeout: 60_000 }, async () => {

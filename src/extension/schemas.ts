@@ -3,31 +3,6 @@ import type { DisabledFeatureSurface } from "../shared/disabled-features.ts";
 import { RUNNER_LAUNCHER_NAME_PATTERN } from "../shared/types.ts";
 import { MAX_ARGS_BYTES, MAX_ARGS_DEPTH, MAX_ARGS_FIELDS, MAX_ARGS_ITEMS } from "../workflows/workflow-resources.ts";
 
-function keepTopLevelParameterDescriptions<T>(schema: T): T {
-	return pruneNestedDescriptions(schema, []) as T;
-}
-
-function pruneNestedDescriptions(value: unknown, path: string[]): unknown {
-	if (!value || typeof value !== "object") return value;
-
-	const result = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
-	for (const key of Reflect.ownKeys(value)) {
-		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (!descriptor) continue;
-		if (key === "description" && !isTopLevelParameterDescription(path)) continue;
-		if ("value" in descriptor) {
-			const nextPath = typeof key === "string" ? [...path, key] : path;
-			descriptor.value = pruneNestedDescriptions(descriptor.value, nextPath);
-		}
-		Object.defineProperty(result, key, descriptor);
-	}
-	return result;
-}
-
-function isTopLevelParameterDescription(path: string[]): boolean {
-	return path.length === 2 && path[0] === "properties";
-}
-
 const SkillOverride = Type.Unsafe({
 	anyOf: [
 		{ type: "array", items: { type: "string" } },
@@ -187,6 +162,11 @@ const SubagentParamProperties = {
 	lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, description: "Transcript tail lines; default 80." })),
 	topic: Type.Optional(Type.String()),
 	message: Type.Optional(Type.String({ description: "resume/steer guidance or project.open prompt." })),
+	all: Type.Optional(Type.Boolean({ description: "wait: all work active at call time." })),
+	nonBlocking: Type.Optional(Type.Boolean({ description: "wait: subscribe to id's wake and return now; requires id, not with all." })),
+	stopOnAttention: Type.Optional(Type.Boolean({ description: "wait: false keeps waiting through all attention except child questions." })),
+	replyTo: Type.Optional(Type.String({ description: "reply: id of the pending child question." })),
+	to: Type.Optional(Type.String({ description: "reply: run id or agent of the child that asked." })),
 	mode: Type.Optional(Type.String({ enum: ["steer", "follow_up", "auto", "plan", "apply"], description: "steer delivery; worktree.cleanup plan/apply (reviewed planId)." })),
 	steeringRecovery: Type.Optional(Type.Boolean({ description: "steer: pause/revive after missed acknowledgment; default true in direct steer mode, forced false by extension RPC for exact ownership." })),
 	additional: Type.Optional(Type.Integer({ minimum: 1, description: "grant-spawn-budget: root interactive parent + native user confirmation only; total grants capped at original configured cap." })),
@@ -237,7 +217,7 @@ const SubagentParamProperties = {
 		description: "fresh/fork overrides every child; profile requires agent's declared defaultContext, ignoring config. Omitted: defaultSubagentContext wins over each agent defaultContext; implicit fork needs persisted parent + leaf, else fresh. forkContext may prune forks before spawn.",
 	})),
 	async: Type.Optional(Type.Boolean({ description: "Background; default asyncByDefault. false only to block parent." })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs; must agree." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Default: config timeoutMs, else 30m foreground; background runs get none with a UI (30-min check-ins) and 30m without; async composites have no default parent deadline. Alias maxRuntimeMs; must agree." })),
 	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs (same defaults)." })),
 	checkpointBeforeDeadlineMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647, description: "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." })),
 	toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Per-tool deadline (ms); fast builtins default 5m." })),
@@ -245,7 +225,7 @@ const SubagentParamProperties = {
 	usageBudget: Type.Optional(UsageBudgetOverride),
 	agentScope: Type.Optional(Type.String({ description: "user/project/both (default); project wins collisions." })),
 	cwd: Type.Optional(Type.String({ description: "Execution/project-pane directory." })),
-	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label (runs an external CLI agent), a Rex host named in settings (runs a Pi child), or \"local\" (a Pi child in a new tab of the Herdr or Rex session this Pi runs in). On another machine, cwd is a directory there." })),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label (runs an external CLI agent), a Rex host named in settings (runs a Pi child), or \"local\" (a Pi child in a new tab of the Herdr or Rex session this Pi runs in, or a headless Herdr Core terminal). On another machine, cwd is a directory there." })),
 	requireLauncher: Type.Optional(Type.Object({
 		name: Type.String({ pattern: RUNNER_LAUNCHER_NAME_PATTERN.source }),
 		definitionDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
@@ -269,7 +249,7 @@ const SubagentParamProperties = {
 	maxOutput: Type.Optional(Type.Object({ bytes: Type.Optional(Type.Integer({ minimum: 1 })), lines: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Child model provider/id; bare id only if unique. Suffix :off/minimal/low/medium/high/xhigh/max overrides agent thinking default." })),
-	fast: Type.Optional(Type.Boolean({ description: "Native OpenAI-Codex priority tier; default false, may cost more/quota." })),
+	fast: Type.Optional(Type.Boolean({ description: "OpenAI service tier (see fastServiceTier); default false, may cost more/quota." })),
 	outputSchema: Type.Optional(OutputSchemaOverride),
 	agentContract: Type.Optional(AgentContractOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
@@ -285,7 +265,6 @@ const SubagentParamProperties = {
 /** Full flat parameter shape accepted by RPC, slash, scheduled and workflow callers. */
 export const SubagentFlatParams = Type.Object(SubagentParamProperties);
 
-// Management/control fields go inside one opaque `options` object, so they are not sent on every request.
 const { runId: _runId, maxRuntimeMs: _maxRuntimeMs, isolation: _isolation, ...ModelProperties } = SubagentParamProperties;
 const { agent, task, workflow, args, async, model, cwd, worktree, output, action, id, message, ...SubagentOptionProperties } = ModelProperties;
 
@@ -297,12 +276,12 @@ export const SubagentOptionParams = Type.Object(SubagentOptionProperties, { addi
 const ModelTopLevelProperties = {
 	agent, task, workflow, args, async, model, cwd, worktree, output, action, id, message,
 	options: Type.Optional(Type.Unsafe<Record<string, unknown>>({ type: "object", additionalProperties: true, description: "Inline source: options.script; omit workflow. Other options: guide tool-reference/parameter-reference." })),
+	label: Type.Optional(Type.String({ minLength: 1, maxLength: 80, description: "2-4 words on what it does; appears wherever the run is listed." })),
 };
 
-export const SubagentParams = keepTopLevelParameterDescriptions(Type.Object(ModelTopLevelProperties));
+export const SubagentParams = Type.Object(ModelTopLevelProperties);
 
-// Replaces workflow scripts when disabledFeatures lists "workflow-scripts". Kept small because every
-// field is sent on every request; the executor validates step shapes and placeholders strictly.
+// Replaces workflow scripts when disabledFeatures lists "workflow-scripts"; the executor validates step shapes and placeholders strictly.
 const StructuredTask = { type: "object", properties: { agent: { type: "string", minLength: 1 }, task: { type: "string" }, cwd: { type: "string" }, model: { type: "string" } }, required: ["agent", "task"], additionalProperties: false };
 const StructuredWorkflowProperties = {
 	action: Type.Optional(Type.String({ minLength: 1, description: "Management/control only; omit for execution. Discover actions with {action:\"guide\",options:{topic:\"tool-reference\"}}." })),
@@ -328,15 +307,5 @@ export function createSubagentParamsSchema(disabled?: DisabledFeatureSurface): t
 		return [[name, schema]];
 	}));
 	// SAFETY: only optional properties are dropped or added; the executor rejects disabled options and admits chain/tasks at runtime.
-	return keepTopLevelParameterDescriptions(Type.Object(enabledProperties)) as typeof SubagentParams;
+	return Type.Object(enabledProperties) as typeof SubagentParams;
 }
-
-const SubagentWaitParamsSchema = Type.Object({
-	id: Type.Optional(Type.String({ description: "Run id or prefix." })),
-	nonBlocking: Type.Optional(Type.Boolean({ description: "Subscribe to id's wake and return immediately; requires id, not with all." })),
-	all: Type.Optional(Type.Boolean({ description: "Wait for all work active at call time." })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Max wait; default waitTool.defaultTimeoutMs, then 30 min." })),
-	stopOnAttention: Type.Optional(Type.Boolean({ description: "false: keep waiting through all attention except supervisor requests." })),
-});
-
-export const SubagentWaitParams = keepTopLevelParameterDescriptions(SubagentWaitParamsSchema);

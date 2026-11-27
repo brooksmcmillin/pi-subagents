@@ -81,7 +81,7 @@ For compact chat results with FleetView as the only live editor surface, merge t
 }
 ```
 
-- `inlineToolDisplay: "summary"` keeps one static result row per call, alongside its call heading. A completed status query is not proof that the queried child has finished.
+- `inlineToolDisplay: "summary"` keeps one static result row per call, alongside its call heading. A completed status query is not proof that the queried child has finished. Rich results (the default) also show each note the tool adds for the model, such as its guidance and warnings: one `↳` line per note, in full when expanded. Summary rows leave them out.
 - `fleetView: true` retains live progress. Open `/subagents-fleet` for details instead of repeatedly requesting status just to watch progress. Pi's expand key does not expand summary results; keep `"rich"` if you want expandable inline output.
 - `asyncWidget: false` hides only the additional under-editor async widget, leaving FleetView available. This configuration reduces visible surfaces; it does not guarantee ordering relative to other extensions.
 - `asyncWidgetCollapsed: true` starts each newly mounted async widget as a one-line live status summary; click its header to expand it.
@@ -120,7 +120,7 @@ Default keys:
 - `↑`/`↓` or `j`/`k` — select a child
 - `K`/`J` (Shift+k / Shift+j) — scroll output one line
 - `PgUp`/`PgDn` — scroll output one body viewport page (structured headers stay pinned)
-- `x`/`Ctrl+O` — toggle tool details
+- `x`/`Ctrl+O` — toggle tool details, including the full `bash` command (multiline commands show every line)
 - `r` — refresh
 - `Esc` — close
 - `Enter` — open the selected inspectable async child through the available Inspect plugin
@@ -220,7 +220,7 @@ For a top-level async run, `details.asyncDir` points at that directory; the fina
 
 The result file is consumed and deleted once its completion notice is delivered. Before deletion, the watcher writes a versioned replay record under `<resultsDir>/completion-replay/<runId>.json` and a bounded output archive under `<resultsDir>/output-archives/<runId>.json`. Replay records expire with the completion deduplication window and are best-effort temporary state, not a permanent run ledger.
 
-`bg_wait` surfaces a slim projection of each terminal payload it covered in its own tool-result `details.completions` — run identity, per-child agent/`runId`/success, artifact paths, and the bounded `archivePath`, without duplicating output text. It reads the replay when watcher delivery or a watcher restart has removed the one-shot result file and in-memory completion state is unavailable. Durable non-blocking wait subscriptions use the same replay in their delivered details. Workflow result files record each child's `runId` explicitly, since a workflow child's `artifactPaths` entry points at its saved output rather than the artifact files keyed by the id. Extensions observing `tool_result` events can read run and artifact identity from there instead of parsing the text summary.
+`subagent({ action: "wait" })` surfaces a slim projection of each terminal payload it covered in its own tool-result `details.completions` — run identity, per-child agent/`runId`/success, artifact paths, and the bounded `archivePath`, without duplicating output text. It reads the replay when watcher delivery or a watcher restart has removed the one-shot result file and in-memory completion state is unavailable. Durable non-blocking wait subscriptions use the same replay in their delivered details. Workflow result files record each child's `runId` explicitly, since a workflow child's `artifactPaths` entry points at its saved output rather than the artifact files keyed by the id. Extensions observing `tool_result` events can read run and artifact identity from there instead of parsing the text summary.
 
 Output archives reference an existing child output artifact or session file when one is available. For children without either file, the archive stores a per-child `result-tail` entry with `resultIndex`, bounded to 64 KiB per child, and records whether it was truncated. Replay and archive JSON use `version: 1`; consumers must ignore unknown fields.
 
@@ -270,6 +270,8 @@ The reported `runtimeAcknowledgedExtensions` projection is `{ version: 1, source
 Lifecycle artifacts include `process-terminal-candidate.json` (private runner evidence) and `process-terminal.json` (the public proof projection).
 
 A proof is `observed` only after the live parent observes the exact detached runner's `close` event and any tracked canonical-session lease is free. Children run inside the runner process, so the candidate records no separate writer processes. If the observer is unavailable, the proof is `unknown`; do not infer process exit from `endedAt`, result-file existence, PID disappearance, or lease-directory absence.
+
+When a finished run's runner PID is confirmed dead and `process-terminal.json` is still `pending`, for example because the Pi that launched it has exited, a status read writes `process-terminal-unobserved.json` with an `unknown` proof (reason `observer-unavailable`). It never touches `process-terminal.json`; status readers report it only while `process-terminal.json` is still `pending` for the same runner, so a close that is observed later still wins.
 
 The `subagent:process-terminal` event and RPC `ping.capabilities.processTerminalProof` expose this status. Process proof is point-in-time evidence and remains separate from execution success or stopped/non-resumable state.
 
@@ -338,7 +340,13 @@ Async events:
 - `subagent:async-complete`
 - `subagent:jobs-changed` (see [extension-api.md](extension-api.md#refresh-a-host-view-without-polling))
 
-For regular async starts, the `subagent:async-started` payload includes redacted `task` and `goal` prompt fields. Async workflow script roots emit the same event with `mode: "workflow"` after their initial `status.json` is durable; workflow roots can omit `task`, and any included prompt fields are redacted. Their keyed children are then announced dynamically through `subagent:child-status`. Companion UI extensions can combine those hints with the authoritative live lifecycle artifacts under `asyncDir` without scraping terminal output.
+For regular async starts, the `subagent:async-started` payload includes redacted `task` and `goal` prompt fields. Single, chain and parallel starts also include `description`: the first agent's description, or its name when it has none, never the task prompt. Async workflow script roots emit the same event with `mode: "workflow"` after their initial `status.json` is durable; workflow roots can omit `task`, and any included prompt fields are redacted. Their keyed children are then announced dynamically through `subagent:child-status`. Companion UI extensions can combine those hints with the authoritative live lifecycle artifacts under `asyncDir` without scraping terminal output.
+
+Foreground lifecycle event:
+
+- `task:subagent:lifecycle`
+
+A foreground single run emits it with `status: "started"` when the child launches and `"completed"`, `"failed"` or `"aborted"` (stopped or paused) when it ends. Payload: `id` (the run id), `agent`, `description` (the agent's description, never the task prompt), `success` (terminal events only), `mode: "foreground"`, and `parentWorkflowRunId` / `workflowKey` when the run belongs to a workflow. A child detached to the background reports its terminal status when it exits. Hosts that only listen for `subagent:async-*` can use this event to show foreground runs. `subagent:foreground-complete` is unchanged.
 
 Intercom delivery events:
 

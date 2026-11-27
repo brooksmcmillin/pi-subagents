@@ -130,7 +130,6 @@ describe("child tool plan declared tools", () => {
 		assert.deepEqual(plan.declaredBuiltinTools, ["read", "grep", "find", "ls", "bash"]);
 		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "grep", "find", "ls", "bash"]);
 		assert.deepEqual(plan.requiredChildTools, ["read", "grep", "find", "ls", "bash"]);
-		assert.deepEqual(plan.warnings, []);
 	});
 
 	it("grants command observation only when explicitly declared", () => {
@@ -249,32 +248,20 @@ describe("child tool plan declared tools", () => {
 	});
 
 	it("keeps requested native coordination tools, but honors ceilings and exclusions", () => {
-		const tools = ["read", "subagent", "contact_supervisor", "subagent_supervisor"];
+		const tools = ["read", "subagent", "contact_supervisor", "grep"];
 		const plan = resolvePiLaunchToolPlan({ tools });
 		assert.deepEqual(plan.effectiveToolAllowlist, tools);
-		assert.deepEqual(plan.requiredChildTools, ["read", "subagent", "subagent_supervisor"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "subagent", "grep"]);
 		assert.equal(plan.fanoutAuthorized, true);
 		for (const restriction of [
-			{ excludeTools: ["subagent_supervisor"] },
+			{ excludeTools: ["grep"] },
 			{ capabilityCeiling: { version: 1 as const, allowedTools: ["read", "subagent", "contact_supervisor"], denyExtensions: true, sources: ["test"] } },
 		]) {
 			const restricted = resolvePiLaunchToolPlan({ tools, ...restriction });
 			assert.equal(restricted.fanoutAuthorized, true);
-			assert.equal(restricted.effectiveToolAllowlist.includes("subagent_supervisor"), false);
+			assert.equal(restricted.effectiveToolAllowlist.includes("grep"), false);
 		}
-		const leaf = resolvePiLaunchToolPlan({ tools: ["read", "contact_supervisor"] });
-		assert.equal(leaf.fanoutAuthorized, false);
-		assert.equal(leaf.effectiveToolAllowlist.includes("subagent_supervisor"), false);
-	});
-
-	it("rejects an explicitly requested reply tool when fanout authorization is absent or removed", () => {
-		for (const input of [
-			{ tools: ["read", "subagent_supervisor"] },
-			{ tools: ["read", "subagent", "subagent_supervisor"], excludeTools: ["subagent"] },
-			{ tools: ["read", "subagent", "subagent_supervisor"], capabilityCeiling: { version: 1 as const, allowedTools: ["read", "subagent_supervisor"], sources: ["test"] } },
-		]) {
-			assert.throws(() => resolvePiLaunchToolPlan(input), /subagent_supervisor.*requires fanout authorization/);
-		}
+		assert.equal(resolvePiLaunchToolPlan({ tools: ["read", "contact_supervisor"] }).fanoutAuthorized, false);
 	});
 
 	it("respects a capability ceiling", () => {
@@ -346,7 +333,6 @@ describe("production launch path keeps declared child tools", () => {
 				assert.deepEqual(launch.toolPlan.effectiveToolAllowlist, ["read", "grep", "bash"]);
 				assert.deepEqual(launch.toolPlan.requiredChildTools, ["read", "grep", "bash"]);
 				assert.deepEqual(launch.config.requiredTools, ["read", "grep", "bash"]);
-				assert.deepEqual(launch.warnings, []);
 			}
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

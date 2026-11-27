@@ -82,7 +82,6 @@ describe("child model resolution diagnostic", () => {
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => unresolvedModelPi() });
 		const result = await runSync(tempDir, [makeAgent("provider-model-worker", { model: MODEL })], "provider-model-worker", "Task", {
 			runId: "foreground-model-resolution",
-			waitToolEnabled: false,
 			childSessionFactory: factory,
 		});
 
@@ -100,7 +99,6 @@ describe("child model resolution diagnostic", () => {
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => unresolvedModelPi() });
 		const result = await runSync(tempDir, [makeAgent("provider-model-worker", { model: MODEL })], "provider-model-worker", "Task", {
 			runId: "foreground-model-policy",
-			waitToolEnabled: false,
 			childSessionFactory: factory,
 			capabilityCeiling: { version: 1, denyExtensions: true, sources: ["policy-fixture"] },
 		});
@@ -118,7 +116,6 @@ describe("child model resolution diagnostic", () => {
 			const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => bridgePi([...replies]) });
 			const result = await runSync(tempDir, [makeAgent("bridge-worker", { model: "bridge/model" })], "bridge-worker", "Task", {
 				runId,
-				waitToolEnabled: false,
 				childSessionFactory: factory,
 				parentProviderRegistry: bridgeParent,
 			});
@@ -134,7 +131,6 @@ describe("child model resolution diagnostic", () => {
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => bridgePi([errorReply]) });
 		const result = await runSync(tempDir, [makeAgent("bridge-worker", { model: "bridge/model" })], "bridge-worker", "Task", {
 			runId: "foreground-inherited-policy",
-			waitToolEnabled: false,
 			childSessionFactory: factory,
 			parentProviderRegistry: bridgeParent,
 			capabilityCeiling: { version: 1, denyExtensions: true, sources: ["policy-fixture"] },
@@ -151,7 +147,6 @@ describe("child model resolution diagnostic", () => {
 			const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
 			const result = await runSync(tempDir, [makeAgent("bridge-worker", { model: "bridge/model" })], "bridge-worker", "Task", {
 				runId,
-				waitToolEnabled: false,
 				childSessionFactory: factory,
 				parentProviderRegistry: bridgeParent,
 			});
@@ -223,6 +218,47 @@ describe("child model resolution diagnostic", () => {
 		for (const claim of ["load", "session_start"] as const) {
 			const childLoadedProvider = await runStep(bridgePi([errorReply], claim));
 			assert.equal(childLoadedProvider.error, PROVIDER_ERROR, `a child whose own extension registered the provider (${claim}) keeps the plain error`);
+		}
+	});
+
+	it("warns an extensions: [] child only when it runs without the parent extension's provider", async () => {
+		const agents = [makeAgent("locked-down", { model: "bridge/model", extensions: [] }), makeAgent("locked-down-core", { model: "magpie/model", extensions: [] })];
+		const built = buildAsyncRunnerSteps("runner-provider-warning", {
+			chain: [{ agent: "locked-down", task: "Task" }, { agent: "locked-down-core", task: "Task" }],
+			agents,
+			ctx: { pi: {} as never, cwd: tempDir, currentSessionId: "parent", parentProviderRegistry: bridgeParent },
+			availableModels: [{ provider: "bridge", id: "model", fullId: "bridge/model" }, { provider: "magpie", id: "model", fullId: "magpie/model" }],
+			asyncDir: tempDir,
+			maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in built, JSON.stringify(built));
+		const [lockedDown, lockedDownCore] = built.steps as Array<Parameters<typeof buildRunnerChildLaunch>[0]>;
+		const doneReply = { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", usage: errorReply.usage };
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => void warnings.push(args.map(String).join(" "));
+		try {
+			const runStep = async (step: Parameters<typeof buildRunnerChildLaunch>[0], pi: PiCodingAgentModule) => {
+				warnings.length = 0;
+				const launch = buildRunnerChildLaunch(step, { cwd: tempDir, id: "runner-provider-warning", flatIndex: 0 }, { model: step.model, sessionEnabled: false, watchdogStatus: () => {} });
+				const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+				await runChildSession({ factory, launch, prompt: "Task: Task", appendChildEvent: () => {}, writeOutputLine: () => {}, parentExtensionProvider: step.parentExtensionProvider });
+				return [...warnings];
+			};
+			assert.deepEqual(await runStep(lockedDown!, bridgePi([doneReply])), ["[pi-subagents] Agent 'locked-down' runs 'bridge/model' without the extension that registers provider 'bridge' in the parent, so its requests go through the 'bridge' provider Pi has without that extension (built in or from models.json)."]);
+			assert.deepEqual(await runStep(lockedDown!, bridgePi([doneReply], "load")), [], "a child whose own extension registers the provider loses nothing");
+			assert.deepEqual(await runStep(lockedDownCore!, bridgePi([doneReply])), [], "a provider no parent extension registered loses nothing");
+
+			warnings.length = 0;
+			const foreground = await runSync(tempDir, [makeAgent("locked-down", { model: "bridge/model", extensions: [] })], "locked-down", "Task", {
+				runId: "foreground-provider-warning",
+				childSessionFactory: createDefaultChildSessionFactory({ loadPiCodingAgent: async () => bridgePi([doneReply]) }),
+				parentProviderRegistry: bridgeParent,
+			});
+			assert.equal(foreground.exitCode, 0, foreground.error);
+			assert.deepEqual(warnings, [], "a foreground child inherits the parent's providers");
+		} finally {
+			console.warn = originalWarn;
 		}
 	});
 });

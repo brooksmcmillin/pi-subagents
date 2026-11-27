@@ -103,11 +103,16 @@ interface MinimalCtx {
 	sessionManager: {
 		getSessionId: () => string;
 		getSessionFile: () => string | null;
+		buildContextEntries: () => unknown[];
 	};
 	modelRegistry: {
 		getAvailable: () => Array<{ provider: string; id: string }>;
 	};
 	model?: { provider: string; id?: string };
+}
+
+export function guideTaughtEntries(): unknown[] {
+	return [{ type: "message", message: { role: "toolResult", details: { taught: ["guide"] } } }];
 }
 
 export function makeMinimalCtx(
@@ -124,6 +129,7 @@ export function makeMinimalCtx(
 		sessionManager: {
 			getSessionId: () => "session-123",
 			getSessionFile: () => null,
+			buildContextEntries: guideTaughtEntries,
 		},
 		modelRegistry: {
 			getAvailable: () => models,

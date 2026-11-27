@@ -1,6 +1,6 @@
 # Pi Subagents: Execution Controls
 
-This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
+This file is a detailed reference for the compact task-delivery recipe.
 
 ## Discovery and Scope Rules
 

@@ -1,6 +1,6 @@
 # Pi Subagents: Orchestration Recipes
 
-This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
+This file is a detailed reference for the compact task-delivery recipe.
 Read it only after the parent has decided to delegate work and wants to apply a
 specific orchestration pattern. The recipes below are useful for actual
 delegation; loading them just to "check what's available" wastes context for
@@ -67,7 +67,7 @@ Prefer `async: true`, `context: "fresh"` for reviewers/validators, `outputMode: 
 
 When one child returns a structured target list, use ordinary JavaScript to validate/filter it and map bounded entries into `runs.all`; do not use the removed chain fanout DSL.
 
-Use the [staged fix orchestration example](prompting-and-roles.md#staged-fix-orchestration-technique) for the inline plan → writer → validation call shape.
+Use the [compact task-delivery recipe](task-delivery.md) for the inline plan → writer → validation call shape.
 
 ## Recon → Plan → Implement
 

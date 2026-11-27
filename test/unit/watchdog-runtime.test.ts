@@ -122,7 +122,7 @@ describe("main watchdog runtime", () => {
 			assert.match(requests[0]!.delta, /explicitly held pending CI/);
 			assert.match(requests[0]!.delta, /waits\/holds are not evidence of neglect/);
 			assert.equal(runtime.getSnapshot().lastWarning, undefined, "a pending/held outcome is evidence, not an automatic finding");
-			runtime.handleTurnEnd(activityTurn("bg_wait", { id: "ci-gate" }, "CI gate completed successfully"), ctx);
+			runtime.handleTurnEnd(activityTurn("subagent", { action: "wait", id: "ci-gate" }, "CI gate completed successfully"), ctx);
 			await runtime.handleAgentEnd({}, ctx);
 			assert.equal(requests.length, 1, "one additional activity review per prompt");
 			runtime.handleBeforeAgentStart({ prompt: "Side question: explain this acronym" }, ctx);
@@ -136,7 +136,7 @@ describe("main watchdog runtime", () => {
 			assert.equal(requests.length, 2, "warning continuations and side prompts alone cannot create fresh activity");
 			runtime.reset("compact", { clearScope: true });
 			runtime.handleBeforeAgentStart({ prompt: "New scope" }, ctx);
-			runtime.handleTurnEnd(activityTurn("subagent_supervisor", { action: "pending" }, "No pending requests"), ctx);
+			runtime.handleTurnEnd(activityTurn("subagent", { action: "reply", replyTo: "r-1", message: "ok" }, "No pending requests"), ctx);
 			await runtime.handleAgentEnd({}, ctx);
 			assert.doesNotMatch(requests.at(-1)!.delta, /CI gate completed successfully/);
 		} finally { runtime.dispose(); }
@@ -162,10 +162,10 @@ describe("main watchdog runtime", () => {
 			runtime.handleBeforeAgentStart({ prompt: "Next task" }, ctx);
 			await runtime.handleAgentEnd({}, ctx);
 			assert.equal(requests.length, 1, "question continuation and watchdog status did not create activity");
-			runtime.handleTurnEnd(activityTurn("bg_wait", {}, `New unclear outcome ${"x".repeat(40_000)}`), ctx);
+			runtime.handleTurnEnd(activityTurn("subagent", { action: "wait" }, `New unclear outcome ${"x".repeat(40_000)}`), ctx);
 			await runtime.handleAgentEnd({}, ctx);
 			assert.ok(requests.at(-1)!.delta.length <= 24_000, "activity and delta share the input cap");
-			runtime.handleTurnEnd(activityTurn("bg_wait", {}, "Gate changed again"), ctx);
+			runtime.handleTurnEnd(activityTurn("subagent", { action: "wait" }, "Gate changed again"), ctx);
 			await runtime.handleAgentEnd({}, ctx);
 			assert.equal(requests.length, 2, "one additional activity review per prompt");
 		} finally { runtime.dispose(); }
@@ -600,9 +600,11 @@ describe("main watchdog runtime", () => {
 		runtime.enqueueDelta(`Assistant:\n${"x".repeat(30_000)}`);
 		await runtime.handleAgentEnd({ type: "agent_end", messages: [] }, { cwd: "/tmp/project" });
 
-		assert.equal(reviewedDelta.length, 24_000, "head + marker + tail fill the cap exactly");
-		assert.match(reviewedDelta, /^Assistant:\nx+\n\n\[\.\.\. about \d+ characters omitted \.\.\.\]\n\nx+$/);
-		assert.equal(reviewedDelta.indexOf("\n\n[..."), 6_000, "the first 6,000 characters are kept as the head");
+		assert.ok(reviewedDelta.length <= 24_000 && reviewedDelta.length > 23_000, "note + head + marker + tail fill the cap");
+		const shape = reviewedDelta.match(/^\[Parts of this run's turn delta omitted: about (\d+) characters[^\n]*\]\n\n(Assistant:\nx+)\n\n\[\.\.\. about \d+ characters omitted \.\.\.\]\n\nx+$/);
+		assert.ok(shape, "the reviewer is told that part of the over-long turn was cut");
+		assert.ok(Number(shape[1]) > 6_000, "the note counts the cut characters");
+		assert.ok(shape[2]!.length > 5_000, "the start of the turn is kept as the head");
 	});
 
 	it("does not record duplicate signatures for stale invalidated reviews", async () => {
@@ -755,8 +757,9 @@ describe("main watchdog runtime", () => {
 		runtime.enqueueDelta(`Assistant:\n${"x".repeat(30_000)}`);
 		await runtime.handleAgentEnd({ type: "agent_end" }, { cwd: repo });
 
-		assert.equal(reviewedDelta.length, 24_000);
 		assert.match(reviewedDelta, /^Current scope:/);
+		assert.ok(reviewedDelta.length <= 24_000);
+		assert.match(reviewedDelta, /\[Parts of this run's turn delta omitted: about \d+ characters/);
 		assert.match(reviewedDelta, /Changed repo paths:/);
 		assert.match(reviewedDelta, /src\/file\.ts/);
 		assert.match(reviewedDelta, /x+$/);
@@ -1159,6 +1162,54 @@ describe("main watchdog runtime", () => {
 			await runtime.handleAgentEnd({}, ctx);
 			assert.equal(requests.length, 1, "unchanged edits are still deduplicated");
 		} finally { runtime.dispose(); }
+	});
+
+	it("keeps a child's supervisor reply in the review input after its turn falls out of the delta", async () => {
+		const deltas: string[] = [];
+		const runtime = new MainWatchdogRuntime({ resolveConfig: () => configResult(enabledConfig()), review: (request) => { deltas.push(request.delta); return { stopReason: "stop" }; } });
+		const ctx = { cwd: "/tmp/project" };
+		const reply = activityTurn("contact_supervisor", { reason: "need_decision", message: "Write which records?" }, "**Reply from supervisor:**\nWrite exactly two records.");
+
+		runtime.handleBeforeAgentStart({ prompt: "Write the records." }, ctx);
+		runtime.handleTurnEnd(reply, ctx);
+		for (const filler of ["A", "B", "C", "D"]) runtime.handleTurnEnd({ message: { role: "assistant", content: filler.repeat(8_000) } }, ctx);
+		await runtime.handleAgentEnd({}, ctx);
+		runtime.handleBeforeAgentStart({ prompt: "Write the records." }, ctx);
+		runtime.handleTurnEnd({ message: { role: "assistant", content: "Wrote two records." } }, ctx);
+		await runtime.handleAgentEnd({}, ctx);
+
+		assert.equal(deltas.length, 2);
+		assert.ok(deltas[0]!.length <= 24_000);
+		assert.match(deltas[0]!, /Supervisor replies this agent received through contact_supervisor[^\n]*\nTool call: contact_supervisor[\s\S]*Write exactly two records\./);
+		assert.doesNotMatch(deltas[0]!, /AAAA/, "the reply's own turn and the first filler were dropped from the delta");
+		assert.match(deltas[0]!, /\[Parts of this run's turn delta omitted: about \d+ characters/);
+		assert.match(deltas[1]!, /Write exactly two records\./, "the reply stays in scope for the next prompt");
+		assert.doesNotMatch(deltas[1]!, /turn delta omitted/);
+	});
+
+	it("keeps every retained supervisor reply whole beside scope and changed paths", async () => {
+		const deltas: string[] = [];
+		const ctx = { cwd: "/tmp/project" };
+		let key = "baseline";
+		const runtime = new MainWatchdogRuntime({
+			resolveConfig: () => configResult(enabledConfig()),
+			reviewChangesOnly: true,
+			repoChangeSignature: () => ({ root: ctx.cwd, key, changedPaths: ["src/records.ts"] }),
+			review: (request) => { deltas.push(request.delta); return { stopReason: "stop" }; },
+		});
+		const replies = [1, 2, 3].map((index) => `reply-${index}-start ${String(index).repeat(1_700)} reply-${index}-end`);
+
+		runtime.handleBeforeAgentStart({ prompt: "Write the records." }, ctx);
+		replies.forEach((text, index) => runtime.handleTurnEnd(activityTurn("contact_supervisor", { reason: "need_decision", message: `Question ${index + 1}?` }, text, `ask-${index}`), ctx));
+		for (const filler of ["A", "B", "C", "D"]) runtime.handleTurnEnd({ message: { role: "assistant", content: filler.repeat(8_000) } }, ctx);
+		key = "edited";
+		await runtime.handleAgentEnd({}, ctx);
+
+		assert.equal(deltas.length, 1);
+		assert.ok(deltas[0]!.length <= 24_000);
+		assert.match(deltas[0]!, /Changed repo paths:[\s\S]*src\/records\.ts/);
+		assert.match(deltas[0]!, /Write the records\./);
+		for (const text of replies) assert.ok(deltas[0]!.includes(text), `${text.slice(0, 14)} survives whole`);
 	});
 
 	it("adds user messages sent while the agent streams to the scope record", async () => {

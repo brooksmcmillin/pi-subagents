@@ -1,7 +1,6 @@
 import type { DynamicParallelStep, ParallelTaskItem } from "../../shared/settings.ts";
-import type { ArtifactPaths, ChainOutputMap, JsonSchemaObject, SingleResult } from "../../shared/types.ts";
+import type { ArtifactPaths, ChainOutputMap, SingleResult } from "../../shared/types.ts";
 import { getSingleResultOutput } from "../../shared/utils.ts";
-import { validateStructuredOutputValue } from "./structured-output.ts";
 
 export class DynamicFanoutError extends Error {}
 
@@ -49,7 +48,7 @@ const DYNAMIC_EXPAND_FROM_KEYS = new Set(["output", "path"]);
 const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outputSchema", "cwd", "machine", "output", "outputMode", "reads", "progress", "skill", "model", "fast", "toolBudget", "acceptance", "agentContract", "gateOn"]);
 const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	...DYNAMIC_PARALLEL_KEYS,
-	"runner", "outputName", "structured", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills", "outputPath", "namespaceOutputPath", "maxSubagentDepth", "timeoutMs", "waitToolEnabled", "waitToolDefaultTimeoutMs",
+	"runner", "outputName", "structured", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills", "outputPath", "namespaceOutputPath", "maxSubagentDepth", "timeoutMs",
 	"structuredOutput", "structuredOutputSchema", "tools", "excludeTools", "allowNestedSubagents", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "builtinMcpTools", "mutationTools", "capabilityCeiling", "systemPrompt",
 	"systemPromptMode", "thinking", "requestedModel", "sessionFile", "effectiveAcceptance", "acceptanceInput", "acceptanceRole", "parentSessionId", "parentSessionFile", "requiredExtensions", "launchResolvedExtensions", "requestedCwd", "machineEnv",
 ]);
@@ -286,12 +285,4 @@ export function collectDynamicResults(
 			...(result?.artifactPaths ? { artifactPaths: result.artifactPaths } : {}),
 		};
 	});
-}
-
-export async function validateDynamicCollection(schema: JsonSchemaObject | undefined, value: DynamicCollectedResult[]): Promise<void> {
-	if (!schema) return;
-	const validation = await validateStructuredOutputValue(schema, value);
-	if (validation.status === "invalid") {
-		throw new DynamicFanoutError(`Collected output validation failed: ${validation.message}`);
-	}
 }

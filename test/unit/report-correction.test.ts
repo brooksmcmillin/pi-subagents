@@ -108,7 +108,7 @@ function request(f: ReturnType<typeof fixture>, stub: ReturnType<typeof factory>
 }
 
 it("cold real SDK correction prepares and captures only structured_output without a provider request", async (t) => {
-	assert.throws(() => prepareStructuredOutputArguments(schema, { value: clean }), /validator is still loading/);
+	assert.deepEqual(prepareStructuredOutputArguments(schema, { value: clean }), { value: clean });
 	const f = fixture(t); const before = fs.readFileSync(f.source); const original = fs.readFileSync(f.artifact);
 	type Tool = { name: string; parameters: never; prepareArguments?: (args: unknown) => Record<string, unknown>; execute: (id: string, params: unknown) => Promise<unknown> };
 	let tool: Tool | undefined;

@@ -4,11 +4,9 @@ import * as fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerSubagentPromptRuntime from "../../../src/runs/shared/subagent-prompt-runtime.ts";
 import { specialistSchema } from "./specialist-schema.ts";
-import { structuredOutputValidatorReady } from "../../../src/runs/shared/structured-output.ts";
 
 // Opt-in live benchmark, never loaded by the test glob. No request bodies or credentials are retained.
 export default async function benchmark(pi: ExtensionAPI): Promise<void> {
-	await structuredOutputValidatorReady();
 	const output = process.env.PI_SCHEMA_BENCHMARK_OUTPUT;
 	assert.ok(output, "Set PI_SCHEMA_BENCHMARK_OUTPUT to a new result path");
 	assert.ok(!fs.existsSync(output), "Refusing to overwrite benchmark evidence");

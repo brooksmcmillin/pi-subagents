@@ -62,9 +62,9 @@ import { applyThinkingSuffix, deriveForkPromptCacheKey, supervisorChannelDir } f
 import { retainsChildCommand } from "../shared/child-commands.ts";
 import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
-import { qualifyModelWithProvider, resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { findModelInfo, qualifyModelWithProvider, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
-import { beginStructuredOutputCompletion, formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT } from "../shared/structured-output.ts";
+import { beginStructuredOutputCompletion, formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, serializeStructuredOutput, shouldRecoverStructuredOutputCompletion, STRUCTURED_OUTPUT_COMPLETION_PROMPT, validateStructuredOutputValue } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, formatInheritedProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
@@ -347,9 +347,8 @@ function isCompleteUsageCounter(value: unknown): value is number {
 }
 
 const STOPPED_BEFORE_COMPLETION_ERROR = "Subagent stopped before completion.";
-const AFTER_COMPACTION_SETTLEMENT = Symbol("afterCompactionSettlement");
-const REMAINING_TIMEOUT_MS = Symbol("remainingTimeoutMs");
-type AbortRecoverySingleResult = SingleResult & { [AFTER_COMPACTION_SETTLEMENT]?: true; [REMAINING_TIMEOUT_MS]?: number };
+// Kept off the result so the object returned in tool details stays plain JSON.
+const attemptRecoveryState = new WeakMap<SingleResult, { afterCompactionSettlement: boolean; remainingTimeoutMs?: number }>();
 
 
 async function runSingleAttempt(
@@ -371,11 +370,10 @@ async function runSingleAttempt(
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
 		orcaProgressTab?: OrcaProgressTab;
-		launchWarnings: { emitted: boolean };
 		verifyModel: boolean;
 		providerDiagnostics?: SingleResult["providerDiagnostics"];
 	},
-): Promise<AbortRecoverySingleResult> {
+): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	assertThinkingWithinCeiling({ model: modelArg, configThinking: effectiveThinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
@@ -384,7 +382,7 @@ async function runSingleAttempt(
 	// Display name for the child session: applied inside the child through its
 	// runtime config and echoed back on the result payload so hosts can label
 	// this run without reading the child's session file.
-	const childSessionName = deriveChildSessionName({ agent: agent.name, task: shared.originalTask ?? task });
+	const childSessionName = deriveChildSessionName({ agent: agent.name, task: shared.originalTask ?? task, label: options.label });
 	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
 	const childWatchdog = watchdogConfig.ok
 		? resolveChildWatchdogConfig({
@@ -441,14 +439,13 @@ async function runSingleAttempt(
 		readOnlyReview: agent.acceptanceRole === "read-only",
 		...(options.outputMode === "file-only" && options.outputPath ? { fileHandoffPath: options.outputPath } : {}),
 		fast: options.fast ?? agent.fast,
+		modelInfo: findModelInfo(modelArg, options.availableModels, agent.modelProvider ?? options.preferredModelProvider),
 		toolBudget: options.toolBudget,
 		permissionRules,
 		permissionAuditPath,
 		childWatchdog,
 		// registerChildWatchdog returns before reading the sink when no watchdog exists.
 		watchdogStatus: childWatchdog ? (event) => onWatchdogStatus?.(event) : undefined,
-		waitToolEnabled: options.waitToolEnabled,
-		waitToolDefaultTimeoutMs: options.waitToolDefaultTimeoutMs,
 		capabilityCeiling: options.capabilityCeiling,
 		thinkingCeiling: options.thinkingCeiling,
 		maxSubagentDepth: options.maxSubagentDepth,
@@ -457,11 +454,7 @@ async function runSingleAttempt(
 		host: "parent",
 	});
 	if (!options.machine && options.parentProviderRegistry) launch.session.parentProviderRegistry = options.parentProviderRegistry;
-	const { toolPlan, capabilityAudit, warnings, launchResolvedExtensions, capture } = launch;
-	if (!shared.launchWarnings.emitted && warnings.length > 0) {
-		for (const warning of warnings) console.warn(`[pi-subagents] ${warning}`);
-		shared.launchWarnings.emitted = true;
-	}
+	const { toolPlan, capabilityAudit, launchResolvedExtensions, capture } = launch;
 
 	const effectiveSystemPrompt = shared.systemPrompt;
 	const fast = options.fast ?? agent.fast;
@@ -479,7 +472,7 @@ async function runSingleAttempt(
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
 		...(options.extensionBindings ? { extensionBindings: options.extensionBindings } : {}),
 	});
-	const result: AbortRecoverySingleResult = withRunContext({
+	const result: SingleResult = withRunContext({
 		index: options.index ?? 0,
 		agent: agent.name,
 		task: shared.originalTask ?? task,
@@ -1538,8 +1531,7 @@ async function runSingleAttempt(
 	result.exitCode = exitCode;
 	result.providerDiagnostics = clearProviderRetry(result.providerDiagnostics);
 	progress.providerDiagnostics = result.providerDiagnostics;
-	if (afterCompactionSettlement) result[AFTER_COMPACTION_SETTLEMENT] = true;
-	result[REMAINING_TIMEOUT_MS] = remainingTimeoutMs;
+	attemptRecoveryState.set(result, { afterCompactionSettlement, remainingTimeoutMs });
 	if (interruptedByControl) {
 		result.exitCode = 0;
 		result.interrupted = true;
@@ -1770,7 +1762,7 @@ async function runSyncCompletionInner(
 		...options,
 		capabilityCeiling: intersectSubagentCapabilityCeilings(options.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(options.parentSessionId), options.childRuntime?.capabilityCeiling),
 	};
-	const childSessionName = deriveChildSessionName({ agent: agentName, task });
+	const childSessionName = deriveChildSessionName({ agent: agentName, task, label: options.label });
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		const diagnosticContext = options.unknownAgentDiagnosticContext
@@ -1920,7 +1912,6 @@ async function runSyncCompletionInner(
 	}
 	const aggregateUsage = emptyUsage();
 	const attemptNotes: string[] = [];
-	const launchWarnings = { emitted: false };
 	let totalToolCount = 0;
 	let totalDurationMs = 0;
 
@@ -2023,7 +2014,6 @@ async function runSyncCompletionInner(
 			outputSnapshot,
 			originalTask: task,
 			orcaProgressTab,
-			launchWarnings,
 			verifyModel,
 			providerDiagnostics: lastResult?.providerDiagnostics,
 		});
@@ -2046,12 +2036,12 @@ async function runSyncCompletionInner(
 			structuredOutputFailed: attemptResult.structuredOutputFailed,
 			acceptanceFailed: false,
 			currentTool: attemptResult.progress?.currentTool,
-			afterCompactionSettlement: attemptResult[AFTER_COMPACTION_SETTLEMENT],
+			afterCompactionSettlement: attemptRecoveryState.get(attemptResult)?.afterCompactionSettlement,
 		});
 		if (recovery.action === "resume") {
 			recoveryPrompt = recovery.prompt;
 			// The retry gets the budget the first attempt left, so that attempt's supervisor waits stay uncounted.
-			const remainingMs = attemptResult[REMAINING_TIMEOUT_MS];
+			const remainingMs = attemptRecoveryState.get(attemptResult)?.remainingTimeoutMs;
 			if (remainingMs !== undefined) attemptOptions.deadlineAt = Date.now() + remainingMs;
 			attemptNotes.push("[abort-recovery] compaction abort after useful progress; resuming the retained child session once on the same model.");
 			continue;
@@ -2162,6 +2152,7 @@ async function runSyncCompletionInner(
 				artifactsDir: options.artifactsDir,
 				runId: options.runId,
 				watchdog: result.watchdog,
+				validateValue: validateStructuredOutputValue,
 			});
 		}
 	} catch (error) {

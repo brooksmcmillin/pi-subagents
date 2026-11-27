@@ -77,7 +77,7 @@ function capCompactMainWindowResult(component: Component, layout: MainWindowRend
 	const maxLines = layout.compactResultMaxLines;
 	if (!enabled || maxLines === undefined) return component;
 	const capped = new Container();
-	capped.render = (width: number): string[] => {
+	capped.render = (width: number) => {
 		const lines = component.render(width);
 		if (lines.length <= maxLines) return lines;
 		const visibleRows = maxLines === 1 ? 1 : maxLines - 1;
@@ -89,7 +89,11 @@ function capCompactMainWindowResult(component: Component, layout: MainWindowRend
 	return capped;
 }
 
-function expandKeyHint(action: string): string {
+export function capFoldedMainWindowResult(component: Component, rendererConfig: MainWindowRendererConfig | undefined, theme: Theme): Component {
+	return capCompactMainWindowResult(component, resolveMainWindowRenderLayout(rendererConfig), theme, true);
+}
+
+export function expandKeyHint(action: string): string {
 	// keyText is empty wherever Pi's app keybindings are not loaded (RPC, print mode), even when the key is bound.
 	return `Press ${keyText("app.tools.expand") || "the expand key"} ${action}`;
 }
@@ -250,7 +254,7 @@ export function clearLegacyResultAnimationTimer(context: LegacyResultAnimationCo
 function extractOutputTarget(task: string): string | undefined {
 	const writeToMatch = task.match(/\[Write to:\s*([^\]\n]+)\]/i);
 	if (writeToMatch?.[1]?.trim()) return writeToMatch[1].trim();
-	const findingsMatch = task.match(/Write your findings to(?: exactly this path)?:\s*([^\r\n]+)/i);
+	const findingsMatch = task.match(/(?:Write your findings to(?: exactly this path)?|The runtime will persist it to exactly this path):\s*([^\r\n]+)/i);
 	if (findingsMatch?.[1]?.trim()) return findingsMatch[1].trim();
 	const outputMatch = task.match(/[Oo]utput(?:\s+to)?\s*:\s*(\S+)/i);
 	if (outputMatch?.[1]?.trim()) return outputMatch[1].trim();
@@ -3336,7 +3340,6 @@ function foregroundWorkflowChecklist(details: Details): WorkflowChecklistProject
 	if (details.mode !== "workflow") return undefined;
 	const stageNodes = details.workflowGraph ? workflowGraphStageNodes(details.workflowGraph) : [];
 	const steps: WorkflowChecklistStep[] = details.results.flatMap((result, resultIndex) => {
-		const stableIndex = foregroundResultIndex(details, resultIndex);
 		const workflowKey = (result as { workflowKey?: unknown }).workflowKey;
 		if (details.workflowGraph && typeof workflowKey !== "string") return [];
 		const node = typeof workflowKey === "string"

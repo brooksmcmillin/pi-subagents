@@ -4,10 +4,10 @@ description: Review/fix loop until clean
 
 Run a parent-orchestrated review loop for the requested work.
 
-Read the installed `pi-subagents` skill and its `references/task-delivery.md`
+Read the packaged `skills/pi-subagents/references/task-delivery.md`
 recipe first. Use its triggered-branch table instead of preloading all execution,
 role and constraint references. For this prompt's reviewer fanout also load
-`references/review-and-validation.md`. Preserve the gates and round cap below.
+`skills/pi-subagents/references/review-and-validation.md`. Preserve the gates and round cap below.
 
 Use the `subagent` tool. Keep the parent session as the loop controller and final decision-maker. Child subagents must receive concrete role-specific tasks; they must not run subagents or manage the loop themselves unless the parent intentionally selected an explicit fanout agent whose builtin `tools` includes `subagent` for that assigned fanout.
 
